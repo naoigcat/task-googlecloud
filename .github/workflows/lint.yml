@@ -1,7 +1,8 @@
 name: Lint by RuboCop
 
 on:
-  push
+  push:
+  pull_request:
 
 jobs:
   lint:
@@ -16,3 +17,15 @@ jobs:
         with:
           entrypoint: /usr/local/bundle/bin/rubocop
           args: -d -E
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      -
+        name: Checkout
+        uses: actions/checkout@v3
+      -
+        name: Setup mise
+        uses: jdx/mise-action@v2
+      -
+        name: Ruby tests
+        run: mise run test
