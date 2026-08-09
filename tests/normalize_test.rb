@@ -1,4 +1,5 @@
 require "minitest/autorun"
+require "securerandom"
 require "shellwords"
 require "stringio"
 require_relative "../lib/normalize"
@@ -18,7 +19,7 @@ class NormalizeTest < Minitest::Test
   def test_call_escapes_object_names_when_moving
     source = "gs://bucket/file;$(touch pwned)/é.txt"
     target = source.normalized
-    commands = run_normalization_with_listing(source)
+    commands = SecureRandom.stub(:hex, "token") { run_normalization_with_listing(source) }
 
     assert_equal expected_move_commands(source, target), commands
   end
@@ -60,24 +61,30 @@ class NormalizeTest < Minitest::Test
   end
 
   def expected_move_commands(source, target)
+    temporary = "#{source}.task-googlecloud-token"
     [
       Shellwords.join(%w[gcloud config set project project]),
-      Shellwords.join(["gsutil", "mv", source, target]),
+      Cloud::ObjectMove.command(source, temporary),
+      Cloud::ObjectMove.command(temporary, target),
     ]
   end
 
   # Supply the exact object name needed to exercise a command path.
-  def listing_pipe(queries, object)
+  def listing_pipe(queries, *objects)
     lambda do |command, &block|
       queries << command
-      block.call(StringIO.new("#{object}\n"))
+      block.call(StringIO.new("#{objects.join("\n")}\n"))
     end
   end
 
-  def stub_cloud_listing(commands, queries, pipe = colliding_object_pipe(queries), &)
-    Cloud.stub(:login, nil) do
-      Cloud.stub(:exec, ->(command) { commands << command }) do
-        Cloud.stub(:pipe, pipe, &)
+  def stub_cloud_listing(commands, queries, pipe = colliding_object_pipe(queries), exec = nil, &)
+    exec ||= ->(command) { commands << command }
+
+    Cloud::Normalize.stub(:sleep, nil) do
+      Cloud.stub(:login, nil) do
+        Cloud.stub(:exec, exec) do
+          Cloud.stub(:pipe, pipe, &)
+        end
       end
     end
   end

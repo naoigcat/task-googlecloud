@@ -1,5 +1,6 @@
 require "minitest/autorun"
 require "pathname"
+require "securerandom"
 require "shellwords"
 require_relative "../lib/upload"
 
@@ -21,16 +22,21 @@ class UploadTest < Minitest::Test
     uploader = Cloud::Upload.new(project)
     uploader.stub(:upload_files_by_directory, { directory => [file] }) do
       Cloud.stub(:login, nil) do
-        Cloud.stub(:exec, ->(command) { commands << command }) { uploader.call }
+        SecureRandom.stub(:hex, "token") do
+          Cloud.stub(:exec, ->(command) { commands << command }) { uploader.call }
+        end
       end
     end
     commands
   end
 
   def expected_commands(project, directory, file)
+    staging_path = "gs://#{directory.basename}/.task-googlecloud-staging/token/#{file.basename}"
+    final_path = "gs://#{directory.basename}/#{file.basename}"
     [
       Shellwords.join(["gcloud", "config", "set", "project", project]),
-      Shellwords.join(["gsutil", "cp", file.to_path, "gs://#{directory.basename}"]),
+      Shellwords.join(["gsutil", "cp", file.to_path, staging_path]),
+      Cloud::ObjectMove.command(staging_path, final_path),
     ]
   end
 end

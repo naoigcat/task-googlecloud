@@ -28,7 +28,37 @@ class PathnameNormalizationTest < Minitest::Test
     end
   end
 
+  def test_apply_normalization_restores_paths_when_a_later_rename_fails
+    Dir.mktmpdir do |directory|
+      source, target, missing_source, missing_target = failure_paths(directory)
+      source.write("content")
+
+      assert_raises(Errno::ENOENT) do
+        Pathname.apply_normalization(failure_entries(source, target, missing_source, missing_target))
+      end
+
+      assert_equal "content", source.read
+      refute target.exist?
+    end
+  end
+
   private
+
+  def failure_paths(directory)
+    [
+      Pathname.new(directory).join("first.txt"),
+      Pathname.new(directory).join("normalized.txt"),
+      Pathname.new(directory).join("missing.txt"),
+      Pathname.new(directory).join("missing-normalized.txt"),
+    ]
+  end
+
+  def failure_entries(source, target, missing_source, missing_target)
+    [
+      [source.to_path, target.to_path],
+      [missing_source.to_path, missing_target.to_path],
+    ]
+  end
 
   # Create both Unicode forms and skip when the filesystem collapses them.
   def with_colliding_paths
