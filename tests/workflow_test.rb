@@ -13,6 +13,7 @@ class WorkflowTest < Minitest::Test
     test_job = @config["jobs"]["test"]
     assert_equal "ubuntu-latest", test_job["runs-on"]
     assert_test_steps(test_job["steps"])
+    assert_lint_steps(@config["jobs"]["lint"]["steps"])
   end
 
   private
@@ -26,5 +27,10 @@ class WorkflowTest < Minitest::Test
   def assert_test_steps(steps)
     assert(steps.any? { |step| step["name"] == "Setup mise" && step["uses"] == "jdx/mise-action@v2" })
     assert(steps.any? { |step| step["name"] == "Ruby tests" && step["run"] == "mise run test" })
+  end
+
+  def assert_lint_steps(steps)
+    assert(steps.any? { |step| step["name"] == "Setup mise" && step["uses"] == "jdx/mise-action@v2" })
+    assert(steps.any? { |step| step["name"] == "RuboCop" && step["run"] == "mise run rubocop" })
   end
 end

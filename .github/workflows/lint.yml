@@ -12,11 +12,11 @@ jobs:
         name: Checkout
         uses: actions/checkout@v3
       -
+        name: Setup mise
+        uses: jdx/mise-action@v2
+      -
         name: RuboCop
-        uses: docker://naoigcat/rubocop:latest
-        with:
-          entrypoint: /usr/local/bundle/bin/rubocop
-          args: -d -E
+        run: mise run rubocop
   test:
     runs-on: ubuntu-latest
     steps:

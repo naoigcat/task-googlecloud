@@ -48,11 +48,11 @@ fi
 description = "Run RuboCop autocorrect with the configured Ruby version"
 run = '''
 set -eu
-RUBY_VERSION="ruby$(awk '/TargetRubyVersion/ {print $2}' .rubocop.yml)"
 if [ "${TASK_GOOGLECLOUD_IN_CONTAINER:-}" = "1" ] || [ -f /.dockerenv ]; then
     rubocop --debug --autocorrect-all
 else
-    docker run --rm -e TASK_GOOGLECLOUD_IN_CONTAINER=1 -v "$(pwd):$(pwd)" -w "$(pwd)" "naoigcat/rubocop:${RUBY_VERSION}" --debug --autocorrect-all
+    docker compose build app
+    docker compose run --rm --no-deps -e TASK_GOOGLECLOUD_IN_CONTAINER=1 app rubocop --debug --autocorrect-all
 fi
 '''
 
@@ -60,11 +60,11 @@ fi
 description = "Run RuboCop lint with the configured Ruby version"
 run = '''
 set -eu
-RUBY_VERSION="ruby$(awk '/TargetRubyVersion/ {print $2}' .rubocop.yml)"
 if [ "${TASK_GOOGLECLOUD_IN_CONTAINER:-}" = "1" ] || [ -f /.dockerenv ]; then
     rubocop --debug --extra-details
 else
-    docker run --rm -e TASK_GOOGLECLOUD_IN_CONTAINER=1 -v "$(pwd):$(pwd)" -w "$(pwd)" "naoigcat/rubocop:${RUBY_VERSION}" --debug --extra-details
+    docker compose build app
+    docker compose run --rm --no-deps -e TASK_GOOGLECLOUD_IN_CONTAINER=1 app rubocop --debug --extra-details
 fi
 '''
 
