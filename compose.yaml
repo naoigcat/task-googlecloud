@@ -12,18 +12,20 @@ services:
         COPY --from=markdownlint /usr/local/lib/node_modules /usr/local/lib/node_modules
         RUN apt-get update && apt-get install -y \
                 build-essential \
-                sshpass \
+                openssh-client \
             && \
             gem install rubocop --no-document && \
             apt-get clean && \
             rm -rf /var/cache/apt/archives/* /var/lib/apt/lists/*
         CMD []
     depends_on:
-      - googlecloud
+      googlecloud:
+        condition: service_healthy
     environment:
       TASK_GOOGLECLOUD_IN_CONTAINER: "1"
     volumes:
       - .:/app
+      - googlecloud-ssh:/run/googlecloud-ssh:ro
   googlecloud:
     build:
       context: .
@@ -32,11 +34,34 @@ services:
         WORKDIR /uploads
         RUN apt-get update && apt-get install -y \
                 openssh-server \
+                netcat-openbsd \
             && \
+            useradd --create-home --shell /bin/bash cloud && \
             mkdir /var/run/sshd && \
-            echo "root:secret" | chpasswd && \
-            sed -i "s/#PermitRootLogin prohibit-password/PermitRootLogin yes/" /etc/ssh/sshd_config
+            mkdir -p /etc/ssh/sshd_config.d && \
+            printf '%s\n' \
+                'PermitRootLogin no' \
+                'PasswordAuthentication no' \
+                'KbdInteractiveAuthentication no' \
+                'PubkeyAuthentication yes' \
+                'AllowUsers cloud' \
+                > /etc/ssh/sshd_config.d/00-googlecloud-security.conf && \
+            sed -i '1i Include /etc/ssh/sshd_config.d/00-googlecloud-security.conf' /etc/ssh/sshd_config && \
+            apt-get clean && \
+            rm -rf /var/cache/apt/archives/* /var/lib/apt/lists/*
+        COPY docker/googlecloud-entrypoint.sh /usr/local/bin/googlecloud-entrypoint
+        RUN chmod 755 /usr/local/bin/googlecloud-entrypoint
         EXPOSE 22
-        CMD ["/usr/sbin/sshd", "-D"]
+        ENTRYPOINT ["/usr/local/bin/googlecloud-entrypoint"]
     volumes:
       - .:/app
+      - googlecloud-ssh:/run/googlecloud-ssh
+    healthcheck:
+      test: ["CMD-SHELL", "sshd -T | grep -q '^permitrootlogin no$' && sshd -T | grep -q '^passwordauthentication no$' && nc -z 127.0.0.1 22 && test -s /run/googlecloud-ssh/client_key && test -s /run/googlecloud-ssh/known_hosts"]
+
+volumes:
+  googlecloud-ssh:
+    driver_opts:
+      type: tmpfs
+      device: tmpfs
+      o: mode=0700

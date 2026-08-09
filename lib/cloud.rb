@@ -21,11 +21,11 @@ module Cloud
     def logout
       return if pipe("gcloud config get account", &:read).empty?
 
-      exec "gcloud auth revoke && rm -fr /root/.config/gcloud"
+      exec "gcloud auth revoke && rm -fr /home/cloud/.config/gcloud"
     end
 
     def exec(command, _mode = "r", _opt = {}, &)
-      success = system("#{sshpass} #{command.shellescape}")
+      success = system("#{ssh_command} #{command.shellescape}")
       return if success
 
       raise CommandError.new("Cloud.exec", command, $CHILD_STATUS)
@@ -34,7 +34,7 @@ module Cloud
     def pipe(command, mode = "r", opt = {}, &)
       raise ArgumentError, "Cloud.pipe requires a block to check command status" unless block_given?
 
-      remote_command = "#{sshpass} #{command.shellescape}".tap(&method(:puts))
+      remote_command = "#{ssh_command} #{command.shellescape}"
       result = IO.popen(remote_command, mode, opt, &)
       raise_command_error("Cloud.pipe", command, $CHILD_STATUS)
       result
@@ -48,8 +48,15 @@ module Cloud
       raise CommandError.new(operation, command, status)
     end
 
-    def sshpass
-      "sshpass -p secret ssh -o StrictHostKeyChecking=no root@googlecloud"
+    def ssh_command
+      "ssh -i /run/googlecloud-ssh/client_key " \
+        "-o IdentitiesOnly=yes " \
+        "-o BatchMode=yes " \
+        "-o ConnectionAttempts=5 " \
+        "-o ConnectTimeout=5 " \
+        "-o StrictHostKeyChecking=yes " \
+        "-o UserKnownHostsFile=/run/googlecloud-ssh/known_hosts " \
+        "cloud@googlecloud"
     end
   end
 end
