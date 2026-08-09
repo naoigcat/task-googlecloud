@@ -78,3 +78,15 @@ else
     docker run --rm --user "$(id -u):$(id -g)" --volume "${PWD}:/workdir" davidanson/markdownlint-cli2:v0.22.1 --config .markdownlint-cli2.jsonc
 fi
 '''
+
+[tasks.test]
+description = "Run Ruby tests"
+run = '''
+set -eu
+if [ "${TASK_GOOGLECLOUD_IN_CONTAINER:-}" = "1" ] || [ -f /.dockerenv ]; then
+    ruby -Ilib -e 'Dir["tests/**/*_test.rb"].sort.each { |file| require File.expand_path(file) }'
+else
+    docker compose build app
+    docker compose run --rm --no-deps -e TASK_GOOGLECLOUD_IN_CONTAINER=1 app ruby -Ilib -e 'Dir["tests/**/*_test.rb"].sort.each { |file| require File.expand_path(file) }'
+fi
+'''
