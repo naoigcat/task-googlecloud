@@ -1,8 +1,28 @@
 require "minitest/autorun"
+require "shellwords"
 require "stringio"
 require_relative "../lib/normalize"
 
 class NormalizeTest < Minitest::Test
+  # Ensure project and bucket names remain single remote-shell arguments.
+  def test_call_escapes_project_and_bucket_in_remote_commands
+    project = "project;$(touch pwned)"
+    bucket = "bucket;$(touch pwned)"
+    commands, queries = run_normalization(project, bucket)
+
+    assert_equal [Shellwords.join(["gcloud", "config", "set", "project", project])], commands
+    assert_equal [Shellwords.join(["gsutil", "ls", "gs://#{bucket}/**"])], queries
+  end
+
+  # Ensure normalized object names remain single remote-shell arguments during moves.
+  def test_call_escapes_object_names_when_moving
+    source = "gs://bucket/file;$(touch pwned)/é.txt"
+    target = source.normalized
+    commands = run_normalization_with_listing(source)
+
+    assert_equal expected_move_commands(source, target), commands
+  end
+
   # Ensure a collision found during preflight validation leaves Cloud Storage unchanged.
   def test_call_does_not_move_objects_when_normalized_names_collide
     commands = []
@@ -14,17 +34,50 @@ class NormalizeTest < Minitest::Test
       end
     end
 
-    assert_equal ["gsutil ls gs://bucket/**"], queries
+    assert_equal [Shellwords.join(["gsutil", "ls", "gs://bucket/**"])], queries
     refute(commands.any? { |command| command.start_with?("gsutil mv") })
   end
 
   private
 
-  # Record Cloud commands while returning colliding NFC and NFD object names.
-  def stub_cloud_listing(commands, queries, &)
+  # Record Cloud commands while supplying a controlled Cloud Storage listing.
+  def run_normalization(project, bucket)
+    commands = []
+    queries = []
+    stub_cloud_listing(commands, queries, listing_pipe(queries, "gs://#{bucket}/file.txt")) do
+      Cloud::Normalize.call(project, bucket)
+    end
+    [commands, queries]
+  end
+
+  def run_normalization_with_listing(source)
+    commands = []
+    queries = []
+    stub_cloud_listing(commands, queries, listing_pipe(queries, source)) do
+      Cloud::Normalize.call("project", "bucket")
+    end
+    commands
+  end
+
+  def expected_move_commands(source, target)
+    [
+      Shellwords.join(%w[gcloud config set project project]),
+      Shellwords.join(["gsutil", "mv", source, target]),
+    ]
+  end
+
+  # Supply the exact object name needed to exercise a command path.
+  def listing_pipe(queries, object)
+    lambda do |command, &block|
+      queries << command
+      block.call(StringIO.new("#{object}\n"))
+    end
+  end
+
+  def stub_cloud_listing(commands, queries, pipe = colliding_object_pipe(queries), &)
     Cloud.stub(:login, nil) do
       Cloud.stub(:exec, ->(command) { commands << command }) do
-        Cloud.stub(:pipe, colliding_object_pipe(queries), &)
+        Cloud.stub(:pipe, pipe, &)
       end
     end
   end

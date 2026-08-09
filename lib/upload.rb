@@ -1,3 +1,4 @@
+require "shellwords"
 require_relative "cloud"
 
 module Cloud
@@ -34,7 +35,7 @@ module Cloud
     # Authenticate only after the rename plan is known to be collision-free.
     def authenticate_project
       Cloud.login
-      Cloud.exec("gcloud config set project #{@project}")
+      Cloud.exec(Shellwords.join(["gcloud", "config", "set", "project", @project]))
     end
 
     # Upload using the post-normalization paths while preserving each directory-to-bucket mapping.
@@ -43,7 +44,7 @@ module Cloud
         puts directory
         bucket = directory.basename.to_path
         directory_files.each do |file|
-          Cloud.exec("gsutil cp \"#{normalized_files[file]}\" gs://#{bucket}")
+          Cloud.exec(Shellwords.join(["gsutil", "cp", normalized_files[file].to_path, "gs://#{bucket}"]))
         end
       end
     end

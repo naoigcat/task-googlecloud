@@ -1,3 +1,4 @@
+require "shellwords"
 require_relative "cloud"
 require_relative "normalization_plan"
 
@@ -17,13 +18,13 @@ module Cloud
     # Validate every object before the first move to avoid partial changes when names collide.
     def call
       Cloud.login
-      Cloud.exec("gcloud config set project #{@project}")
-      files = Cloud.pipe("gsutil ls gs://#{@bucket}/**", &:readlines).map(&:chomp)
+      Cloud.exec(Shellwords.join(["gcloud", "config", "set", "project", @project]))
+      files = Cloud.pipe(Shellwords.join(["gsutil", "ls", "gs://#{@bucket}/**"]), &:readlines).map(&:chomp)
 
       NormalizationPlan.build(files).each do |source, target|
         next if source == target
 
-        Cloud.exec("gsutil mv #{source.shellescape} #{target.shellescape}")
+        Cloud.exec(Shellwords.join(["gsutil", "mv", source, target]))
         sleep 1
       end
     end
