@@ -2,6 +2,7 @@ require "minitest/autorun"
 require "pathname"
 require "securerandom"
 require "shellwords"
+require "stringio"
 require_relative "../lib/upload"
 
 class UploadTest < Minitest::Test
@@ -23,11 +24,17 @@ class UploadTest < Minitest::Test
     uploader.stub(:upload_files_by_directory, { directory => [file] }) do
       Cloud.stub(:login, nil) do
         SecureRandom.stub(:hex, "token") do
-          Cloud.stub(:exec, ->(command) { commands << command }) { uploader.call }
+          stub_cloud(commands) { uploader.call }
         end
       end
     end
     commands
+  end
+
+  def stub_cloud(commands, &)
+    Cloud.stub(:pipe, ->(_command, &block) { block.call(StringIO.new("Generation: 101\n")) }) do
+      Cloud.stub(:exec, ->(command) { commands << command }, &)
+    end
   end
 
   def expected_commands(project, directory, file)

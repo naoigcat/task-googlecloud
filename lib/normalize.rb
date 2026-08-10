@@ -51,15 +51,17 @@ module Cloud
 
     def stage_objects(moves, staged)
       moves.each do |source, _target, temporary|
-        staged << [source, temporary]
         move_object(source, temporary)
+        staged << [source, temporary, nil]
+        staged.last[2] = Cloud::ObjectMove.generation(temporary)
       end
     end
 
     def finalize_objects(moves, finalized)
       moves.each do |_source, target, temporary|
-        finalized << [temporary, target]
         move_object(temporary, target)
+        finalized << [temporary, target, nil]
+        finalized.last[2] = Cloud::ObjectMove.generation(target)
       end
     end
 
@@ -77,20 +79,20 @@ module Cloud
     end
 
     def rollback_finalized(finalized)
-      finalized.reverse_each.filter_map do |temporary, target|
-        attempt_rollback(temporary, target)
+      finalized.reverse_each.filter_map do |temporary, target, target_generation|
+        attempt_rollback(temporary, target, target_generation)
       end
     end
 
     def rollback_staged(staged)
-      staged.reverse_each.filter_map do |source, temporary|
-        attempt_rollback(source, temporary)
+      staged.reverse_each.filter_map do |source, temporary, temporary_generation|
+        attempt_rollback(source, temporary, temporary_generation)
       end
     end
 
     # Try every known move so one cleanup failure does not block later restorations.
-    def attempt_rollback(source, target)
-      Cloud.exec(Cloud::ObjectMove.rollback_command(source, target))
+    def attempt_rollback(source, target, target_generation)
+      Cloud.exec(Cloud::ObjectMove.rollback_command(source, target, target_generation))
     rescue StandardError => e
       e
     end

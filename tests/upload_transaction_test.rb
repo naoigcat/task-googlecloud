@@ -2,6 +2,7 @@ require "minitest/autorun"
 require "pathname"
 require "securerandom"
 require "shellwords"
+require "stringio"
 require "tmpdir"
 require_relative "../lib/upload"
 
@@ -45,6 +46,20 @@ class UploadTransactionTest < Minitest::Test
     end
   end
 
+  def test_call_reports_manual_cleanup_when_generation_lookup_fails_after_upload
+    with_unicode_upload do |directory, file, _normalized_file|
+      uploader = Cloud::Upload.new("project")
+      generation_error = Cloud::ObjectMove::MissingGenerationError.new("gs://bucket/staged")
+
+      error =
+        assert_raises(NormalizationPlan::RollbackError) do
+          run_upload(uploader, directory, file, ->(_command) {}, ->(_command, &) { raise generation_error })
+        end
+
+      assert_includes error.message, "Cannot verify ownership"
+    end
+  end
+
   private
 
   def with_unicode_upload
@@ -60,13 +75,21 @@ class UploadTransactionTest < Minitest::Test
     end
   end
 
-  def run_upload(uploader, directory, file, exec)
+  def run_upload(uploader, directory, file, exec, pipe = generation_pipe)
     uploader.stub(:upload_files_by_directory, { directory => [file] }) do
       Cloud.stub(:login, nil) do
         SecureRandom.stub(:hex, "token") do
-          Cloud.stub(:exec, exec) { uploader.call }
+          Cloud.stub(:pipe, pipe) do
+            Cloud.stub(:exec, exec) { uploader.call }
+          end
         end
       end
+    end
+  end
+
+  def generation_pipe
+    lambda do |_command, &block|
+      block.call(StringIO.new("Generation: 101\n"))
     end
   end
 
@@ -85,10 +108,7 @@ class UploadTransactionTest < Minitest::Test
     end
   end
 
-  def expected_failure_commands(normalized_file, staging_path, final_path)
-    expected_commands(normalized_file, staging_path) + [
-      Cloud::ObjectMove.rollback_command(staging_path, final_path),
-      Shellwords.join(["gsutil", "rm", "-f", staging_path]),
-    ]
+  def expected_failure_commands(normalized_file, staging_path, _final_path)
+    expected_commands(normalized_file, staging_path) + [Cloud::ObjectMove.cleanup_command(staging_path, "101")]
   end
 end

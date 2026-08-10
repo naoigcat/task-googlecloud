@@ -76,15 +76,17 @@ module Cloud
         normalized_file = normalized_files[file]
         staging_path = "gs://#{bucket}/#{staging_prefix}/#{normalized_file.basename}"
         final_path = "gs://#{bucket}/#{normalized_file.basename}"
-        staged_files << [staging_path, final_path]
         Cloud.exec(Shellwords.join(["gsutil", "cp", normalized_file.to_path, staging_path]))
+        staged_files << [staging_path, final_path, nil]
+        staged_files.last[2] = Cloud::ObjectMove.generation(staging_path)
       end
     end
 
     def finalize_uploads(staged_files, finalized_files)
-      staged_files.each do |staging_path, final_path|
-        finalized_files << [staging_path, final_path]
+      staged_files.each do |staging_path, final_path, _staging_generation|
         Cloud.exec(Cloud::ObjectMove.command(staging_path, final_path))
+        finalized_files << [staging_path, final_path, nil]
+        finalized_files.last[2] = Cloud::ObjectMove.generation(final_path)
       end
     end
 
@@ -93,26 +95,26 @@ module Cloud
     end
 
     def rollback_finalized_uploads(finalized_files)
-      finalized_files.reverse_each.filter_map do |staging_path, final_path|
-        attempt_remote_rollback(staging_path, final_path)
+      finalized_files.reverse_each.filter_map do |staging_path, final_path, final_generation|
+        attempt_remote_rollback(staging_path, final_path, final_generation)
       end
     end
 
     def cleanup_staged_uploads(staged_files)
       staged_files.filter_map do |staged_file|
-        attempt_remote_cleanup(staged_file.first)
+        attempt_remote_cleanup(*staged_file)
       end
     end
 
     # Try every remote cleanup so one failure does not block later restorations.
-    def attempt_remote_rollback(source, target)
-      Cloud.exec(Cloud::ObjectMove.rollback_command(source, target))
+    def attempt_remote_rollback(source, target, target_generation)
+      Cloud.exec(Cloud::ObjectMove.rollback_command(source, target, target_generation))
     rescue StandardError => e
       e
     end
 
-    def attempt_remote_cleanup(staging_path)
-      Cloud.exec(Shellwords.join(["gsutil", "rm", "-f", staging_path]))
+    def attempt_remote_cleanup(staging_path, _final_path, staging_generation)
+      Cloud.exec(Cloud::ObjectMove.cleanup_command(staging_path, staging_generation))
     rescue StandardError => e
       e
     end

@@ -50,8 +50,12 @@ class NormalizeTransactionTest < Minitest::Test
   end
 
   def listing_pipe(source_one, source_two)
-    lambda do |_command, &block|
-      block.call(StringIO.new("#{source_one}\n#{source_two}\n"))
+    lambda do |command, &block|
+      if command.start_with?("gsutil stat ")
+        block.call(StringIO.new("Generation: 101\n"))
+      else
+        block.call(StringIO.new("#{source_one}\n#{source_two}\n"))
+      end
     end
   end
 
@@ -71,8 +75,7 @@ class NormalizeTransactionTest < Minitest::Test
       Shellwords.join(%w[gcloud config set project project]),
       Cloud::ObjectMove.command(source_one, temporary_one),
       Cloud::ObjectMove.command(source_two, temporary_two),
-      Cloud::ObjectMove.rollback_command(source_two, temporary_two),
-      Cloud::ObjectMove.rollback_command(source_one, temporary_one),
+      Cloud::ObjectMove.rollback_command(source_one, temporary_one, "101"),
     ]
   end
 
@@ -80,7 +83,7 @@ class NormalizeTransactionTest < Minitest::Test
     commands = [Shellwords.join(%w[gcloud config set project project])]
     commands.concat(move_commands(sources, temporaries))
     commands.concat(move_commands(temporaries, targets))
-    commands.concat(rollback_commands(temporaries, targets))
+    commands.concat(rollback_commands([temporaries.first], [targets.first]))
     commands.concat(rollback_commands(sources, temporaries))
     commands
   end
@@ -91,7 +94,7 @@ class NormalizeTransactionTest < Minitest::Test
 
   def rollback_commands(sources, targets)
     sources.zip(targets).reverse_each.map do |source, target|
-      Cloud::ObjectMove.rollback_command(source, target)
+      Cloud::ObjectMove.rollback_command(source, target, "101")
     end
   end
 end

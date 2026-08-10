@@ -72,6 +72,8 @@ class NormalizeTest < Minitest::Test
   # Supply the exact object name needed to exercise a command path.
   def listing_pipe(queries, *objects)
     lambda do |command, &block|
+      next block.call(StringIO.new("Generation: 101\n")) if command.start_with?("gsutil stat ")
+
       queries << command
       block.call(StringIO.new("#{objects.join("\n")}\n"))
     end
