@@ -31,6 +31,9 @@ class WorkflowTest < Minitest::Test
 
   def assert_test_steps(steps)
     assert_pinned_actions(steps)
+    assert(
+      steps.any? { |step| step["name"] == "Google Cloud image" && step["run"] == "docker compose build googlecloud" },
+    )
     assert(steps.any? { |step| step["name"] == "Ruby tests" && step["run"] == "mise run test" })
   end
 

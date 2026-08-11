@@ -47,8 +47,8 @@ services:
         FROM --platform=linux/x86_64 gcr.io/google.com/cloudsdktool/google-cloud-cli:489.0.0@sha256:1fe16aa77fac9463b8b8ec3a5ebf1e5a02f0ce6afc67a5bf63055f0c6f855892
         WORKDIR /uploads
         RUN apt-get update && apt-get install -y \
-                openssh-server=1:9.2p1-2+deb12u10 \
-                netcat-openbsd=1.219-1 \
+                openssh-server=1:8.4p1-5+deb11u7 \
+                netcat-openbsd=1.217-3 \
             && \
             useradd --create-home --shell /bin/bash cloud && \
             mkdir /var/run/sshd && \

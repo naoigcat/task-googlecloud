@@ -11,7 +11,7 @@ class ComposeTest < Minitest::Test
   private_constant :EXPECTED_BASE_IMAGES
 
   EXPECTED_APP_APT_VERSIONS = ["build-essential=12.9", "openssh-client=1:9.2p1-2+deb12u10"].freeze
-  EXPECTED_GOOGLECLOUD_APT_VERSIONS = ["openssh-server=1:9.2p1-2+deb12u10", "netcat-openbsd=1.219-1"].freeze
+  EXPECTED_GOOGLECLOUD_APT_VERSIONS = ["openssh-server=1:8.4p1-5+deb11u7", "netcat-openbsd=1.217-3"].freeze
   private_constant :EXPECTED_APP_APT_VERSIONS, :EXPECTED_GOOGLECLOUD_APT_VERSIONS
 
   EXPECTED_GEM_VERSIONS = [
