@@ -75,7 +75,8 @@ set -eu
 if [ "${TASK_GOOGLECLOUD_IN_CONTAINER:-}" = "1" ] || [ -f /.dockerenv ]; then
     markdownlint-cli2 --config .markdownlint-cli2.jsonc
 else
-    docker run --rm --user "$(id -u):$(id -g)" --volume "${PWD}:/workdir" davidanson/markdownlint-cli2:v0.22.1 --config .markdownlint-cli2.jsonc
+    docker compose build app
+    docker compose run --rm --no-deps -e TASK_GOOGLECLOUD_IN_CONTAINER=1 app markdownlint-cli2 --config .markdownlint-cli2.jsonc
 fi
 '''
 

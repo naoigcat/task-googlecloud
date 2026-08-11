@@ -8,8 +8,8 @@ services:
         FROM ruby:3.4.10-slim-bookworm@sha256:514336e7d46dd52b94a7391e4bc34dc04dc83098963c2c2493b90354952acd78
         WORKDIR /app
         COPY --from=markdownlint /usr/local/bin/node /usr/local/bin/node
-        COPY --from=markdownlint /usr/local/bin/markdownlint-cli2 /usr/local/bin/markdownlint-cli2
         COPY --from=markdownlint /usr/local/lib/node_modules /usr/local/lib/node_modules
+        RUN ln -s ../lib/node_modules/markdownlint-cli2/markdownlint-cli2-bin.mjs /usr/local/bin/markdownlint-cli2
         RUN apt-get update && apt-get install -y \
                 build-essential=12.9 \
                 openssh-client=1:9.2p1-2+deb12u10 \

@@ -17,6 +17,9 @@ jobs:
       -
         name: RuboCop
         run: mise run rubocop
+      -
+        name: Markdownlint
+        run: mise run markdownlint
   test:
     runs-on: ubuntu-latest
     steps:

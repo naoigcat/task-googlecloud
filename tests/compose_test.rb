@@ -64,6 +64,7 @@ class ComposeTest < Minitest::Test
 
     assert_explicit_gem_versions(app_dockerfile)
     assert_pinned_build_inputs(app_dockerfile, googlecloud_dockerfile)
+    assert_markdownlint_entrypoint(app_dockerfile)
     refute_includes app_dockerfile, "gem install rubocop --no-document"
     refute_includes googlecloud_dockerfile, "google-cloud-cli:latest"
   end
@@ -75,6 +76,14 @@ class ComposeTest < Minitest::Test
       version = version_parts.join(".")
       assert_includes dockerfile, "gem install #{name} -v #{version} --no-document"
     end
+  end
+
+  def assert_markdownlint_entrypoint(dockerfile)
+    entrypoint = [
+      "ln -s ../lib/node_modules/markdownlint-cli2/markdownlint-cli2-bin.mjs",
+      "/usr/local/bin/markdownlint-cli2",
+    ].join(" ")
+    assert_includes dockerfile, entrypoint
   end
 
   def assert_pinned_build_inputs(app_dockerfile, googlecloud_dockerfile)

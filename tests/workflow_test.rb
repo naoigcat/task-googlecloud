@@ -40,6 +40,7 @@ class WorkflowTest < Minitest::Test
   def assert_lint_steps(steps)
     assert_pinned_actions(steps)
     assert(steps.any? { |step| step["name"] == "RuboCop" && step["run"] == "mise run rubocop" })
+    assert(steps.any? { |step| step["name"] == "Markdownlint" && step["run"] == "mise run markdownlint" })
   end
 
   def assert_pinned_actions(steps)
