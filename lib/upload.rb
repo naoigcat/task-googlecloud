@@ -76,27 +76,35 @@ module Cloud
         normalized_file = normalized_files[file]
         staging_path = "gs://#{bucket}/#{staging_prefix}/#{normalized_file.basename}"
         final_path = "gs://#{bucket}/#{normalized_file.basename}"
-        record_remote_change(staging_path, final_path, staging_path, staged_files) do
-          Cloud.exec(Shellwords.join(["gsutil", "cp", normalized_file.to_path, staging_path]))
+        record_remote_change(staging_path, final_path, staged_files) do
+          Cloud::ObjectCopy.copy(normalized_file.to_path, staging_path)
         end
       end
     end
 
     def finalize_uploads(staged_files, finalized_files)
       staged_files.each do |staging_path, final_path, _staging_generation|
-        record_remote_change(staging_path, final_path, final_path, finalized_files) do
-          Cloud.exec(Cloud::ObjectMove.command(staging_path, final_path))
+        record_remote_change(staging_path, final_path, finalized_files, remote_source: staging_path) do
+          Cloud::ObjectMove.move(staging_path, final_path)
         end
       end
     end
 
-    def record_remote_change(source, target, generation_path, changes)
+    def record_remote_change(source, target, changes, remote_source: nil)
       # Defer signals until the remote change and generation are recorded for safe rollback.
       Thread.handle_interrupt(SignalException => :never) do
-        yield
-        changes << [source, target, nil]
-        changes.last[2] = Cloud::ObjectMove.generation(generation_path)
+        target_generation = yield
+        changes << [source, target, target_generation]
+      rescue Cloud::CommandError, Cloud::ObjectMove::MissingGenerationError => e
+        confirm_remote_failure(remote_source, target, e) unless target_generation
+        raise
       end
+    end
+
+    def confirm_remote_failure(source, target, error)
+      return Cloud::ObjectMove.confirm_move_after_failure(source, target, error) if source
+
+      Cloud::ObjectMove.confirm_write_after_failure(target, error)
     end
 
     def rollback_uploads(staged_files, finalized_files)
@@ -108,28 +116,19 @@ module Cloud
       finalized_staging_paths = finalized_files.map(&:first)
       # Finalization recreates staging with a new generation, so it is cleaned separately.
       staged_files.reject { |staged_file| finalized_staging_paths.include?(staged_file.first) }
-                  .filter_map { |staging_path, _, generation| attempt_remote_cleanup(staging_path, generation) }
+                  .filter_map { |staging_path, _, generation| attempt_remote(Cloud::ObjectMove.cleanup_command(staging_path, generation)) }
     end
 
     def attempt_finalized_rollback(staging_path, final_path, final_generation)
-      rollback_error = attempt_remote_rollback(staging_path, final_path, final_generation)
-      return rollback_error if rollback_error
-
-      # Rollback copies final back to staging, so delete its newly read generation.
-      attempt_remote_cleanup(staging_path, Cloud::ObjectMove.generation(staging_path))
+      staging_generation = Cloud::ObjectMove.rollback(staging_path, final_path, final_generation)
+      attempt_remote(Cloud::ObjectMove.cleanup_command(staging_path, staging_generation))
     rescue StandardError => e
       e
     end
 
-    # Try every remote cleanup so one failure does not block later restorations.
-    def attempt_remote_rollback(source, target, target_generation)
-      Cloud.exec(Cloud::ObjectMove.rollback_command(source, target, target_generation))
-    rescue StandardError => e
-      e
-    end
-
-    def attempt_remote_cleanup(staging_path, staging_generation)
-      Cloud.exec(Cloud::ObjectMove.cleanup_command(staging_path, staging_generation))
+    # Keep rollback attempts independent so one failed remote action does not block later repairs.
+    def attempt_remote(command)
+      Cloud.exec(command)
     rescue StandardError => e
       e
     end

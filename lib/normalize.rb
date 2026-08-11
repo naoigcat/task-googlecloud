@@ -64,11 +64,17 @@ module Cloud
     def record_move(source, target, moves)
       # Defer signals until the move and generation are recorded so rollback sees every side effect.
       Thread.handle_interrupt(SignalException => :never) do
-        move_object(source, target)
-        moves << [source, target, nil]
-        moves.last[2] = Cloud::ObjectMove.generation(target)
-        yield moves.last if block_given?
+        execute_and_record_move(source, target, moves) { |move| yield move if block_given? }
       end
+    end
+
+    def execute_and_record_move(source, target, moves)
+      target_generation = move_object(source, target)
+      moves << [source, target, target_generation]
+      yield moves.last
+    rescue Cloud::CommandError, Cloud::ObjectMove::MissingGenerationError => e
+      Cloud::ObjectMove.confirm_move_after_failure(source, target, e) unless target_generation
+      raise
     end
 
     def temporary_path(source)
@@ -76,8 +82,9 @@ module Cloud
     end
 
     def move_object(source, target)
-      Cloud.exec(Cloud::ObjectMove.command(source, target))
+      target_generation = Cloud::ObjectMove.move(source, target)
       sleep 1
+      target_generation
     end
 
     def rollback_objects(staged, finalized)

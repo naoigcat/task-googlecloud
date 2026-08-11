@@ -50,6 +50,7 @@ class NormalizeInterruptTransactionTest < Minitest::Test
     lambda do |source, target|
       commands << Cloud::ObjectMove.command(source, target)
       interrupt.call if target == interrupted_target
+      "101"
     end
   end
 

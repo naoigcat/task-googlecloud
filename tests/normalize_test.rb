@@ -36,7 +36,7 @@ class NormalizeTest < Minitest::Test
     end
 
     assert_equal [Shellwords.join(["gsutil", "ls", "gs://bucket/**"])], queries
-    refute(commands.any? { |command| command.start_with?("gsutil mv") })
+    refute(commands.any? { |command| command.include?("gsutil") })
   end
 
   private
@@ -54,8 +54,10 @@ class NormalizeTest < Minitest::Test
   def run_normalization_with_listing(source)
     commands = []
     queries = []
-    stub_cloud_listing(commands, queries, listing_pipe(queries, source)) do
-      Cloud::Normalize.call("project", "bucket")
+    Cloud::ObjectMove.stub(:move, recording_move(commands)) do
+      stub_cloud_listing(commands, queries, listing_pipe(queries, source)) do
+        Cloud::Normalize.call("project", "bucket")
+      end
     end
     commands
   end
@@ -64,9 +66,16 @@ class NormalizeTest < Minitest::Test
     temporary = "#{source}.task-googlecloud-token"
     [
       Shellwords.join(%w[gcloud config set project project]),
-      Cloud::ObjectMove.command(source, temporary),
-      Cloud::ObjectMove.command(temporary, target),
+      Cloud::ObjectMove.command("#{source}#101", temporary, source_path: source),
+      Cloud::ObjectMove.command("#{temporary}#101", target, source_path: temporary),
     ]
+  end
+
+  def recording_move(commands)
+    lambda do |source, target|
+      commands << Cloud::ObjectMove.command("#{source}#101", target, source_path: source)
+      "101"
+    end
   end
 
   # Supply the exact object name needed to exercise a command path.

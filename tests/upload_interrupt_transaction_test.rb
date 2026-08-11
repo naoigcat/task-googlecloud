@@ -2,7 +2,6 @@ require "minitest/autorun"
 require "pathname"
 require "securerandom"
 require "shellwords"
-require "stringio"
 require "tmpdir"
 require_relative "../lib/upload"
 require_relative "interrupt_test_helper"
@@ -12,61 +11,108 @@ class UploadInterruptTransactionTest < Minitest::Test
 
   def test_call_restores_remote_and_local_paths_when_interrupted_after_finalization
     with_unicode_upload do |directory, file, normalized_file|
-      commands, staging_path, final_path = run_interrupted_upload(directory, file, :finalization)
+      commands = run_interrupted_upload(directory, file, :finalization)
 
       assert_equal "content", file.read
       refute normalized_file.exist?
-      assert_equal expected_finalization_commands(normalized_file, staging_path, final_path), commands
+      assert_equal expected_finalization_commands(file), commands
     end
   end
 
   def test_call_restores_staged_upload_when_interrupted_after_the_copy
     with_unicode_upload do |directory, file, normalized_file|
-      commands, staging_path, = run_interrupted_upload(directory, file, :staging)
+      commands = run_interrupted_upload(directory, file, :staging)
 
       assert_equal "content", file.read
       refute normalized_file.exist?
-      assert_equal expected_staging_commands(normalized_file, staging_path), commands
+      assert_equal expected_staging_commands(file), commands
     end
   end
 
   private
 
   def run_interrupted_upload(directory, file, phase)
-    staging_path = "gs://bucket/.task-googlecloud-staging/token/é.txt"
-    final_path = "gs://bucket/é.txt"
     commands = []
-    generation_paths = expected_generation_paths(staging_path, final_path, phase)
-
     with_interrupt_after_side_effect do |trigger|
-      exec = interrupted_exec(commands, trigger, staging_path, final_path, phase)
-      run_upload_with_interrupt(directory, file, exec, generation_pipe(generation_paths))
+      run_upload_with_interrupt(directory, file, phase, commands, trigger)
     end
-    assert_empty generation_paths
-    [commands, staging_path, final_path]
+    commands
   end
 
-  def expected_generation_paths(staging_path, final_path, phase)
-    return [[staging_path, "101"]] if phase == :staging
-
-    [[staging_path, "101"], [final_path, "102"], [staging_path, "103"]]
+  def run_upload_with_interrupt(directory, file, phase, commands, trigger)
+    uploader = Cloud::Upload.new("project")
+    uploader.stub(:upload_files_by_directory, { directory => [file] }) do
+      Cloud.stub(:login, nil) do
+        SecureRandom.stub(:hex, "token") do
+          stub_remote(phase, commands, trigger) { assert_raises(Interrupt) { uploader.call } }
+        end
+      end
+    end
   end
 
-  def run_upload_with_interrupt(directory, file, exec, pipe)
-    assert_raises(Interrupt) { run_upload(directory, file, exec, pipe) }
+  def stub_remote(phase, commands, trigger, &)
+    Cloud::ObjectCopy.stub(:copy, interrupted_copy(phase, commands, trigger)) do
+      Cloud::ObjectMove.stub(:move, interrupted_move(phase, commands, trigger)) do
+        Cloud::ObjectMove.stub(:rollback, interrupted_rollback(commands)) do
+          Cloud.stub(:exec, recording_exec(commands), &)
+        end
+      end
+    end
   end
 
-  def interrupted_exec(commands, trigger, staging_path, final_path, phase)
+  def interrupted_copy(phase, commands, trigger)
+    lambda do |source, target|
+      commands << Cloud::ObjectCopy.command(source, target)
+      trigger.call if phase == :staging
+      "101"
+    end
+  end
+
+  def interrupted_move(phase, commands, trigger)
+    lambda do |source, target|
+      commands << Cloud::ObjectMove.command("#{source}#101", target, source_path: source)
+      trigger.call if phase == :finalization
+      "102"
+    end
+  end
+
+  def interrupted_rollback(commands)
+    lambda do |source, target, generation|
+      commands << Cloud::ObjectMove.rollback_command(source, target, generation)
+      "103"
+    end
+  end
+
+  def recording_exec(commands)
     lambda do |command|
       commands << command
-      trigger.call if interrupted_command?(command, staging_path, final_path, phase)
+      nil
     end
   end
 
-  def interrupted_command?(command, staging_path, final_path, phase)
-    return command.start_with?("gsutil cp") if phase == :staging
+  def staging_path(file) = "gs://bucket/.task-googlecloud-staging/token/#{normalized_basename(file)}"
 
-    command == Cloud::ObjectMove.command(staging_path, final_path)
+  def final_path(file) = "gs://bucket/#{normalized_basename(file)}"
+
+  def expected_commands(file)
+    [
+      Shellwords.join(%w[gcloud config set project project]),
+      Cloud::ObjectCopy.command(file.dirname.join(normalized_basename(file)).to_path, staging_path(file)),
+      Cloud::ObjectMove.command("#{staging_path(file)}#101", final_path(file), source_path: staging_path(file)),
+    ]
+  end
+
+  def normalized_basename(file) = file.basename.to_s.normalized
+
+  def expected_finalization_commands(file)
+    expected_commands(file) + [
+      Cloud::ObjectMove.rollback_command(staging_path(file), final_path(file), "102"),
+      Cloud::ObjectMove.cleanup_command(staging_path(file), "103"),
+    ]
+  end
+
+  def expected_staging_commands(file)
+    expected_commands(file).first(2) + [Cloud::ObjectMove.cleanup_command(staging_path(file), "101")]
   end
 
   def with_unicode_upload
@@ -80,45 +126,5 @@ class UploadInterruptTransactionTest < Minitest::Test
 
       yield directory, file, normalized_file
     end
-  end
-
-  def run_upload(directory, file, exec, pipe)
-    uploader = Cloud::Upload.new("project")
-    uploader.stub(:upload_files_by_directory, { directory => [file] }) do
-      Cloud.stub(:login, nil) do
-        SecureRandom.stub(:hex, "token") do
-          Cloud.stub(:pipe, pipe) do
-            Cloud.stub(:exec, exec) { uploader.call }
-          end
-        end
-      end
-    end
-  end
-
-  def generation_pipe(generation_paths)
-    lambda do |command, &block|
-      expected_path, generation = generation_paths.shift
-      assert_equal Shellwords.join(["gsutil", "stat", expected_path]), command
-      block.call(StringIO.new("Generation: #{generation}\n"))
-    end
-  end
-
-  def expected_commands(normalized_file, staging_path)
-    [
-      Shellwords.join(%w[gcloud config set project project]),
-      Shellwords.join(["gsutil", "cp", normalized_file.to_path, staging_path]),
-      Cloud::ObjectMove.command(staging_path, "gs://bucket/é.txt"),
-    ]
-  end
-
-  def expected_finalization_commands(normalized_file, staging_path, final_path)
-    expected_commands(normalized_file, staging_path) + [
-      Cloud::ObjectMove.rollback_command(staging_path, final_path, "102"),
-      Cloud::ObjectMove.cleanup_command(staging_path, "103"),
-    ]
-  end
-
-  def expected_staging_commands(normalized_file, staging_path)
-    expected_commands(normalized_file, staging_path).first(2) + [Cloud::ObjectMove.cleanup_command(staging_path, "101")]
   end
 end

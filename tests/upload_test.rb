@@ -2,7 +2,7 @@ require "minitest/autorun"
 require "pathname"
 require "securerandom"
 require "shellwords"
-require "stringio"
+require "tmpdir"
 require_relative "../lib/upload"
 
 class UploadTest < Minitest::Test
@@ -24,16 +24,39 @@ class UploadTest < Minitest::Test
     uploader.stub(:upload_files_by_directory, { directory => [file] }) do
       Cloud.stub(:login, nil) do
         SecureRandom.stub(:hex, "token") do
-          stub_cloud(commands) { uploader.call }
+          stub_remote_writes(commands) { uploader.call }
         end
       end
     end
     commands
   end
 
-  def stub_cloud(commands, &)
-    Cloud.stub(:pipe, ->(_command, &block) { block.call(StringIO.new("Generation: 101\n")) }) do
-      Cloud.stub(:exec, ->(command) { commands << command }, &)
+  def stub_remote_writes(commands, &)
+    Cloud::ObjectCopy.stub(:copy, recording_copy(commands)) do
+      Cloud::ObjectMove.stub(:move, recording_move(commands)) do
+        Cloud.stub(:exec, recording_exec(commands), &)
+      end
+    end
+  end
+
+  def recording_copy(commands)
+    lambda do |source, target|
+      commands << Cloud::ObjectCopy.command(source, target)
+      "101"
+    end
+  end
+
+  def recording_move(commands)
+    lambda do |source, target|
+      commands << Cloud::ObjectMove.command("#{source}#101", target, source_path: source)
+      "102"
+    end
+  end
+
+  def recording_exec(commands)
+    lambda do |command|
+      commands << command
+      nil
     end
   end
 
@@ -42,8 +65,8 @@ class UploadTest < Minitest::Test
     final_path = "gs://#{directory.basename}/#{file.basename}"
     [
       Shellwords.join(["gcloud", "config", "set", "project", project]),
-      Shellwords.join(["gsutil", "cp", file.to_path, staging_path]),
-      Cloud::ObjectMove.command(staging_path, final_path),
+      Cloud::ObjectCopy.command(file.to_path, staging_path),
+      Cloud::ObjectMove.command("#{staging_path}#101", final_path, source_path: staging_path),
     ]
   end
 end

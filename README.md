@@ -26,11 +26,11 @@ Move files to `uploads/[bucket]` directory and run below command.
 mise run upload [project]
 ```
 
-### Recovery after a forced termination
+### Recovery after an interrupted or failed run
 
 The normalize and upload workflows catch Ctrl-C (`Interrupt`) and termination signals and attempt to roll back the transaction. A forced kill (`SIGKILL`),
 container or host termination, or a second interruption during rollback cannot be caught. These events can leave temporary Cloud Storage objects or locally
-normalized filenames behind.
+normalized filenames behind. The workflows also stop for manual recovery when a remote failure leaves an object whose ownership cannot be established safely.
 
 Before retrying a stopped run:
 

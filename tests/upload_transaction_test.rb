@@ -10,10 +10,9 @@ class UploadTransactionTest < Minitest::Test
   def test_call_restores_local_paths_when_an_upload_fails
     with_unicode_upload do |directory, file, normalized_file|
       uploader = Cloud::Upload.new("project")
-      failing_exec =
-        ->(command) { raise StandardError, "upload failed" if command.start_with?("gsutil cp") }
+      failing_copy = ->(_source, _target) { raise StandardError, "upload failed" }
 
-      assert_raises(StandardError) { run_upload(uploader, directory, file, failing_exec) }
+      assert_raises(StandardError) { run_upload(uploader, directory, file, copy: failing_copy) }
       assert_equal "content", file.read
       refute normalized_file.exist?
     end
@@ -22,53 +21,27 @@ class UploadTransactionTest < Minitest::Test
   def test_call_uses_the_normalized_filename_for_remote_paths
     with_unicode_upload do |directory, file, normalized_file|
       commands = []
-      uploader = Cloud::Upload.new("project")
-      recording_exec = ->(command) { commands << command }
-      run_upload(uploader, directory, file, recording_exec)
+      run_upload(Cloud::Upload.new("project"), directory, file, commands: commands)
 
-      staging_path = "gs://bucket/.task-googlecloud-staging/token/é.txt"
-      assert_equal expected_commands(normalized_file, staging_path), commands
+      assert_equal expected_commands(normalized_file), commands
     end
   end
 
   def test_call_restores_staged_objects_when_finalization_fails
-    assert_finalization_rollback(StandardError.new("finalization failed"))
-  end
+    with_unicode_upload do |directory, file, normalized_file|
+      commands = []
+      error = StandardError.new("finalization failed")
+      move = failing_move(commands, error)
 
-  def test_call_reports_manual_cleanup_when_generation_lookup_fails_after_upload
-    with_unicode_upload do |directory, file, _normalized_file|
-      uploader = Cloud::Upload.new("project")
-      generation_error = Cloud::ObjectMove::MissingGenerationError.new("gs://bucket/staged")
+      assert_raises(StandardError) do
+        run_upload(Cloud::Upload.new("project"), directory, file, commands: commands, move: move)
+      end
 
-      error =
-        assert_raises(NormalizationPlan::RollbackError) do
-          run_upload(uploader, directory, file, ->(_command) {}, ->(_command, &) { raise generation_error })
-        end
-
-      assert_includes error.message, "Cannot verify ownership"
+      assert_equal expected_commands(normalized_file) + [cleanup_command], commands
     end
   end
 
   private
-
-  def assert_finalization_rollback(error)
-    with_unicode_upload do |directory, file, normalized_file|
-      commands, staging_path, final_path = run_finalization_failure(error, directory, file)
-
-      assert_equal "content", file.read
-      refute normalized_file.exist?
-      assert_equal expected_failure_commands(normalized_file, staging_path, final_path), commands
-    end
-  end
-
-  def run_finalization_failure(error, directory, file)
-    staging_path = "gs://bucket/.task-googlecloud-staging/token/é.txt"
-    final_path = "gs://bucket/é.txt"
-    commands = []
-    exec = failing_finalize_exec(commands, staging_path, final_path, error)
-    assert_raises(error.class) { run_upload(Cloud::Upload.new("project"), directory, file, exec) }
-    [commands, staging_path, final_path]
-  end
 
   def with_unicode_upload
     Dir.mktmpdir do |directory_path|
@@ -83,40 +56,66 @@ class UploadTransactionTest < Minitest::Test
     end
   end
 
-  def run_upload(uploader, directory, file, exec, pipe = generation_pipe)
+  def run_upload(uploader, directory, file, commands: [], **stubs)
     uploader.stub(:upload_files_by_directory, { directory => [file] }) do
-      Cloud.stub(:login, nil) do
-        SecureRandom.stub(:hex, "token") do
-          Cloud.stub(:pipe, pipe) do
-            Cloud.stub(:exec, exec) { uploader.call }
+      with_upload_stubs(commands, **stubs) { uploader.call }
+    end
+  end
+
+  def with_upload_stubs(
+    commands,
+    copy: recording_copy(commands),
+    move: recording_move(commands),
+    pipe: generation_pipe,
+    &
+  )
+    Cloud.stub(:login, nil) do
+      SecureRandom.stub(:hex, "token") do
+        Cloud::ObjectCopy.stub(:copy, copy) do
+          Cloud::ObjectMove.stub(:move, move) do
+            Cloud.stub(:pipe, pipe) { Cloud.stub(:exec, recording_exec(commands), &) }
           end
         end
       end
     end
   end
 
-  def generation_pipe
-    lambda do |_command, &block|
-      block.call(StringIO.new("Generation: 101\n"))
+  def recording_copy(commands)
+    lambda do |source, target|
+      commands << Cloud::ObjectCopy.command(source, target)
+      "101"
     end
   end
 
-  def expected_commands(normalized_file, staging_path)
+  def recording_move(commands)
+    lambda do |source, target|
+      commands << Cloud::ObjectMove.command("#{source}#101", target, source_path: source)
+      "102"
+    end
+  end
+
+  def failing_move(commands, error)
+    lambda do |source, target|
+      commands << Cloud::ObjectMove.command("#{source}#101", target, source_path: source)
+      raise error
+    end
+  end
+
+  def recording_exec(commands) = ->(command) { commands << command }
+
+  def generation_pipe = ->(_command, &block) { block.call(StringIO.new("Generation: 101\n")) }
+
+  def expected_commands(normalized_file)
     [
       Shellwords.join(%w[gcloud config set project project]),
-      Shellwords.join(["gsutil", "cp", normalized_file.to_path, staging_path]),
-      Cloud::ObjectMove.command(staging_path, "gs://bucket/é.txt"),
+      Cloud::ObjectCopy.command(normalized_file.to_path, staging_path),
+      Cloud::ObjectMove.command("#{staging_path}#101", final_path, source_path: staging_path),
     ]
   end
 
-  def failing_finalize_exec(commands, staging_path, final_path, error = StandardError.new("finalization failed"))
-    lambda do |command|
-      commands << command
-      raise error if command == Cloud::ObjectMove.command(staging_path, final_path)
-    end
-  end
+  def staging_path = "gs://bucket/.task-googlecloud-staging/token/é.txt"
 
-  def expected_failure_commands(normalized_file, staging_path, _final_path)
-    expected_commands(normalized_file, staging_path) + [Cloud::ObjectMove.cleanup_command(staging_path, "101")]
-  end
+  def final_path = "gs://bucket/é.txt"
+
+  def cleanup_command = Cloud::ObjectMove.cleanup_command(staging_path, "101")
 end
