@@ -7,11 +7,12 @@ class WorkflowTest < Minitest::Test
   private_constant :CHECKOUT_ACTION, :MISE_ACTION
 
   def setup
-    @workflow = File.read(File.expand_path("../.github/workflows/lint.yml", __dir__))
+    @workflow = File.read(File.expand_path("../.github/workflows/lint-and-test.yml", __dir__))
     @config = YAML.safe_load(@workflow)
   end
 
   def test_ci_runs_the_test_task_for_pushes_and_pull_requests
+    assert_equal "Lint and test", @config["name"]
     assert_triggers
 
     test_job = @config["jobs"]["test"]

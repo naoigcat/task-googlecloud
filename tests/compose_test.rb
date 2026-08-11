@@ -95,6 +95,6 @@ class ComposeTest < Minitest::Test
     lines = dockerfile.lines
     start = lines.index { |line| line.include?("apt-get install -y") }
     finish = ((start + 1)...lines.length).find { |index| lines[index].strip == "&& \\" }
-    lines[(start + 1)...finish].map(&:strip)
+    lines[(start + 1)...finish].map { |line| line.strip.delete_suffix("\\").strip }
   end
 end
