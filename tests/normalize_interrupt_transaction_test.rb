@@ -66,10 +66,8 @@ class NormalizeInterruptTransactionTest < Minitest::Test
       Cloud::ObjectMove.command("other", "final-temporary"),
       Cloud::ObjectMove.command("temporary", "target"),
       Cloud::ObjectMove.command("final-temporary", "normalized"),
-      Cloud::ObjectMove.rollback_command("final-temporary", "normalized", "101"),
-      Cloud::ObjectMove.rollback_command("temporary", "target", "101"),
-      Cloud::ObjectMove.rollback_command("other", "final-temporary", "101"),
-      Cloud::ObjectMove.rollback_command("source", "temporary", "101"),
+      Cloud::ObjectMove.rollback_command("other", "normalized", "101"),
+      Cloud::ObjectMove.rollback_command("source", "target", "101"),
     ]
   end
 end

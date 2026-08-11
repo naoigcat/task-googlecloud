@@ -31,7 +31,7 @@ class NormalizeTransactionTest < Minitest::Test
     assert_equal expected_commands(source_one, source_two, temporary_one, temporary_two), @commands
   end
 
-  def test_call_restores_staged_objects_when_finalization_fails
+  def test_call_restores_original_sources_when_finalization_fails_after_a_move
     sources = ["gs://bucket/é.txt", "gs://bucket/á.txt"]
     temporaries = sources.map { |source| "#{source}.task-googlecloud-token" }
     targets = sources.map(&:normalized)
@@ -97,8 +97,8 @@ class NormalizeTransactionTest < Minitest::Test
     commands = [Shellwords.join(%w[gcloud config set project project])]
     commands.concat(move_commands(sources, temporaries))
     commands.concat(move_commands(temporaries, targets))
-    commands.concat(rollback_commands([temporaries.first], [targets.first]))
-    commands.concat(rollback_commands(sources, temporaries))
+    commands.concat(rollback_commands([sources.first], [targets.first]))
+    commands << Cloud::ObjectMove.rollback_command(sources.last, temporaries.last, "101")
     commands
   end
 

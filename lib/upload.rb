@@ -100,19 +100,25 @@ module Cloud
     end
 
     def rollback_uploads(staged_files, finalized_files)
-      rollback_finalized_uploads(finalized_files) + cleanup_staged_uploads(staged_files)
+      finalized_files.reverse_each.filter_map { |entry| attempt_finalized_rollback(*entry) } +
+        cleanup_staged_uploads(staged_files, finalized_files)
     end
 
-    def rollback_finalized_uploads(finalized_files)
-      finalized_files.reverse_each.filter_map do |staging_path, final_path, final_generation|
-        attempt_remote_rollback(staging_path, final_path, final_generation)
-      end
+    def cleanup_staged_uploads(staged_files, finalized_files)
+      finalized_staging_paths = finalized_files.map(&:first)
+      # Finalization recreates staging with a new generation, so it is cleaned separately.
+      staged_files.reject { |staged_file| finalized_staging_paths.include?(staged_file.first) }
+                  .filter_map { |staging_path, _, generation| attempt_remote_cleanup(staging_path, generation) }
     end
 
-    def cleanup_staged_uploads(staged_files)
-      staged_files.filter_map do |staged_file|
-        attempt_remote_cleanup(*staged_file)
-      end
+    def attempt_finalized_rollback(staging_path, final_path, final_generation)
+      rollback_error = attempt_remote_rollback(staging_path, final_path, final_generation)
+      return rollback_error if rollback_error
+
+      # Rollback copies final back to staging, so delete its newly read generation.
+      attempt_remote_cleanup(staging_path, Cloud::ObjectMove.generation(staging_path))
+    rescue StandardError => e
+      e
     end
 
     # Try every remote cleanup so one failure does not block later restorations.
@@ -122,7 +128,7 @@ module Cloud
       e
     end
 
-    def attempt_remote_cleanup(staging_path, _final_path, staging_generation)
+    def attempt_remote_cleanup(staging_path, staging_generation)
       Cloud.exec(Cloud::ObjectMove.cleanup_command(staging_path, staging_generation))
     rescue StandardError => e
       e

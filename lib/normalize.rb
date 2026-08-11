@@ -56,8 +56,8 @@ module Cloud
     end
 
     def finalize_objects(moves, finalized)
-      moves.each do |_source, target, temporary|
-        record_move(temporary, target, finalized)
+      moves.each do |source, target, temporary|
+        record_move(temporary, target, finalized) { |move| move[0] = source }
       end
     end
 
@@ -67,6 +67,7 @@ module Cloud
         move_object(source, target)
         moves << [source, target, nil]
         moves.last[2] = Cloud::ObjectMove.generation(target)
+        yield moves.last if block_given?
       end
     end
 
@@ -80,7 +81,7 @@ module Cloud
     end
 
     def rollback_objects(staged, finalized)
-      rollback_finalized(finalized) + rollback_staged(staged)
+      rollback_finalized(finalized) + rollback_staged(staged, finalized)
     end
 
     def rollback_finalized(finalized)
@@ -89,8 +90,12 @@ module Cloud
       end
     end
 
-    def rollback_staged(staged)
+    def rollback_staged(staged, finalized)
+      finalized_sources = finalized.map(&:first)
       staged.reverse_each.filter_map do |source, temporary, temporary_generation|
+        # Finalization already restored this source; replaying staging would use an obsolete generation.
+        next if finalized_sources.include?(source)
+
         attempt_rollback(source, temporary, temporary_generation)
       end
     end

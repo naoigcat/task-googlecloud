@@ -47,9 +47,9 @@ class UploadInterruptTransactionTest < Minitest::Test
   end
 
   def expected_generation_paths(staging_path, final_path, phase)
-    return [staging_path] if phase == :staging
+    return [[staging_path, "101"]] if phase == :staging
 
-    [staging_path, final_path]
+    [[staging_path, "101"], [final_path, "102"], [staging_path, "103"]]
   end
 
   def run_upload_with_interrupt(directory, file, exec, pipe)
@@ -97,9 +97,9 @@ class UploadInterruptTransactionTest < Minitest::Test
 
   def generation_pipe(generation_paths)
     lambda do |command, &block|
-      expected_path = generation_paths.shift
+      expected_path, generation = generation_paths.shift
       assert_equal Shellwords.join(["gsutil", "stat", expected_path]), command
-      block.call(StringIO.new("Generation: 101\n"))
+      block.call(StringIO.new("Generation: #{generation}\n"))
     end
   end
 
@@ -113,8 +113,8 @@ class UploadInterruptTransactionTest < Minitest::Test
 
   def expected_finalization_commands(normalized_file, staging_path, final_path)
     expected_commands(normalized_file, staging_path) + [
-      Cloud::ObjectMove.rollback_command(staging_path, final_path, "101"),
-      Cloud::ObjectMove.cleanup_command(staging_path, "101"),
+      Cloud::ObjectMove.rollback_command(staging_path, final_path, "102"),
+      Cloud::ObjectMove.cleanup_command(staging_path, "103"),
     ]
   end
 
