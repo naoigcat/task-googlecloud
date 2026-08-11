@@ -19,7 +19,7 @@ module PathnameNormalization
     apply_renames(entries, renamed)
 
     entries.map { |_source, target| Pathname.new(target) }
-  rescue StandardError => e
+  rescue StandardError, SignalException => e
     rollback_after_failure(e, renamed)
   end
 
@@ -27,7 +27,14 @@ module PathnameNormalization
     entries.each do |source, target|
       next if source == target
 
-      Pathname.new(source).rename(target)
+      record_rename(source, target, renamed) { Pathname.new(source).rename(target) }
+    end
+  end
+
+  def record_rename(source, target, renamed)
+    # Defer signals until the filesystem change is recorded for a complete rollback.
+    Thread.handle_interrupt(SignalException => :never) do
+      yield
       renamed << [source, target]
     end
   end

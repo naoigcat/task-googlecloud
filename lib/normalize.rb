@@ -39,7 +39,7 @@ module Cloud
     def process_moves(moves, staged, finalized)
       stage_objects(moves, staged)
       finalize_objects(moves, finalized)
-    rescue StandardError => e
+    rescue StandardError, SignalException => e
       rollback_after_failure(e, staged, finalized)
     end
 
@@ -51,17 +51,22 @@ module Cloud
 
     def stage_objects(moves, staged)
       moves.each do |source, _target, temporary|
-        move_object(source, temporary)
-        staged << [source, temporary, nil]
-        staged.last[2] = Cloud::ObjectMove.generation(temporary)
+        record_move(source, temporary, staged)
       end
     end
 
     def finalize_objects(moves, finalized)
       moves.each do |_source, target, temporary|
-        move_object(temporary, target)
-        finalized << [temporary, target, nil]
-        finalized.last[2] = Cloud::ObjectMove.generation(target)
+        record_move(temporary, target, finalized)
+      end
+    end
+
+    def record_move(source, target, moves)
+      # Defer signals until the move and generation are recorded so rollback sees every side effect.
+      Thread.handle_interrupt(SignalException => :never) do
+        move_object(source, target)
+        moves << [source, target, nil]
+        moves.last[2] = Cloud::ObjectMove.generation(target)
       end
     end
 

@@ -17,6 +17,20 @@ class NormalizeTransactionTest < Minitest::Test
     assert_equal expected_commands(source_one, source_two, temporary_one, temporary_two), @commands
   end
 
+  def test_call_restores_staged_objects_when_interrupted
+    source_one = "gs://bucket/é.txt"
+    source_two = "gs://bucket/á.txt"
+    temporary_one = "#{source_one}.task-googlecloud-token"
+    temporary_two = "#{source_two}.task-googlecloud-token"
+
+    failure_command = Cloud::ObjectMove.command(source_two, temporary_two)
+    assert_raises(Interrupt) do
+      run_failing_normalization(source_one, source_two, failure_command, Interrupt.new)
+    end
+
+    assert_equal expected_commands(source_one, source_two, temporary_one, temporary_two), @commands
+  end
+
   def test_call_restores_staged_objects_when_finalization_fails
     sources = ["gs://bucket/é.txt", "gs://bucket/á.txt"]
     temporaries = sources.map { |source| "#{source}.task-googlecloud-token" }
@@ -30,20 +44,20 @@ class NormalizeTransactionTest < Minitest::Test
 
   private
 
-  def run_failing_normalization(source_one, source_two, failure_command)
+  def run_failing_normalization(source_one, source_two, failure_command, error = StandardError.new("staging failed"))
     @commands = []
     SecureRandom.stub(:hex, "token") do
-      stub_cloud(@commands, source_one, source_two, failure_command) do
+      stub_cloud(@commands, source_one, source_two, failure_command, error) do
         Cloud::Normalize.call("project", "bucket")
       end
     end
   end
 
-  def stub_cloud(commands, source_one, source_two, failure_command, &)
+  def stub_cloud(commands, source_one, source_two, failure_command, error = StandardError.new("staging failed"), &)
     Cloud::Normalize.stub(:sleep, nil) do
       Cloud.stub(:login, nil) do
         Cloud.stub(:pipe, listing_pipe(source_one, source_two)) do
-          Cloud.stub(:exec, failing_exec(commands, failure_command), &)
+          Cloud.stub(:exec, failing_exec(commands, failure_command, error), &)
         end
       end
     end
@@ -59,14 +73,14 @@ class NormalizeTransactionTest < Minitest::Test
     end
   end
 
-  def failing_exec(commands, failure_command)
+  def failing_exec(commands, failure_command, error)
     failed = false
     lambda do |command|
       commands << command
       next unless command == failure_command && !failed
 
       failed = true
-      raise StandardError, "staging failed"
+      raise error
     end
   end
 

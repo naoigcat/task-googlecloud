@@ -32,18 +32,7 @@ class UploadTransactionTest < Minitest::Test
   end
 
   def test_call_restores_staged_objects_when_finalization_fails
-    with_unicode_upload do |directory, file, normalized_file|
-      staging_path = "gs://bucket/.task-googlecloud-staging/token/é.txt"
-      final_path = "gs://bucket/é.txt"
-      commands = []
-      uploader = Cloud::Upload.new("project")
-
-      assert_raises(StandardError) do
-        run_upload(uploader, directory, file, failing_finalize_exec(commands, staging_path, final_path))
-      end
-
-      assert_equal expected_failure_commands(normalized_file, staging_path, final_path), commands
-    end
+    assert_finalization_rollback(StandardError.new("finalization failed"))
   end
 
   def test_call_reports_manual_cleanup_when_generation_lookup_fails_after_upload
@@ -61,6 +50,25 @@ class UploadTransactionTest < Minitest::Test
   end
 
   private
+
+  def assert_finalization_rollback(error)
+    with_unicode_upload do |directory, file, normalized_file|
+      commands, staging_path, final_path = run_finalization_failure(error, directory, file)
+
+      assert_equal "content", file.read
+      refute normalized_file.exist?
+      assert_equal expected_failure_commands(normalized_file, staging_path, final_path), commands
+    end
+  end
+
+  def run_finalization_failure(error, directory, file)
+    staging_path = "gs://bucket/.task-googlecloud-staging/token/é.txt"
+    final_path = "gs://bucket/é.txt"
+    commands = []
+    exec = failing_finalize_exec(commands, staging_path, final_path, error)
+    assert_raises(error.class) { run_upload(Cloud::Upload.new("project"), directory, file, exec) }
+    [commands, staging_path, final_path]
+  end
 
   def with_unicode_upload
     Dir.mktmpdir do |directory_path|
@@ -101,10 +109,10 @@ class UploadTransactionTest < Minitest::Test
     ]
   end
 
-  def failing_finalize_exec(commands, staging_path, final_path)
+  def failing_finalize_exec(commands, staging_path, final_path, error = StandardError.new("finalization failed"))
     lambda do |command|
       commands << command
-      raise StandardError, "finalization failed" if command == Cloud::ObjectMove.command(staging_path, final_path)
+      raise error if command == Cloud::ObjectMove.command(staging_path, final_path)
     end
   end
 

@@ -42,7 +42,7 @@ module Cloud
 
     def upload_with_rollback(files_by_directory, normalized_files, normalization_plan)
       upload_normalized_files(files_by_directory, normalized_files)
-    rescue StandardError => e
+    rescue StandardError, SignalException => e
       rollback_errors = Pathname.rollback_normalization(normalization_plan)
       NormalizationPlan.raise_on_rollback_failure(e, rollback_errors)
       raise
@@ -55,7 +55,7 @@ module Cloud
       finalized_files = []
 
       perform_upload(files_by_directory, normalized_files, staging_prefix, staged_files, finalized_files)
-    rescue StandardError => e
+    rescue StandardError, SignalException => e
       rollback_errors = rollback_uploads(staged_files, finalized_files)
       NormalizationPlan.raise_on_rollback_failure(e, rollback_errors)
       raise
@@ -76,17 +76,26 @@ module Cloud
         normalized_file = normalized_files[file]
         staging_path = "gs://#{bucket}/#{staging_prefix}/#{normalized_file.basename}"
         final_path = "gs://#{bucket}/#{normalized_file.basename}"
-        Cloud.exec(Shellwords.join(["gsutil", "cp", normalized_file.to_path, staging_path]))
-        staged_files << [staging_path, final_path, nil]
-        staged_files.last[2] = Cloud::ObjectMove.generation(staging_path)
+        record_remote_change(staging_path, final_path, staging_path, staged_files) do
+          Cloud.exec(Shellwords.join(["gsutil", "cp", normalized_file.to_path, staging_path]))
+        end
       end
     end
 
     def finalize_uploads(staged_files, finalized_files)
       staged_files.each do |staging_path, final_path, _staging_generation|
-        Cloud.exec(Cloud::ObjectMove.command(staging_path, final_path))
-        finalized_files << [staging_path, final_path, nil]
-        finalized_files.last[2] = Cloud::ObjectMove.generation(final_path)
+        record_remote_change(staging_path, final_path, final_path, finalized_files) do
+          Cloud.exec(Cloud::ObjectMove.command(staging_path, final_path))
+        end
+      end
+    end
+
+    def record_remote_change(source, target, generation_path, changes)
+      # Defer signals until the remote change and generation are recorded for safe rollback.
+      Thread.handle_interrupt(SignalException => :never) do
+        yield
+        changes << [source, target, nil]
+        changes.last[2] = Cloud::ObjectMove.generation(generation_path)
       end
     end
 
