@@ -3,16 +3,16 @@ services:
     build:
       context: .
       dockerfile_inline: |
-        FROM node:20-bookworm-slim AS markdownlint
+        FROM node:20-bookworm-slim@sha256:2cf067cfed83d5ea958367df9f966191a942351a2df77d6f0193e162b5febfc0 AS markdownlint
         RUN npm install -g markdownlint-cli2@0.22.1 --no-fund --no-audit
-        FROM ruby:3.4.10-slim-bookworm
+        FROM ruby:3.4.10-slim-bookworm@sha256:514336e7d46dd52b94a7391e4bc34dc04dc83098963c2c2493b90354952acd78
         WORKDIR /app
         COPY --from=markdownlint /usr/local/bin/node /usr/local/bin/node
         COPY --from=markdownlint /usr/local/bin/markdownlint-cli2 /usr/local/bin/markdownlint-cli2
         COPY --from=markdownlint /usr/local/lib/node_modules /usr/local/lib/node_modules
         RUN apt-get update && apt-get install -y \
-                build-essential \
-                openssh-client \
+                build-essential=12.9 \
+                openssh-client=1:9.2p1-2+deb12u10 \
             && \
             gem install ast -v 2.4.3 --no-document && \
             gem install json -v 2.21.2 --no-document && \
@@ -44,11 +44,11 @@ services:
     build:
       context: .
       dockerfile_inline: |
-        FROM --platform=linux/x86_64 gcr.io/google.com/cloudsdktool/google-cloud-cli:489.0.0
+        FROM --platform=linux/x86_64 gcr.io/google.com/cloudsdktool/google-cloud-cli:489.0.0@sha256:1fe16aa77fac9463b8b8ec3a5ebf1e5a02f0ce6afc67a5bf63055f0c6f855892
         WORKDIR /uploads
         RUN apt-get update && apt-get install -y \
-                openssh-server \
-                netcat-openbsd \
+                openssh-server=1:9.2p1-2+deb12u10 \
+                netcat-openbsd=1.219-1 \
             && \
             useradd --create-home --shell /bin/bash cloud && \
             mkdir /var/run/sshd && \
