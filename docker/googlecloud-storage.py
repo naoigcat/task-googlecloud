@@ -13,6 +13,7 @@ API_HOST = "storage.googleapis.com"
 API_ROOT = "/storage/v1"
 UPLOAD_ROOT = "/upload/storage/v1"
 CHUNK_SIZE = 1024 * 1024
+HTTPS_TIMEOUT = 30
 
 
 class StorageApiError(RuntimeError):
@@ -47,7 +48,7 @@ def response_error(status, body):
 def request(method, path, token, headers=None, body=None):
     request_headers = {"Authorization": f"Bearer {token}", "Accept": "application/json"}
     request_headers.update(headers or {})
-    connection = http.client.HTTPSConnection(API_HOST)
+    connection = http.client.HTTPSConnection(API_HOST, timeout=HTTPS_TIMEOUT)
     try:
         connection.request(method, path, body=body, headers=request_headers)
         response = connection.getresponse()
@@ -125,7 +126,7 @@ def upload_file(source, bucket, object_name, token=None):
     )
     path = f"{UPLOAD_ROOT}/b/{encoded_path(bucket)}/o?{query}"
     size = os.path.getsize(source)
-    connection = http.client.HTTPSConnection(API_HOST)
+    connection = http.client.HTTPSConnection(API_HOST, timeout=HTTPS_TIMEOUT)
     try:
         connection.putrequest("POST", path)
         connection.putheader("Authorization", f"Bearer {token}")

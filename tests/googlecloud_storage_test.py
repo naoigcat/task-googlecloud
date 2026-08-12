@@ -1,8 +1,10 @@
 import contextlib
 import importlib.util
 import io
+import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import Mock, patch
 from urllib.parse import parse_qs, urlsplit
 
 
@@ -111,6 +113,31 @@ class GooglecloudStorageTest(unittest.TestCase):
                 with self.assertRaises(storage.StorageApiError) as context:
                     storage.list_objects("bucket", token="token")
                 self.assertEqual(status, context.exception.status)
+
+
+class HttpsConnectionTimeoutTest(unittest.TestCase):
+    def test_request_sets_a_socket_timeout(self):
+        connection = Mock()
+        connection.getresponse.return_value.status = 200
+        connection.getresponse.return_value.read.return_value = b"{}"
+
+        with patch.object(storage.http.client, "HTTPSConnection", return_value=connection) as constructor:
+            storage.request("GET", "/path", "token")
+
+        constructor.assert_called_once_with(storage.API_HOST, timeout=30)
+
+    def test_upload_sets_a_socket_timeout(self):
+        connection = Mock()
+        connection.getresponse.return_value.status = 200
+        connection.getresponse.return_value.read.return_value = b"{}"
+
+        with tempfile.NamedTemporaryFile() as source:
+            source.write(b"content")
+            source.flush()
+            with patch.object(storage.http.client, "HTTPSConnection", return_value=connection) as constructor:
+                storage.upload_file(source.name, "bucket", "object", token="token")
+
+        constructor.assert_called_once_with(storage.API_HOST, timeout=30)
 
 
 if __name__ == "__main__":
