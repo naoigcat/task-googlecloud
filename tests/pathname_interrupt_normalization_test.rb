@@ -1,11 +1,8 @@
 require "minitest/autorun"
 require "tmpdir"
 require_relative "../lib/pathname_normalization"
-require_relative "interrupt_test_helper"
 
 class PathnameInterruptNormalizationTest < Minitest::Test
-  include InterruptTestHelper
-
   def test_apply_normalization_restores_paths_when_interrupted_after_the_rename
     Dir.mktmpdir do |directory|
       source, target = interrupted_paths(directory)
@@ -29,35 +26,39 @@ class PathnameInterruptNormalizationTest < Minitest::Test
   end
 
   def apply_interrupted_normalization(source, target, interrupt)
-    Pathname.stub(:new, interrupting_constructor(source, interrupt)) do
+    AtomicRename.stub(:rename, interrupting_rename(interrupt)) do
       Pathname.apply_normalization([[source.to_path, target.to_path]])
     end
   end
 
-  def interrupting_constructor(source, interrupt)
-    original_new = Pathname.method(:new)
-    source_operation = interrupting_source_operation(source, interrupt)
-    constructor_for_path(original_new, source, source_operation)
-  end
-
-  def constructor_for_path(original_new, source, source_operation)
-    used_for_rename = false
-    lambda do |path|
-      if path == source.to_path && !used_for_rename
-        used_for_rename = true
-        source_operation
-      else
-        original_new.call(path)
-      end
-    end
-  end
-
-  def interrupting_source_operation(source, interrupt)
-    operation = Object.new
-    operation.define_singleton_method(:rename) do |target_path|
-      source.rename(target_path)
+  def interrupting_rename(interrupt)
+    original_rename = AtomicRename.method(:rename)
+    lambda do |source, target|
+      original_rename.call(source, target)
       interrupt.call
     end
-    operation
+  end
+
+  def with_interrupt_after_side_effect
+    release = Queue.new
+    interrupter = interrupt_thread(release)
+    yield interrupt_trigger(release)
+  ensure
+    release << true
+    interrupter&.join
+  end
+
+  def interrupt_thread(release)
+    Thread.new do
+      release.pop
+      Thread.main.raise(Interrupt)
+    end
+  end
+
+  def interrupt_trigger(release)
+    lambda do
+      release << true
+      Thread.pass
+    end
   end
 end

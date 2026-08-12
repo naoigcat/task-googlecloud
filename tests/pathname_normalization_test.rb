@@ -42,6 +42,17 @@ class PathnameNormalizationTest < Minitest::Test
     end
   end
 
+  def test_apply_normalization_does_not_overwrite_a_target_created_after_planning
+    Dir.mktmpdir do |directory|
+      source = Pathname.new(directory).join("source.txt")
+      target = Pathname.new(directory).join("target.txt")
+      source.write("original")
+      rename = target_appearing_rename(target)
+
+      assert_normalization_rejects_target(source, target, rename)
+    end
+  end
+
   private
 
   def failure_paths(directory)
@@ -58,6 +69,22 @@ class PathnameNormalizationTest < Minitest::Test
       [source.to_path, target.to_path],
       [missing_source.to_path, missing_target.to_path],
     ]
+  end
+
+  def target_appearing_rename(target)
+    original_rename = AtomicRename.method(:rename)
+    lambda do |source_path, target_path|
+      target.write("competitor") if target_path == target.to_path && !target.exist?
+      original_rename.call(source_path, target_path)
+    end
+  end
+
+  def assert_normalization_rejects_target(source, target, rename)
+    assert_raises(Errno::EEXIST) do
+      AtomicRename.stub(:rename, rename) { Pathname.apply_normalization([[source.to_path, target.to_path]]) }
+    end
+    assert_equal "original", source.read
+    assert_equal "competitor", target.read
   end
 
   # Create both Unicode forms and skip when the filesystem collapses them.

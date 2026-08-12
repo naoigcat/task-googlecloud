@@ -1,4 +1,5 @@
 require "pathname"
+require_relative "atomic_rename"
 require_relative "normalization_plan"
 require_relative "string_normalization"
 
@@ -27,8 +28,15 @@ module PathnameNormalization
     entries.each do |source, target|
       next if source == target
 
-      record_rename(source, target, renamed) { Pathname.new(source).rename(target) }
+      record_rename(source, target, renamed) { rename_without_overwrite(source, target) }
     end
+  end
+
+  # Use the filesystem's atomic no-replace operation so a competing file cannot be replaced.
+  def rename_without_overwrite(source, target)
+    return if File.exist?(source) && File.exist?(target) && File.identical?(source, target)
+
+    AtomicRename.rename(source, target)
   end
 
   def record_rename(source, target, renamed)
@@ -64,7 +72,7 @@ module PathnameNormalization
     raise Errno::EEXIST if source_path.exist? && target_path.exist?
     raise Errno::ENOENT unless target_path.exist? && !source_path.exist?
 
-    target_path.rename(source)
+    rename_without_overwrite(target, source)
     nil
   rescue StandardError => e
     e
