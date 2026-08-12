@@ -103,7 +103,7 @@ class CloudMoveTest < Minitest::Test
   end
 
   def move_command(source, target)
-    Cloud::ObjectMove.command("#{source}#123", target, source_path: source)
+    Cloud::ObjectMove.command(source, target, source_path: source, source_generation: "123")
   end
 
   def assert_uses_state_command(command, path)

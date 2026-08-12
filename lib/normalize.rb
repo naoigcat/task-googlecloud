@@ -21,7 +21,8 @@ module Cloud
     def call
       Cloud.login
       Cloud.exec(Shellwords.join(["gcloud", "config", "set", "project", @project]))
-      files = Cloud.pipe(Shellwords.join(["gsutil", "ls", "gs://#{@bucket}/**"]), &:readlines).map(&:chomp)
+      # The API returns object names as data, so wildcard characters cannot alter the listing.
+      files = Cloud.pipe(Cloud::StorageApi.list_command(@bucket), &:readlines).map(&:chomp)
 
       normalize_objects(NormalizationPlan.build(files).reject { |source, target| source == target })
     end

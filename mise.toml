@@ -81,7 +81,7 @@ fi
 '''
 
 [tasks.test]
-description = "Run Ruby tests"
+description = "Run Ruby and Cloud Storage API tests"
 run = '''
 set -eu
 if [ "${TASK_GOOGLECLOUD_IN_CONTAINER:-}" = "1" ] || [ -f /.dockerenv ]; then
@@ -89,5 +89,6 @@ if [ "${TASK_GOOGLECLOUD_IN_CONTAINER:-}" = "1" ] || [ -f /.dockerenv ]; then
 else
     docker compose build app
     docker compose run --rm --no-deps -e TASK_GOOGLECLOUD_IN_CONTAINER=1 app ruby -Ilib -e 'Dir["tests/**/*_test.rb"].sort.each { |file| require File.expand_path(file) }'
+    docker compose run --rm --no-deps -e PYTHONDONTWRITEBYTECODE=1 --entrypoint python3 googlecloud -m unittest discover -s /app/tests -p 'googlecloud_storage_test.py'
 fi
 '''

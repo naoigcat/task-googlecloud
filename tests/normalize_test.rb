@@ -12,7 +12,7 @@ class NormalizeTest < Minitest::Test
     commands, queries = run_normalization(project, bucket)
 
     assert_equal [Shellwords.join(["gcloud", "config", "set", "project", project])], commands
-    assert_equal [Shellwords.join(["gsutil", "ls", "gs://#{bucket}/**"])], queries
+    assert_equal [Cloud::StorageApi.list_command(bucket)], queries
   end
 
   # Ensure normalized object names remain single remote-shell arguments during moves.
@@ -22,6 +22,16 @@ class NormalizeTest < Minitest::Test
     commands = SecureRandom.stub(:hex, "token") { run_normalization_with_listing(source) }
 
     assert_equal expected_move_commands(source, target), commands
+  end
+
+  def test_call_passes_special_object_names_to_the_api
+    source = "gs://bucket/folder*?[]#/é.txt"
+    target = source.normalized
+    commands = SecureRandom.stub(:hex, "token") { run_normalization_with_listing(source) }
+    temporary = "#{source}.task-googlecloud-token"
+
+    assert_api_move(commands, source, temporary)
+    assert_api_move(commands, temporary, target)
   end
 
   # Ensure a collision found during preflight validation leaves Cloud Storage unchanged.
@@ -35,7 +45,7 @@ class NormalizeTest < Minitest::Test
       end
     end
 
-    assert_equal [Shellwords.join(["gsutil", "ls", "gs://bucket/**"])], queries
+    assert_equal [Cloud::StorageApi.list_command("bucket")], queries
     refute(commands.any? { |command| command.include?("gsutil") })
   end
 
@@ -66,16 +76,21 @@ class NormalizeTest < Minitest::Test
     temporary = "#{source}.task-googlecloud-token"
     [
       Shellwords.join(%w[gcloud config set project project]),
-      Cloud::ObjectMove.command("#{source}#101", temporary, source_path: source),
-      Cloud::ObjectMove.command("#{temporary}#101", target, source_path: temporary),
+      Cloud::ObjectMove.command(source, temporary, source_path: source, source_generation: "101"),
+      Cloud::ObjectMove.command(temporary, target, source_path: temporary, source_generation: "101"),
     ]
   end
 
   def recording_move(commands)
     lambda do |source, target|
-      commands << Cloud::ObjectMove.command("#{source}#101", target, source_path: source)
+      commands << Cloud::ObjectMove.command(source, target, source_path: source, source_generation: "101")
       "101"
     end
+  end
+
+  def assert_api_move(commands, source, target)
+    expected = Cloud::StorageApi.move_command(source, target, source_generation: "101")
+    assert(commands.any? { |command| command.include?(expected) })
   end
 
   # Supply the exact object name needed to exercise a command path.
