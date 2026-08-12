@@ -63,6 +63,34 @@ class CloudTest < Minitest::Test
     end
   end
 
+  def test_pipe_converts_read_errors_to_command_errors
+    io_error = IOError.new("read failed")
+    reader = Object.new
+    reader.define_singleton_method(:read) { raise io_error }
+    popen = ->(_command, _mode, _opt, &block) { block.call(reader) }
+
+    IO.stub(:popen, popen) do
+      error = assert_raises(Cloud::CommandError) { Cloud.pipe("gcloud storage", &:read) }
+
+      assert_includes error.message, "Cloud.pipe"
+      assert_same io_error, error.cause
+    end
+  end
+
+  def test_pipe_converts_system_call_errors_to_command_errors
+    system_error = Errno::ECONNRESET.new
+    reader = Object.new
+    reader.define_singleton_method(:read) { raise system_error }
+    popen = ->(_command, _mode, _opt, &block) { block.call(reader) }
+
+    IO.stub(:popen, popen) do
+      error = assert_raises(Cloud::CommandError) { Cloud.pipe("gcloud storage", &:read) }
+
+      assert_includes error.message, "Cloud.pipe"
+      assert_same system_error, error.cause
+    end
+  end
+
   def test_pipe_requires_a_block_to_check_the_remote_command_status
     assert_raises(ArgumentError) { Cloud.pipe("exit 7") }
   end

@@ -28,6 +28,17 @@ class NormalizePartialMoveFailureTest < Minitest::Test
     assert_equal [Cloud::ObjectMove.command(SOURCE, TEMPORARY)], commands
   end
 
+  def test_process_moves_confirms_after_a_read_error
+    normalizer = Cloud::Normalize.new("project", "bucket")
+    read_error = IOError.new("read failed")
+    confirmations = []
+    error = assert_read_error_confirmed(normalizer, read_error, confirmations)
+
+    assert_same read_error, error
+
+    assert_equal [[SOURCE, TEMPORARY, read_error]], confirmations
+  end
+
   private
 
   def run_failed_move(responses, error_class)
@@ -64,6 +75,16 @@ class NormalizePartialMoveFailureTest < Minitest::Test
     lambda do |command|
       commands << command
       nil
+    end
+  end
+
+  def assert_read_error_confirmed(normalizer, read_error, confirmations)
+    Cloud::ObjectMove.stub(:confirm_move_after_failure, ->(*args) { confirmations << args }) do
+      normalizer.stub(:move_object, ->(_source, _target) { raise read_error }) do
+        assert_raises(IOError) do
+          normalizer.__send__(:process_moves, [[SOURCE, "target", TEMPORARY]], [], [])
+        end
+      end
     end
   end
 end

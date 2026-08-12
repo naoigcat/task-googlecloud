@@ -73,7 +73,7 @@ module Cloud
       target_generation = move_object(source, target)
       moves << [source, target, target_generation]
       yield moves.last
-    rescue Cloud::CommandError, Cloud::ObjectMove::MissingGenerationError => e
+    rescue Cloud::CommandError, Cloud::ObjectMove::MissingGenerationError, IOError, SystemCallError => e
       Cloud::ObjectMove.confirm_move_after_failure(source, target, e) unless target_generation
       raise
     end

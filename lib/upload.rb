@@ -95,7 +95,7 @@ module Cloud
       Thread.handle_interrupt(SignalException => :never) do
         target_generation = yield
         changes << [source, target, target_generation]
-      rescue Cloud::CommandError, Cloud::ObjectMove::MissingGenerationError => e
+      rescue Cloud::CommandError, Cloud::ObjectMove::MissingGenerationError, IOError, SystemCallError => e
         confirm_remote_failure(remote_source, remote_target, e) unless target_generation
         raise
       end

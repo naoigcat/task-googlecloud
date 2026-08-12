@@ -33,7 +33,12 @@ module Cloud
       raise ArgumentError, "Cloud.pipe requires a block to check command status" unless block_given?
 
       remote_command = "#{ssh_command} #{command.shellescape}"
-      result = IO.popen(remote_command, mode, opt, &)
+      result =
+        begin
+          IO.popen(remote_command, mode, opt, &)
+        rescue IOError, SystemCallError
+          raise CommandError.new("Cloud.pipe", command, $CHILD_STATUS)
+        end
       raise_command_error("Cloud.pipe", command, $CHILD_STATUS)
       result
     end

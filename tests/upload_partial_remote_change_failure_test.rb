@@ -40,6 +40,17 @@ class UploadPartialRemoteChangeFailureTest < Minitest::Test
     assert_empty staged_files
   end
 
+  def test_upload_confirms_after_a_read_error
+    uploader = Cloud::Upload.new("project")
+    read_error = IOError.new("read failed")
+    confirmations = []
+    error = assert_read_error_confirmed(uploader, read_error, confirmations)
+
+    assert_same read_error, error
+
+    assert_equal [[STAGING_PATH, read_error]], confirmations
+  end
+
   private
 
   def record_partial_upload(staged_files, target: STAGING_PATH)
@@ -76,5 +87,15 @@ class UploadPartialRemoteChangeFailureTest < Minitest::Test
 
   def copy_error
     Cloud::CommandError.new("Cloud.pipe", Cloud::ObjectCopy.command("file.txt", STAGING_PATH), nil)
+  end
+
+  def assert_read_error_confirmed(uploader, read_error, confirmations)
+    Cloud::ObjectMove.stub(:confirm_write_after_failure, ->(*args) { confirmations << args }) do
+      assert_raises(IOError) do
+        uploader.__send__(:record_remote_change, STAGING_PATH, FINAL_PATH, [], remote_target: STAGING_PATH) do
+          raise read_error
+        end
+      end
+    end
   end
 end
