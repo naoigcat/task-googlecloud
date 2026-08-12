@@ -76,7 +76,7 @@ module Cloud
         normalized_file = normalized_files[file]
         staging_path = "gs://#{bucket}/#{staging_prefix}/#{normalized_file.basename}"
         final_path = "gs://#{bucket}/#{normalized_file.basename}"
-        record_remote_change(staging_path, final_path, staged_files) do
+        record_remote_change(staging_path, final_path, staged_files, remote_target: staging_path) do
           Cloud::ObjectCopy.copy(normalized_file.to_path, staging_path)
         end
       end
@@ -90,13 +90,13 @@ module Cloud
       end
     end
 
-    def record_remote_change(source, target, changes, remote_source: nil)
+    def record_remote_change(source, target, changes, remote_source: nil, remote_target: target)
       # Defer signals until the remote change and generation are recorded for safe rollback.
       Thread.handle_interrupt(SignalException => :never) do
         target_generation = yield
         changes << [source, target, target_generation]
       rescue Cloud::CommandError, Cloud::ObjectMove::MissingGenerationError => e
-        confirm_remote_failure(remote_source, target, e) unless target_generation
+        confirm_remote_failure(remote_source, remote_target, e) unless target_generation
         raise
       end
     end
