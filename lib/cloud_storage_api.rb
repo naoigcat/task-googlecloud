@@ -12,7 +12,7 @@ module Cloud
 
     def upload_command(source, target)
       bucket, object = split_uri(target)
-      command("upload", "--file", source, "--bucket", bucket, "--object", object)
+      command("upload", "--file", source, "--bucket", bucket, object_option("--object", object))
     end
 
     def copy_command(source, target, source_generation:, destination_generation:)
@@ -30,12 +30,24 @@ module Cloud
 
     def stat_command(path, generation: nil)
       bucket, object = split_uri(path)
-      command("stat", "--bucket", bucket, "--object", object, *generation_option("--generation", generation))
+      command(
+        "stat",
+        "--bucket",
+        bucket,
+        object_option("--object", object),
+        *generation_option("--generation", generation),
+      )
     end
 
     def state_command(path, generation: nil)
       bucket, object = split_uri(path)
-      command("state", "--bucket", bucket, "--object", object, *generation_option("--generation", generation))
+      command(
+        "state",
+        "--bucket",
+        bucket,
+        object_option("--object", object),
+        *generation_option("--generation", generation),
+      )
     end
 
     def list_command(bucket)
@@ -44,7 +56,7 @@ module Cloud
 
     def delete_command(path, generation)
       bucket, object = split_uri(path)
-      command("delete", "--bucket", bucket, "--object", object, "--generation", generation)
+      command("delete", "--bucket", bucket, object_option("--object", object), "--generation", generation)
     end
 
     def split_uri(path)
@@ -61,11 +73,14 @@ module Cloud
     def uri_arguments(source, target)
       source_bucket, source_object = split_uri(source)
       target_bucket, target_object = split_uri(target)
-      pair("--source-bucket", source_bucket) + pair("--source-object", source_object) +
-        pair("--target-bucket", target_bucket) + pair("--target-object", target_object)
+      pair("--source-bucket", source_bucket) + [object_option("--source-object", source_object)] +
+        pair("--target-bucket", target_bucket) + [object_option("--target-object", target_object)]
     end
 
     def pair(name, value) = [name, value]
+
+    # Bind object values to their option names so argparse does not treat leading hyphens as options.
+    def object_option(name, value) = "#{name}=#{value}"
 
     def generation_option(name, generation)
       generation ? [name, generation] : []

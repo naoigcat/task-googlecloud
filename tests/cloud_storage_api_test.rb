@@ -12,7 +12,7 @@ class CloudStorageApiTest < Minitest::Test
 
     expected = Cloud::StorageApi.move_command(SOURCE, TARGET, source_generation: "123")
     assert_includes command, expected
-    assert_includes command, Shellwords.join(["--source-object", "folder*?[]#/source.txt"])
+    assert_includes command, Shellwords.join(["--source-object=folder*?[]#/source.txt"])
     refute_includes command, "gsutil"
   end
 
@@ -38,5 +38,33 @@ class CloudStorageApiTest < Minitest::Test
 
     assert_includes command, Cloud::StorageApi.delete_command(TARGET, "456")
     refute_includes command, "gsutil"
+  end
+
+  def test_object_options_keep_leading_hyphens_in_one_argument
+    target = "gs://bucket/-target?"
+
+    assert_argument Cloud::StorageApi.upload_command("/tmp/file", target), "--object=-target?"
+    assert_argument Cloud::StorageApi.stat_command(target), "--object=-target?"
+    assert_argument Cloud::StorageApi.state_command(target), "--object=-target?"
+    assert_argument Cloud::StorageApi.delete_command(target, "123"), "--object=-target?"
+  end
+
+  def test_uri_object_options_keep_leading_hyphens_in_one_argument
+    source = "gs://bucket/-source*"
+    target = "gs://bucket/-target?"
+
+    copy = Cloud::StorageApi.copy_command(source, target, source_generation: "123", destination_generation: "0")
+    assert_argument copy, "--source-object=-source*"
+    assert_argument copy, "--target-object=-target?"
+
+    move = Cloud::StorageApi.move_command(source, target, source_generation: "123")
+    assert_argument move, "--source-object=-source*"
+    assert_argument move, "--target-object=-target?"
+  end
+
+  private
+
+  def assert_argument(command, argument)
+    assert_includes Shellwords.split(command), argument
   end
 end

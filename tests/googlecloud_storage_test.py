@@ -114,6 +114,19 @@ class GooglecloudStorageTest(unittest.TestCase):
                     storage.list_objects("bucket", token="token")
                 self.assertEqual(status, context.exception.status)
 
+    def test_parse_args_accepts_a_leading_hyphen_in_an_object_name(self):
+        argv = [
+            "googlecloud-storage.py",
+            "state",
+            "--bucket",
+            "bucket",
+            "--object=-foo*",
+        ]
+        with patch.object(storage.sys, "argv", argv):
+            args = storage.parse_args()
+
+        self.assertEqual("-foo*", args.object)
+
 
 class HttpsConnectionTimeoutTest(unittest.TestCase):
     def test_request_sets_a_socket_timeout(self):
