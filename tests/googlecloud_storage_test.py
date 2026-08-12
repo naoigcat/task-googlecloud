@@ -91,6 +91,27 @@ class GooglecloudStorageTest(unittest.TestCase):
             parse_qs(urlsplit(self.requests[1][1]).query),
         )
 
+    def test_list_treats_an_empty_bucket_as_successful(self):
+        self.responses = [{}]
+
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            storage.list_objects("bucket", token="token")
+
+        self.assertEqual("", output.getvalue())
+        self.assertEqual(1, len(self.requests))
+
+    def test_list_propagates_missing_and_forbidden_bucket_errors(self):
+        for status in (404, 403):
+            with self.subTest(status=status):
+                def raise_error(_method, _path, _token):
+                    raise storage.StorageApiError(status, "listing failed")
+
+                storage.request = raise_error
+                with self.assertRaises(storage.StorageApiError) as context:
+                    storage.list_objects("bucket", token="token")
+                self.assertEqual(status, context.exception.status)
+
 
 if __name__ == "__main__":
     unittest.main()
