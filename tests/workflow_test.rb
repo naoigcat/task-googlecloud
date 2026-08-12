@@ -17,6 +17,7 @@ class WorkflowTest < Minitest::Test
 
     test_job = @config["jobs"]["test"]
     assert_equal "ubuntu-latest", test_job["runs-on"]
+    assert_read_only_permissions(@config["jobs"])
     assert_test_steps(test_job["steps"])
     assert_lint_steps(@config["jobs"]["lint"]["steps"])
   end
@@ -52,5 +53,15 @@ class WorkflowTest < Minitest::Test
       ],
       action_steps.map { |step| [step["name"], step["uses"]] },
     )
+  end
+
+  def assert_read_only_permissions(jobs)
+    jobs.each_value do |job|
+      assert_equal ["contents"], job["permissions"].keys
+      assert_equal "read", job["permissions"]["contents"]
+      checkout = job["steps"].find { |step| step["name"] == "Checkout" }
+      assert_equal ["persist-credentials"], checkout["with"].keys
+      assert_equal false, checkout["with"]["persist-credentials"]
+    end
   end
 end
