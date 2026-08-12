@@ -22,28 +22,31 @@ module Cloud
       normalization_plan = Pathname.normalization_plan(files)
 
       authenticate_project
-      normalized_files = files.zip(Pathname.apply_normalization(normalization_plan)).to_h
-      upload_with_rollback(files_by_directory, normalized_files, normalization_plan)
+      upload_with_rollback(files_by_directory, files, normalization_plan)
     end
 
     private
 
     # Collect every upload path up front so collision detection can see the complete set.
     def upload_files_by_directory
-      Pathname.new("../uploads").expand_path(__dir__).glob("*")
-              .to_h { |directory| [directory, directory.glob("*")] }
+      Pathname.new("../uploads").expand_path(__dir__).glob("*").to_h { |directory| [directory, directory.glob("*")] }
     end
+
+    def project_command = Shellwords.join(%w[gcloud config set project] + [@project])
 
     # Authenticate only after the rename plan is known to be collision-free.
-    def authenticate_project
-      Cloud.login
-      Cloud.exec(Shellwords.join(["gcloud", "config", "set", "project", @project]))
-    end
+    def authenticate_project = Cloud.login.tap { Cloud.exec(project_command) }
 
-    def upload_with_rollback(files_by_directory, normalized_files, normalization_plan)
+    def upload_with_rollback(files_by_directory, files, plan)
+      normalized_files = nil
+      # Defer signals until the local rename is marked complete so the outer rescue owns rollback.
+      Thread.handle_interrupt(SignalException => :never) do
+        normalized_files = Pathname.apply_normalization(plan)
+        normalized_files = files.zip(normalized_files).to_h
+      end
       upload_normalized_files(files_by_directory, normalized_files)
     rescue StandardError, SignalException => e
-      rollback_errors = Pathname.rollback_normalization(normalization_plan)
+      rollback_errors = normalized_files ? Pathname.rollback_normalization(plan) : []
       NormalizationPlan.raise_on_rollback_failure(e, rollback_errors)
       raise
     end
