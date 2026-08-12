@@ -1,7 +1,48 @@
 require "minitest/autorun"
+require "stringio"
 require_relative "../lib/cloud"
 
 class CloudTest < Minitest::Test
+  def test_login_authenticates_when_the_account_is_unset
+    commands = []
+
+    with_account("(unset)\n") do
+      Cloud.stub(:exec, ->(command) { commands << command }) { Cloud.login }
+    end
+
+    assert_equal ["gcloud auth login"], commands
+  end
+
+  def test_login_skips_authentication_for_an_active_account
+    commands = []
+
+    with_account("user@example.com\n") do
+      Cloud.stub(:exec, ->(command) { commands << command }) { Cloud.login }
+    end
+
+    assert_empty commands
+  end
+
+  def test_logout_skips_revocation_when_the_account_is_unset
+    commands = []
+
+    with_account("(unset)\n") do
+      Cloud.stub(:exec, ->(command) { commands << command }) { Cloud.logout }
+    end
+
+    assert_empty commands
+  end
+
+  def test_logout_revokes_an_active_account
+    commands = []
+
+    with_account("user@example.com\n") do
+      Cloud.stub(:exec, ->(command) { commands << command }) { Cloud.logout }
+    end
+
+    assert_equal ["gcloud auth revoke && rm -fr /home/cloud/.config/gcloud"], commands
+  end
+
   def test_exec_raises_when_the_remote_command_fails
     Cloud.stub(:system, false) do
       error = assert_raises(Cloud::CommandError) { Cloud.exec("gcloud auth login") }
@@ -56,5 +97,11 @@ class CloudTest < Minitest::Test
     assert_includes command, "cloud@googlecloud"
     refute_includes command, "sshpass"
     refute_includes command, "root@googlecloud"
+  end
+
+  private
+
+  def with_account(output, &)
+    Cloud.stub(:pipe, ->(_command, &block) { block.call(StringIO.new(output)) }, &)
   end
 end

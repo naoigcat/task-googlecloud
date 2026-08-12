@@ -13,13 +13,11 @@ module Cloud
 
   class << self
     def login
-      return unless pipe("gcloud config get account", &:read).empty?
-
-      exec "gcloud auth login"
+      exec "gcloud auth login" unless authenticated?
     end
 
     def logout
-      return if pipe("gcloud config get account", &:read).empty?
+      return unless authenticated?
 
       exec "gcloud auth revoke && rm -fr /home/cloud/.config/gcloud"
     end
@@ -41,6 +39,11 @@ module Cloud
     end
 
     private
+
+    def authenticated?
+      account = pipe("gcloud config get account", &:read).strip
+      !account.empty? && account != "(unset)"
+    end
 
     def raise_command_error(operation, command, status)
       return if status&.success?
