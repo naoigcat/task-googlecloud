@@ -85,7 +85,27 @@ services:
         install -d -m 700 -o cloud -g cloud /home/cloud/.ssh
         install -m 600 -o cloud -g cloud "$$ssh_key_dir/client_key.pub" /home/cloud/.ssh/authorized_keys
 
-        exec /usr/sbin/sshd -D -e
+        # Keep signal-aware PID 1 and isolate sshd so interrupts stop the server tree.
+        setsid /usr/sbin/sshd -D -e &
+        sshd_pid=$$!
+
+        stop_sshd_descendants() {
+          for child_pid in $$(pgrep -P "$$1" 2>/dev/null || true); do
+            stop_sshd_descendants "$$child_pid"
+            kill -TERM "$$child_pid" 2>/dev/null || true
+          done
+        }
+
+        stop_sshd() {
+          stop_sshd_descendants "$$sshd_pid"
+          kill -TERM "-$$sshd_pid" 2>/dev/null || true
+          wait "$$sshd_pid" 2>/dev/null || true
+        }
+
+        trap 'stop_sshd; exit 130' INT
+        trap 'stop_sshd; exit 143' TERM
+
+        wait "$$sshd_pid"
         EOF
         RUN chmod 755 /usr/local/bin/googlecloud-entrypoint
         EXPOSE 22
