@@ -31,19 +31,6 @@ else
 fi
 '''
 
-[tasks.logout]
-description = "Logout from Google Cloud"
-run = '''
-set -eu
-if [ -f /.dockerenv ]; then
-    task-googlecloud logout
-else
-    trap 'docker compose down' EXIT
-    docker compose build app
-    docker compose run --rm app task-googlecloud logout
-fi
-'''
-
 [tasks.fmt]
 description = "Format Rust source"
 run = '''
