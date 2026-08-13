@@ -1,0 +1,26 @@
+[package]
+name = "task-googlecloud"
+version = "0.1.0"
+edition = "2024"
+description = "Manage Google Cloud Storage object names and uploads"
+license = "MIT"
+
+[dependencies]
+clap = { version = "4.5.45", features = ["derive"] }
+libc = "0.2.175"
+percent-encoding = "2.3.1"
+reqwest = { version = "0.12.23", default-features = false, features = ["blocking", "json", "rustls-tls"] }
+serde = { version = "1.0.219", features = ["derive"] }
+serde_json = "1.0.143"
+signal-hook = "0.3.18"
+thiserror = "2.0.16"
+unicode-normalization = "0.1.24"
+url = "2.5.7"
+uuid = { version = "1.18.1", features = ["v4"] }
+
+[dev-dependencies]
+tempfile = "3.22.0"
+
+[[bin]]
+name = "task-googlecloud"
+path = "src/main.rs"

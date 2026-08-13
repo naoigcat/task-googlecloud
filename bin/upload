@@ -1,9 +1,0 @@
-#!/usr/bin/env ruby
-
-require_relative "../lib/upload"
-
-project = ARGV.first
-
-abort "Usage: ruby bin/upload [project]" unless project && ARGV.size == 1
-
-Cloud::Upload.call(project)

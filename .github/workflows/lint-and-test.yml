@@ -19,8 +19,11 @@ jobs:
         name: Setup mise
         uses: jdx/mise-action@c37c93293d6b742fc901e1406b8f764f6fb19dac # v2
       -
-        name: RuboCop
-        run: mise run rubocop
+        name: Rust format
+        run: mise run fmt-check
+      -
+        name: Clippy
+        run: mise run clippy
       -
         name: Markdownlint
         run: mise run markdownlint
@@ -41,5 +44,5 @@ jobs:
         name: Google Cloud image
         run: docker compose build googlecloud
       -
-        name: Ruby tests
+        name: Rust tests
         run: mise run test

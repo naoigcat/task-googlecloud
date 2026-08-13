@@ -1,3 +1,5 @@
+target/
 uploads/
-.git/
 .DS_Store
+.git/
+.markdownlint-cli2.jsonc

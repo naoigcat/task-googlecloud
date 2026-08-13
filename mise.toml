@@ -6,12 +6,12 @@ arg "<bucket>" help="Cloud Storage bucket"
 '''
 run = '''
 set -eu
-if [ "${TASK_GOOGLECLOUD_IN_CONTAINER:-}" = "1" ] || [ -f /.dockerenv ]; then
-    ruby bin/normalize "${usage_project?}" "${usage_bucket?}"
+if [ -f /.dockerenv ]; then
+    task-googlecloud normalize "${usage_project?}" "${usage_bucket?}"
 else
     trap 'docker compose down' EXIT
-    docker compose build
-    docker compose run --rm -e TASK_GOOGLECLOUD_IN_CONTAINER=1 app ruby bin/normalize "${usage_project?}" "${usage_bucket?}"
+    docker compose build app
+    docker compose run --rm app task-googlecloud normalize "${usage_project?}" "${usage_bucket?}"
 fi
 '''
 
@@ -22,12 +22,12 @@ arg "<project>" help="Google Cloud project"
 '''
 run = '''
 set -eu
-if [ "${TASK_GOOGLECLOUD_IN_CONTAINER:-}" = "1" ] || [ -f /.dockerenv ]; then
-    ruby bin/upload "${usage_project?}"
+if [ -f /.dockerenv ]; then
+    task-googlecloud upload "${usage_project?}"
 else
     trap 'docker compose down' EXIT
-    docker compose build
-    docker compose run --rm -e TASK_GOOGLECLOUD_IN_CONTAINER=1 app ruby bin/upload "${usage_project?}"
+    docker compose build app
+    docker compose run --rm app task-googlecloud upload "${usage_project?}"
 fi
 '''
 
@@ -35,36 +35,48 @@ fi
 description = "Logout from Google Cloud"
 run = '''
 set -eu
-if [ "${TASK_GOOGLECLOUD_IN_CONTAINER:-}" = "1" ] || [ -f /.dockerenv ]; then
-    ruby bin/logout
+if [ -f /.dockerenv ]; then
+    task-googlecloud logout
 else
     trap 'docker compose down' EXIT
-    docker compose build
-    docker compose run --rm -e TASK_GOOGLECLOUD_IN_CONTAINER=1 app ruby bin/logout
+    docker compose build app
+    docker compose run --rm app task-googlecloud logout
 fi
 '''
 
-[tasks.fix]
-description = "Run RuboCop autocorrect with the configured Ruby version"
+[tasks.fmt]
+description = "Format Rust source"
 run = '''
 set -eu
-if [ "${TASK_GOOGLECLOUD_IN_CONTAINER:-}" = "1" ] || [ -f /.dockerenv ]; then
-    rubocop --debug --autocorrect-all
+if [ -f /.dockerenv ]; then
+    cargo fmt --all
 else
     docker compose build app
-    docker compose run --rm --no-deps -e TASK_GOOGLECLOUD_IN_CONTAINER=1 app rubocop --debug --autocorrect-all
+    docker compose run --rm --no-deps app cargo fmt --all
 fi
 '''
 
-[tasks.rubocop]
-description = "Run RuboCop lint with the configured Ruby version"
+[tasks.fmt-check]
+description = "Check Rust formatting"
 run = '''
 set -eu
-if [ "${TASK_GOOGLECLOUD_IN_CONTAINER:-}" = "1" ] || [ -f /.dockerenv ]; then
-    rubocop --debug --extra-details
+if [ -f /.dockerenv ]; then
+    cargo fmt --all -- --check
 else
     docker compose build app
-    docker compose run --rm --no-deps -e TASK_GOOGLECLOUD_IN_CONTAINER=1 app rubocop --debug --extra-details
+    docker compose run --rm --no-deps app cargo fmt --all -- --check
+fi
+'''
+
+[tasks.clippy]
+description = "Run Clippy with warnings denied"
+run = '''
+set -eu
+if [ -f /.dockerenv ]; then
+    cargo clippy --all-targets --locked -- -D warnings
+else
+    docker compose build app
+    docker compose run --rm --no-deps app cargo clippy --all-targets --locked -- -D warnings
 fi
 '''
 
@@ -72,23 +84,22 @@ fi
 description = "Run markdownlint-cli2"
 run = '''
 set -eu
-if [ "${TASK_GOOGLECLOUD_IN_CONTAINER:-}" = "1" ] || [ -f /.dockerenv ]; then
+if [ -f /.dockerenv ]; then
     markdownlint-cli2 --config .markdownlint-cli2.jsonc
 else
     docker compose build app
-    docker compose run --rm --no-deps -e TASK_GOOGLECLOUD_IN_CONTAINER=1 app markdownlint-cli2 --config .markdownlint-cli2.jsonc
+    docker compose run --rm --no-deps app markdownlint-cli2 --config .markdownlint-cli2.jsonc
 fi
 '''
 
 [tasks.test]
-description = "Run Ruby and Cloud Storage API tests"
+description = "Run Rust tests"
 run = '''
 set -eu
-if [ "${TASK_GOOGLECLOUD_IN_CONTAINER:-}" = "1" ] || [ -f /.dockerenv ]; then
-    ruby -Ilib -e 'Dir["tests/**/*_test.rb"].sort.each { |file| require File.expand_path(file) }'
+if [ -f /.dockerenv ]; then
+    cargo test --all-targets --locked
 else
     docker compose build app
-    docker compose run --rm --no-deps -e TASK_GOOGLECLOUD_IN_CONTAINER=1 app ruby -Ilib -e 'Dir["tests/**/*_test.rb"].sort.each { |file| require File.expand_path(file) }'
-    docker compose run --rm --no-deps -e PYTHONDONTWRITEBYTECODE=1 --entrypoint python3 googlecloud -m unittest discover -s /app/tests -p 'googlecloud_storage_test.py'
+    docker compose run --rm --no-deps app cargo test --all-targets --locked
 fi
 '''

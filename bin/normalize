@@ -1,9 +1,0 @@
-#!/usr/bin/env ruby
-
-require_relative "../lib/normalize"
-
-project, bucket = ARGV
-
-abort "Usage: ruby bin/normalize [project] [bucket]" unless project && bucket && ARGV.size == 2
-
-Cloud::Normalize.call(project, bucket)

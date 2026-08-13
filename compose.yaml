@@ -4,39 +4,39 @@ services:
       context: .
       dockerfile_inline: |
         FROM node:20-bookworm-slim@sha256:2cf067cfed83d5ea958367df9f966191a942351a2df77d6f0193e162b5febfc0 AS markdownlint
+
         RUN npm install -g markdownlint-cli2@0.22.1 --no-fund --no-audit
-        FROM ruby:3.4.10-slim-bookworm@sha256:514336e7d46dd52b94a7391e4bc34dc04dc83098963c2c2493b90354952acd78
+
+        FROM rust:1.89.0-slim-bookworm@sha256:d7fc7de78bb8c1469933aeecbf801314d30d7d6e9f0578bba4cfa285bfa37fe6
+
         WORKDIR /app
+
+        COPY Cargo.toml Cargo.lock ./
+        COPY src ./src
+
+        RUN apt-get update && apt-get install -y --no-install-recommends \
+                ca-certificates \
+                openssh-client \
+            && \
+            rustup component add clippy rustfmt \
+            && \
+            cargo build --release --locked \
+            && \
+            install -m 755 target/release/task-googlecloud /usr/local/bin/task-googlecloud \
+            && \
+            apt-get clean \
+            && \
+            rm -rf /var/lib/apt/lists/*
+
         COPY --from=markdownlint /usr/local/bin/node /usr/local/bin/node
         COPY --from=markdownlint /usr/local/lib/node_modules /usr/local/lib/node_modules
+
         RUN ln -s ../lib/node_modules/markdownlint-cli2/markdownlint-cli2-bin.mjs /usr/local/bin/markdownlint-cli2
-        RUN apt-get update && apt-get install -y \
-                build-essential=12.9 \
-                openssh-client=1:9.2p1-2+deb12u10 \
-            && \
-            gem install ast -v 2.4.3 --no-document && \
-            gem install json -v 2.21.2 --no-document && \
-            gem install language_server-protocol -v 3.17.0.6 --no-document && \
-            gem install lint_roller -v 1.1.0 --no-document && \
-            gem install parallel -v 2.1.0 --no-document && \
-            gem install parser -v 3.3.12.0 --no-document && \
-            gem install prism -v 1.9.0 --no-document && \
-            gem install racc -v 1.8.1 --no-document && \
-            gem install rainbow -v 3.1.1 --no-document && \
-            gem install regexp_parser -v 2.12.0 --no-document && \
-            gem install rubocop-ast -v 1.50.0 --no-document && \
-            gem install ruby-progressbar -v 1.13.0 --no-document && \
-            gem install unicode-emoji -v 4.2.0 --no-document && \
-            gem install unicode-display_width -v 3.2.0 --no-document && \
-            gem install rubocop -v 1.89.0 --no-document && \
-            apt-get clean && \
-            rm -rf /var/cache/apt/archives/* /var/lib/apt/lists/*
+
         CMD []
     depends_on:
       googlecloud:
         condition: service_healthy
-    environment:
-      TASK_GOOGLECLOUD_IN_CONTAINER: "1"
     volumes:
       - .:/app
       - googlecloud-ssh:/run/googlecloud-ssh:ro
@@ -63,12 +63,34 @@ services:
             sed -i '1i Include /etc/ssh/sshd_config.d/00-googlecloud-security.conf' /etc/ssh/sshd_config && \
             apt-get clean && \
             rm -rf /var/cache/apt/archives/* /var/lib/apt/lists/*
-        COPY docker/googlecloud-entrypoint.sh /usr/local/bin/googlecloud-entrypoint
+        RUN cat <<'EOF' > /usr/local/bin/googlecloud-entrypoint
+        #!/bin/sh
+        set -eu
+
+        ssh_key_dir=/run/googlecloud-ssh
+
+        install -d -m 700 "$$ssh_key_dir"
+        rm -f "$$ssh_key_dir/client_key" "$$ssh_key_dir/client_key.pub" "$$ssh_key_dir/known_hosts"
+        ssh-keygen -A
+        ssh-keygen -q -t ed25519 -N "" -f "$$ssh_key_dir/client_key"
+
+        known_hosts="$$ssh_key_dir/known_hosts"
+        : > "$$known_hosts"
+        for host_key in /etc/ssh/ssh_host_*_key.pub; do
+          [ -f "$$host_key" ] || continue
+          printf 'googlecloud %s\n' "$$(cat "$$host_key")" >> "$$known_hosts"
+        done
+        chmod 644 "$$known_hosts"
+
+        install -d -m 700 -o cloud -g cloud /home/cloud/.ssh
+        install -m 600 -o cloud -g cloud "$$ssh_key_dir/client_key.pub" /home/cloud/.ssh/authorized_keys
+
+        exec /usr/sbin/sshd -D -e
+        EOF
         RUN chmod 755 /usr/local/bin/googlecloud-entrypoint
         EXPOSE 22
         ENTRYPOINT ["/usr/local/bin/googlecloud-entrypoint"]
     volumes:
-      - .:/app
       - googlecloud-ssh:/run/googlecloud-ssh
     healthcheck:
       test: ["CMD-SHELL", "sshd -T | grep -q '^permitrootlogin no$' && sshd -T | grep -q '^passwordauthentication no$' && nc -z 127.0.0.1 22 && test -s /run/googlecloud-ssh/client_key && test -s /run/googlecloud-ssh/known_hosts"]

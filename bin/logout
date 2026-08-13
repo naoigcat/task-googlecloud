@@ -1,7 +1,0 @@
-#!/usr/bin/env ruby
-
-require_relative "../lib/logout"
-
-abort "Usage: ruby bin/logout" unless ARGV.empty?
-
-Cloud::Logout.call
