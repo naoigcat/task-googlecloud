@@ -3,6 +3,9 @@
     "globs": [
         "**/*.md"
     ],
+    "ignores": [
+        "node_modules/**"
+    ],
     "config": {
         "ul-indent": {
             "indent": 4
