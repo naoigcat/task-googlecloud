@@ -452,10 +452,10 @@ impl StorageClient for StorageApi {
         target: &ObjectPath,
         operation: &AppError,
     ) -> Result<(), AppError> {
-        let source_details = self.object_details(source)?;
-        let target_details = self.object_details(target)?;
-        let no_change =
-            source_details.0 == ObjectState::Present && target_details.0 == ObjectState::Missing;
+        let source_details = self.object_details(source);
+        let target_details = self.object_details(target);
+        let no_change = matches!(source_details, Ok((ObjectState::Present, _)))
+            && matches!(target_details, Ok((ObjectState::Missing, _)));
         if no_change && !matches!(operation, AppError::Http(_) | AppError::Storage { .. }) {
             return Ok(());
         }
@@ -475,8 +475,8 @@ impl StorageClient for StorageApi {
         target: &ObjectPath,
         operation: &AppError,
     ) -> Result<(), AppError> {
-        let details = self.object_details(target)?;
-        if details.0 == ObjectState::Missing
+        let details = self.object_details(target);
+        if matches!(details, Ok((ObjectState::Missing, _)))
             && !matches!(operation, AppError::Http(_) | AppError::Storage { .. })
         {
             return Ok(());
@@ -502,13 +502,19 @@ impl StorageApi {
     }
 }
 
-fn state_details(object: &ObjectPath, details: (ObjectState, Option<String>)) -> String {
+/// A failed lookup is reported rather than propagated so that the caller still
+/// learns which objects need manual recovery.
+fn state_details(
+    object: &ObjectPath,
+    details: Result<(ObjectState, Option<String>), AppError>,
+) -> String {
     match details {
-        (ObjectState::Missing, _) => format!("{} is missing", object.uri()),
-        (ObjectState::Present, Some(generation)) => {
+        Ok((ObjectState::Missing, _)) => format!("{} is missing", object.uri()),
+        Ok((ObjectState::Present, Some(generation))) => {
             format!("{}: generation {generation}", object.uri())
         }
-        (ObjectState::Present, None) => format!("{}: generation unknown", object.uri()),
+        Ok((ObjectState::Present, None)) => format!("{}: generation unknown", object.uri()),
+        Err(error) => format!("{}: state unknown ({error})", object.uri()),
     }
 }
 

@@ -642,7 +642,7 @@ fn requires_recovery_for_http_upload_failures_with_existing_state() {
 }
 
 #[test]
-fn reports_http_failure_when_state_confirmation_gets_a_server_error() {
+fn requires_recovery_when_state_confirmation_gets_a_server_error() {
     let (base, requests, server) = test_server(vec![(
         503,
         r#"{"error":{"message":"service unavailable"}}"#.to_string(),
@@ -654,13 +654,8 @@ fn reports_http_failure_when_state_confirmation_gets_a_server_error() {
         .unwrap_err();
     server.join().unwrap();
 
-    assert!(matches!(
-        error,
-        AppError::Storage {
-            status: 503,
-            message: _
-        }
-    ));
+    assert!(matches!(error, AppError::Recovery { .. }));
+    assert!(error.to_string().contains("state unknown"));
     assert!(error.to_string().contains("service unavailable"));
     let requests = requests.lock().unwrap();
     assert_eq!(requests.len(), 1);
