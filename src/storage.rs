@@ -3,12 +3,14 @@ use std::sync::Mutex;
 use std::time::Duration;
 
 use percent_encoding::{AsciiSet, CONTROLS, utf8_percent_encode};
-use reqwest::blocking::{Client, RequestBuilder, Response};
 use reqwest::header::{CONTENT_LENGTH, CONTENT_TYPE};
+use reqwest::{Body, Client, RequestBuilder, Response};
 use serde::Deserialize;
 use serde::de::DeserializeOwned;
+use tokio_util::io::ReaderStream;
 use url::form_urlencoded::Serializer;
 
+use crate::InterruptFlag;
 use crate::atomic_rename::DirectoryIdentity;
 use crate::cloud::Cloud;
 use crate::error::AppError;
@@ -24,6 +26,7 @@ const API_BASE: &str = "https://storage.googleapis.com/storage/v1";
 const UPLOAD_BASE: &str = "https://storage.googleapis.com/upload/storage/v1";
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 const UPLOAD_TIMEOUT: Duration = Duration::from_secs(60 * 60);
+const INTERRUPT_POLL_INTERVAL: Duration = Duration::from_millis(25);
 /// A generation-guarded marker serializes mutations through this client, so a
 /// move cannot delete its source while another compliant writer replaces its
 /// destination.
@@ -130,6 +133,8 @@ pub trait StorageClient {
 
 pub struct StorageApi {
     cloud: Cloud,
+    interrupt: Option<InterruptFlag>,
+    runtime: Option<tokio::runtime::Runtime>,
     client: Client,
     upload_client: Client,
     token_override: Option<String>,
@@ -180,10 +185,18 @@ impl StorageApi {
         request_timeout: Duration,
         upload_timeout: Duration,
     ) -> Self {
+        let interrupt = cloud.interrupt();
         Self {
             cloud,
-            client: Self::build_client(Some(request_timeout)),
-            upload_client: Self::build_client(Some(upload_timeout)),
+            interrupt,
+            runtime: Some(
+                tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .expect("the HTTP runtime configuration is valid"),
+            ),
+            client: Self::build_client(request_timeout),
+            upload_client: Self::build_client(upload_timeout),
             token_override: token,
             api_base: api_base.into(),
             upload_base: upload_base.into(),
@@ -192,7 +205,7 @@ impl StorageApi {
         }
     }
 
-    fn build_client(total_timeout: Option<Duration>) -> Client {
+    fn build_client(total_timeout: Duration) -> Client {
         Client::builder()
             .timeout(total_timeout)
             .connect_timeout(REQUEST_TIMEOUT)
@@ -206,13 +219,39 @@ impl StorageApi {
             .map_or_else(|| self.cloud.access_token().map_err(AppError::token), Ok)
     }
 
-    fn send(&self, request: RequestBuilder) -> Result<Response, AppError> {
-        let token = self.token()?;
-        Ok(request.bearer_auth(token).send()?)
-    }
-
     fn send_body(&self, request: RequestBuilder) -> Result<Vec<u8>, AppError> {
-        Self::response_body(self.send(request)?)
+        let token = self.token()?;
+        if self
+            .interrupt
+            .as_ref()
+            .is_some_and(InterruptFlag::is_interrupted)
+        {
+            return Err(AppError::Interrupted);
+        }
+        let interrupt = self.interrupt.clone();
+        // Dropping the async request closes the connection, so rollback never
+        // races with a blocking request that was left running in the background.
+        let result = self
+            .runtime
+            .as_ref()
+            .expect("the HTTP runtime remains available while StorageApi is alive")
+            .block_on(async move {
+                tokio::select! {
+                    response = async {
+                        let response = request.bearer_auth(token).send().await?;
+                        Self::response_body(response).await
+                    } => response,
+                    _ = wait_for_interrupt(interrupt) => Err(AppError::Interrupted),
+                }
+            });
+        if self
+            .interrupt
+            .as_ref()
+            .is_some_and(InterruptFlag::is_interrupted)
+        {
+            return Err(AppError::Interrupted);
+        }
+        result
     }
 
     fn send_json<T>(&self, request: RequestBuilder, description: &str) -> Result<T, AppError>
@@ -224,9 +263,9 @@ impl StorageApi {
             .map_err(|error| AppError::Message(format!("{description}: {error}")))
     }
 
-    fn response_body(response: Response) -> Result<Vec<u8>, AppError> {
+    async fn response_body(response: Response) -> Result<Vec<u8>, AppError> {
         let status = response.status();
-        let body = response.bytes()?.to_vec();
+        let body = response.bytes().await?.to_vec();
         if status.is_success() {
             return Ok(body);
         }
@@ -262,6 +301,7 @@ impl StorageApi {
         let metadata = match metadata {
             Ok(metadata) => metadata,
             Err(error) if error.status() != Some(412) && error.reached_storage() => {
+                self.clear_interrupt_for_rollback();
                 match self.recover_unacknowledged_bucket_lock(&object, &token) {
                     Ok(()) => return Err(error),
                     Err(recovery) => return Err(AppError::rollback(error, vec![recovery])),
@@ -301,11 +341,21 @@ impl StorageApi {
         Ok(())
     }
 
+    fn clear_interrupt_for_rollback(&self) -> bool {
+        self.interrupt
+            .as_ref()
+            .is_some_and(InterruptFlag::clear_for_rollback)
+    }
+
     fn release_bucket_locks(&self, locks: &[BucketLock]) -> Vec<AppError> {
         locks
             .iter()
             .rev()
-            .filter_map(|lock| self.delete_object(&lock.object, &lock.generation).err())
+            .filter_map(|lock| {
+                // Lock release is rollback work, so a new signal must not abort cleanup.
+                self.clear_interrupt_for_rollback();
+                self.delete_object(&lock.object, &lock.generation).err()
+            })
             .collect()
     }
 
@@ -322,15 +372,18 @@ impl StorageApi {
             match self.acquire_bucket_lock(bucket) {
                 Ok(lock) => locks.push(lock),
                 Err(error) => {
+                    self.clear_interrupt_for_rollback();
                     return Err(AppError::rollback(error, self.release_bucket_locks(&locks)));
                 }
             }
         }
 
         let result = operation();
+        let interrupted = self.clear_interrupt_for_rollback();
         let release_errors = self.release_bucket_locks(&locks);
         match result {
-            Ok(value) if release_errors.is_empty() => Ok(value),
+            Ok(value) if release_errors.is_empty() && !interrupted => Ok(value),
+            Ok(_) if release_errors.is_empty() => Err(AppError::Interrupted),
             Ok(_) => Err(AppError::Recovery {
                 paths: locks
                     .iter()
@@ -543,7 +596,9 @@ impl StorageClient for StorageApi {
                 .post(url)
                 .header(CONTENT_TYPE, "application/octet-stream")
                 .header(CONTENT_LENGTH, size)
-                .body(file);
+                .body(Body::wrap_stream(ReaderStream::new(
+                    tokio::fs::File::from_std(file),
+                )));
             let metadata: MetadataResponse =
                 self.send_json(request, "Invalid Cloud Storage upload response")?;
             Ok(metadata.generation)
@@ -634,6 +689,15 @@ impl StorageClient for StorageApi {
             operation: operation.to_string(),
             details: state_details(target, details),
         })
+    }
+}
+
+impl Drop for StorageApi {
+    fn drop(&mut self) {
+        // A stalled local read must not make process shutdown wait forever after SIGINT.
+        if let Some(runtime) = self.runtime.take() {
+            runtime.shutdown_timeout(Duration::ZERO);
+        }
     }
 }
 
@@ -787,6 +851,19 @@ struct ErrorDetails {
     message: Option<String>,
 }
 
+async fn wait_for_interrupt(interrupt: Option<InterruptFlag>) {
+    let Some(interrupt) = interrupt else {
+        std::future::pending::<()>().await;
+        return;
+    };
+    loop {
+        if interrupt.is_interrupted() {
+            return;
+        }
+        tokio::time::sleep(INTERRUPT_POLL_INTERVAL).await;
+    }
+}
+
 fn response_message(body: &[u8]) -> String {
     serde_json::from_slice::<ErrorResponse>(body)
         .ok()
@@ -840,8 +917,13 @@ where
 mod tests {
     use std::io::{Read, Write};
     use std::net::{TcpListener, TcpStream};
-    use std::sync::mpsc;
+    use std::sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+        mpsc,
+    };
     use std::thread;
+    use std::time::Instant;
 
     use tempfile::NamedTempFile;
 
@@ -966,6 +1048,93 @@ mod tests {
         let error = result.unwrap().unwrap_err();
 
         assert!(matches!(error, super::AppError::Http(_)));
+    }
+
+    #[test]
+    fn interrupts_a_blocking_cloud_storage_request() {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let base = format!("http://{}/storage/v1", listener.local_addr().unwrap());
+        let (request_sender, request_received) = mpsc::channel();
+        let (release_sender, release_server) = mpsc::channel();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            read_headers(&mut stream);
+            request_sender.send(()).unwrap();
+            release_server.recv().unwrap();
+        });
+        let interrupted = Arc::new(AtomicBool::new(false));
+        let interrupt = super::InterruptFlag::from_atomic(Arc::clone(&interrupted));
+        let storage = StorageApi::with_endpoint_options(
+            Cloud::with_interrupt(interrupt),
+            base.clone(),
+            base,
+            Some("token".to_string()),
+            Duration::from_secs(30),
+        );
+        let (result_sender, result_receiver) = mpsc::channel();
+        let request = thread::spawn(move || {
+            result_sender.send(storage.list_objects("bucket")).unwrap();
+        });
+
+        request_received
+            .recv_timeout(Duration::from_secs(1))
+            .unwrap();
+        let started = Instant::now();
+        interrupted.store(true, Ordering::Relaxed);
+        let result = result_receiver
+            .recv_timeout(Duration::from_millis(500))
+            .unwrap();
+
+        assert!(started.elapsed() < Duration::from_millis(500));
+        assert!(matches!(result, Err(super::AppError::Interrupted)));
+        request.join().unwrap();
+        release_sender.send(()).unwrap();
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn releases_a_bucket_lock_after_an_interrupted_upload() {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let base = format!("http://{}/storage/v1", listener.local_addr().unwrap());
+        let (request_sender, request_received) = mpsc::channel();
+        let server = thread::spawn(move || {
+            let (mut lock_stream, _) = listener.accept().unwrap();
+            read_headers(&mut lock_stream);
+            write_json(&mut lock_stream, r#"{"generation":"lock"}"#);
+
+            let (mut upload_stream, _) = listener.accept().unwrap();
+            read_headers(&mut upload_stream);
+            request_sender.send(()).unwrap();
+
+            let (mut release_stream, _) = listener.accept().unwrap();
+            read_headers(&mut release_stream);
+            write_json(&mut release_stream, "{}");
+        });
+        let interrupted = Arc::new(AtomicBool::new(false));
+        let interrupt = super::InterruptFlag::from_atomic(Arc::clone(&interrupted));
+        let storage = StorageApi::with_endpoint_options(
+            Cloud::with_interrupt(interrupt),
+            base.clone(),
+            base,
+            Some("token".to_string()),
+            Duration::from_secs(30),
+        );
+        let source = NamedTempFile::new().unwrap();
+        std::fs::write(source.path(), b"contents").unwrap();
+        let target = ObjectPath::parse("gs://bucket/target").unwrap();
+        let upload = thread::spawn(move || storage.upload_file(source.path(), &target));
+
+        request_received
+            .recv_timeout(Duration::from_secs(1))
+            .unwrap();
+        interrupted.store(true, Ordering::Relaxed);
+        let error = upload
+            .join()
+            .unwrap()
+            .expect_err("interrupted upload should fail");
+
+        assert!(matches!(error, super::AppError::Interrupted));
+        server.join().unwrap();
     }
 
     #[test]

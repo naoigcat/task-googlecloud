@@ -50,9 +50,9 @@ impl InterruptFlag {
         self.interrupted.load(Ordering::Relaxed)
     }
 
-    pub(crate) fn clear_for_rollback(&self) {
+    pub(crate) fn clear_for_rollback(&self) -> bool {
         // The signal aborts the in-flight command, but rollback must still be able to reach Cloud Storage.
-        self.interrupted.store(false, Ordering::Relaxed);
+        self.interrupted.swap(false, Ordering::Relaxed)
     }
 
     pub(crate) fn check(&self) -> Result<(), AppError> {

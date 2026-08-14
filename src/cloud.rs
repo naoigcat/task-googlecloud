@@ -25,6 +25,10 @@ impl Cloud {
         }
     }
 
+    pub(crate) fn interrupt(&self) -> Option<InterruptFlag> {
+        self.interrupt.clone()
+    }
+
     pub fn login(&self) -> Result<(), AppError> {
         let account = self.run_capture("gcloud config get account")?;
         if account.trim().is_empty() || account.trim() == "(unset)" {
