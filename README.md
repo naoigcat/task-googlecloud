@@ -84,7 +84,7 @@ Before retrying a stopped run:
     using the operation's input list or a backup to confirm the original name.
 5.  After all temporary objects, final objects, and local names have been
     reconciled, rerun the original `mise run normalize` or `mise run upload`
- command.
+    command.
 
 ## Author
 
