@@ -69,7 +69,12 @@ pub fn upload_files_by_directory(root: &Path) -> Result<BTreeMap<PathBuf, Vec<Pa
         let mut files = fs::read_dir(&directory)?
             .map(|entry| entry.map(|entry| entry.path()))
             .collect::<Result<Vec<_>, _>>()?;
-        files.retain(|file| file.is_file());
+        files.retain(|file| {
+            file.is_file()
+                && file
+                    .file_name()
+                    .is_some_and(|name| !name.to_string_lossy().starts_with('.'))
+        });
         files.sort();
         directories.insert(directory, files);
     }

@@ -77,10 +77,14 @@ fn discovers_files_by_bucket_directory() {
     std::fs::create_dir(&bucket).unwrap();
     std::fs::write(bucket.join("one.txt"), "one").unwrap();
     std::fs::write(bucket.join("two.txt"), "two").unwrap();
+    std::fs::write(bucket.join(".DS_Store"), "metadata").unwrap();
 
     let found = upload_files_by_directory(directory.path()).unwrap();
 
-    assert_eq!(found.get(&bucket).unwrap().len(), 2);
+    assert_eq!(
+        found.get(&bucket).unwrap(),
+        &vec![bucket.join("one.txt"), bucket.join("two.txt")]
+    );
 }
 
 #[test]
