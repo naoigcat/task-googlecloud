@@ -67,6 +67,30 @@ else
 fi
 '''
 
+[tasks.audit]
+description = "Audit Rust dependencies"
+run = '''
+set -eu
+if [ -f /.dockerenv ]; then
+    cargo audit
+else
+    docker compose build app
+    docker compose run --rm --no-deps app cargo audit
+fi
+'''
+
+[tasks.deny]
+description = "Check Rust dependencies"
+run = '''
+set -eu
+if [ -f /.dockerenv ]; then
+    cargo deny check
+else
+    docker compose build app
+    docker compose run --rm --no-deps app cargo deny check
+fi
+'''
+
 [tasks.markdownlint]
 description = "Run markdownlint-cli2"
 run = '''
