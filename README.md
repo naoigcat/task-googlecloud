@@ -26,11 +26,11 @@ Move files to `uploads/[bucket]` and run:
 mise run upload [project]
 ```
 
-### Logout
+### Authentication lifecycle
 
-```sh
-mise run logout
-```
+Authentication is stored only in the temporary `googlecloud` container. The
+container is removed when a host-side mise task finishes, so credentials are
+not reused by later runs and no separate logout task is provided.
 
 ## Development
 
