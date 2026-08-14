@@ -443,6 +443,11 @@ impl StorageClient for StorageApi {
         target: &ObjectPath,
         operation: &AppError,
     ) -> Result<(), AppError> {
+        // Nothing was sent, so neither object can have moved.
+        if !operation.reached_storage() {
+            return Ok(());
+        }
+
         let source_details = self.object_details(source);
         let target_details = self.object_details(target);
         let no_change = matches!(source_details, Ok((ObjectState::Present, _)))
@@ -468,7 +473,7 @@ impl StorageClient for StorageApi {
     ) -> Result<(), AppError> {
         // Nothing was sent, so the target cannot exist and asking would only
         // turn a local failure into a spurious manual recovery.
-        if matches!(operation, AppError::UploadSource(_)) {
+        if !operation.reached_storage() {
             return Ok(());
         }
 

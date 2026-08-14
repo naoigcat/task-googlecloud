@@ -71,6 +71,13 @@ impl AppError {
         }
     }
 
+    /// Whether the failure may have left Cloud Storage changed. Reading the
+    /// upload source and fetching the access token both happen before a request
+    /// is built, so those failures never can have.
+    pub(crate) fn reached_storage(&self) -> bool {
+        !matches!(self, Self::UploadSource(_) | Self::Command { .. })
+    }
+
     pub(crate) fn status(&self) -> Option<u16> {
         match self {
             Self::Storage { status, .. } => Some(*status),

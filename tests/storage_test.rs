@@ -271,7 +271,7 @@ fn refuses_symlinked_upload_sources() {
 }
 
 #[test]
-fn does_not_confirm_uploads_that_never_reached_storage() {
+fn does_not_confirm_operations_that_never_reached_storage() {
     // A dead endpoint proves no request is attempted: any lookup would fail.
     let storage = StorageApi::with_endpoints(
         Cloud::new(),
@@ -279,16 +279,26 @@ fn does_not_confirm_uploads_that_never_reached_storage() {
         "http://127.0.0.1:1/storage/v1",
         Some("token".to_string()),
     );
+    let source = ObjectPath::parse("gs://bucket/source").unwrap();
     let target = ObjectPath::parse("gs://bucket/target").unwrap();
+    let unreadable_source = AppError::UploadSource(std::io::Error::new(
+        std::io::ErrorKind::NotFound,
+        "not a regular file",
+    ));
+    let unreachable_cloud = AppError::Command {
+        operation: "Cloud command".to_string(),
+        status: "255".to_string(),
+        details: ": ssh: connect to host googlecloud port 22: Connection refused".to_string(),
+    };
 
     storage
-        .confirm_write_after_failure(
-            &target,
-            &AppError::UploadSource(std::io::Error::new(
-                std::io::ErrorKind::NotFound,
-                "not a regular file",
-            )),
-        )
+        .confirm_write_after_failure(&target, &unreadable_source)
+        .unwrap();
+    storage
+        .confirm_write_after_failure(&target, &unreachable_cloud)
+        .unwrap();
+    storage
+        .confirm_move_after_failure(&source, &target, &unreachable_cloud)
         .unwrap();
 }
 
