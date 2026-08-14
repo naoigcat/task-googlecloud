@@ -29,8 +29,10 @@ mise run upload [project]
 ### Authentication lifecycle
 
 Authentication is stored only in the temporary `googlecloud` container. The
-container is removed when a host-side mise task finishes, so credentials are
-not reused by later runs and no logout command is provided.
+`mise run normalize` and `mise run upload` tasks remove that container when they
+finish, so credentials are not reused by later runs and no logout command is
+provided. A development shell does not tear the container down on its own, so
+run `docker compose down` after using it.
 
 ## Development
 
@@ -40,6 +42,13 @@ The application container contains the pinned Rust toolchain and the compiled
 ```sh
 docker compose build app
 docker compose run --rm app /bin/bash
+```
+
+`--rm` removes only the application container. Discard the `googlecloud`
+container, and with it any credentials obtained from the shell, with:
+
+```sh
+docker compose down
 ```
 
 Run the local verification tasks:
