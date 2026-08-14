@@ -561,7 +561,7 @@ fn encode(value: &str) -> String {
 #[cfg(unix)]
 fn open_relative_without_following_links(root: &Path, source: &Path) -> Result<File, AppError> {
     let directory = open_directory(root)?;
-    open_path_components(directory, source, false)
+    open_path_components(directory, source)
 }
 
 #[cfg(unix)]
@@ -582,16 +582,11 @@ fn open_without_upload_root(source: &Path) -> Result<File, AppError> {
 }
 
 #[cfg(unix)]
-fn open_path_components(
-    mut directory: File,
-    source: &Path,
-    allow_root: bool,
-) -> Result<File, AppError> {
+fn open_path_components(mut directory: File, source: &Path) -> Result<File, AppError> {
     let mut components = source.components().peekable();
 
     while let Some(component) = components.next() {
         match component {
-            Component::RootDir if allow_root => {}
             Component::CurDir => {}
             Component::RootDir => {
                 return Err(std::io::Error::new(
