@@ -44,14 +44,15 @@ services:
     build:
       context: .
       dockerfile_inline: |
-        FROM --platform=linux/x86_64 gcr.io/google.com/cloudsdktool/google-cloud-cli:489.0.0@sha256:1fe16aa77fac9463b8b8ec3a5ebf1e5a02f0ce6afc67a5bf63055f0c6f855892
+        # Keep one reproducible CLI release while allowing Docker to select the host architecture.
+        FROM gcr.io/google.com/cloudsdktool/google-cloud-cli:573.0.0-stable@sha256:f5fae73a6f1c60b58a1150ff76771a43620891d4dd74abc527c8eca0d544b385
         WORKDIR /uploads
         RUN apt-get update && apt-get install -y \
-                openssh-server=1:8.4p1-5+deb11u7 \
-                netcat-openbsd=1.217-3 \
+                openssh-server=1:10.0p1-7+deb13u4 \
+                netcat-openbsd=1.229-1 \
             && \
             useradd --create-home --shell /bin/bash cloud && \
-            mkdir /var/run/sshd && \
+            mkdir -p /var/run/sshd && \
             mkdir -p /etc/ssh/sshd_config.d && \
             printf '%s\n' \
                 'PermitRootLogin no' \
@@ -63,6 +64,10 @@ services:
             sed -i '1i Include /etc/ssh/sshd_config.d/00-googlecloud-security.conf' /etc/ssh/sshd_config && \
             apt-get clean && \
             rm -rf /var/cache/apt/archives/* /var/lib/apt/lists/*
+        # Login shells reset PATH, so keep gcloud available to the SSH user.
+        RUN printf '%s\n' 'export PATH="$$PATH:/usr/lib/google-cloud-sdk/bin"' > /etc/profile.d/google-cloud-sdk.sh
+        # SSH command sessions use a minimal PATH, so expose gcloud in a standard directory.
+        RUN ln -s /usr/lib/google-cloud-sdk/bin/gcloud /usr/local/bin/gcloud
         RUN cat <<'EOF' > /usr/local/bin/googlecloud-entrypoint
         #!/bin/sh
         set -eu
