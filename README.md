@@ -79,9 +79,13 @@ a remote failure leaves an object whose ownership cannot be established safely.
 
 Before retrying a stopped run:
 
-1.  Stop other runs for the same bucket and inspect Cloud Storage for normalize
-    objects ending in `.task-googlecloud-<token>` and upload objects below
-    `.task-googlecloud-staging/<token>/`.
+1.  Stop other runs for the same bucket and inspect Cloud Storage for the
+    `.task-googlecloud-lock` object, normalize objects ending in
+    `.task-googlecloud-<token>`, and upload objects below
+    `.task-googlecloud-staging/<token>/`. Every writer touching the bucket must
+    honor the lock object; after a forced termination, remove the lock only
+    after confirming that no run is active and recording its current
+    generation.
 2.  For normalize, inspect both the temporary object and its normalized final
     path. Verify the source, destination, object generation, and contents
     before moving a temporary object back or keeping/removing a final object.
