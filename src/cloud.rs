@@ -19,19 +19,6 @@ impl Cloud {
         Ok(())
     }
 
-    pub fn logout(&self) -> Result<(), AppError> {
-        let account = self.run_capture("gcloud config get account")?;
-        if account.trim().is_empty() || account.trim() == "(unset)" {
-            return Ok(());
-        }
-
-        self.run_script(
-            "set -eu\ngcloud auth revoke\nrm -rf /home/cloud/.config/gcloud\n",
-            &[],
-        )?;
-        Ok(())
-    }
-
     pub fn set_project(&self, project: &str) -> Result<(), AppError> {
         self.run_script(
             "set -eu\ngcloud config set project \"$1\"\n",

@@ -53,7 +53,6 @@ impl InterruptFlag {
 pub enum Command {
     Normalize { project: String, bucket: String },
     Upload { project: String },
-    Logout,
 }
 
 pub fn run(
@@ -67,6 +66,5 @@ pub fn run(
             normalize::run(&cloud, &storage, &interrupt, &project, &bucket)
         }
         Command::Upload { project } => upload::run(&cloud, &storage, &interrupt, &project),
-        Command::Logout => cloud.logout(),
     }
 }

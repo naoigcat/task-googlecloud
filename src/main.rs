@@ -14,7 +14,6 @@ struct Cli {
 enum Command {
     Normalize { project: String, bucket: String },
     Upload { project: String },
-    Logout,
 }
 
 fn main() {
@@ -26,7 +25,6 @@ fn main() {
         let command = match cli.command {
             Command::Normalize { project, bucket } => TaskCommand::Normalize { project, bucket },
             Command::Upload { project } => TaskCommand::Upload { project },
-            Command::Logout => TaskCommand::Logout,
         };
         run(command, cloud, storage, interrupt)
     })();
