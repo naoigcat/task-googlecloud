@@ -25,6 +25,9 @@ jobs:
         name: Clippy
         run: mise run clippy
       -
+        name: ShellCheck
+        run: mise run shellcheck
+      -
         name: Dependency audit
         run: mise run audit
       -
