@@ -28,6 +28,9 @@ pub enum AppError {
         details: String,
     },
 
+    #[error("Cloud Storage token retrieval failed: {0}")]
+    Token(Box<AppError>, bool),
+
     #[error("Manual recovery required for {paths} after {operation}; {details}")]
     Recovery {
         paths: String,
@@ -71,11 +74,41 @@ impl AppError {
         }
     }
 
-    /// Whether the failure may have left Cloud Storage changed. Reading the
-    /// upload source and fetching the access token both happen before a request
-    /// is built, so those failures never can have.
+    /// Whether the failure may have left Cloud Storage changed. Upload-source
+    /// failures and token failures before any request cannot have; token
+    /// failures after an earlier request are marked as reached.
     pub(crate) fn reached_storage(&self) -> bool {
-        !matches!(self, Self::UploadSource(_) | Self::Command { .. })
+        match self {
+            Self::UploadSource(_) | Self::Command { .. } => false,
+            Self::Token(_, reached_storage) => *reached_storage,
+            _ => true,
+        }
+    }
+
+    pub(crate) fn is_interrupted(&self) -> bool {
+        match self {
+            Self::Interrupted => true,
+            Self::Token(error, _) => error.is_interrupted(),
+            _ => false,
+        }
+    }
+
+    pub(crate) fn token(error: Self) -> Self {
+        Self::Token(Box::new(error), false)
+    }
+
+    pub(crate) fn mark_reached_storage(self) -> Self {
+        match self {
+            Self::Token(error, _) => Self::Token(error, true),
+            error => error,
+        }
+    }
+
+    pub(crate) fn may_have_sent_storage_request(&self) -> bool {
+        matches!(
+            self,
+            Self::Http(_) | Self::Storage { .. } | Self::Token(_, true)
+        )
     }
 
     pub(crate) fn status(&self) -> Option<u16> {

@@ -13,7 +13,7 @@ pub fn execute<S: StorageClient>(
     match storage.move_object(source, target, expected_source_generation) {
         Ok(generation) => Ok(generation),
         Err(error) => {
-            if matches!(error, AppError::Interrupted) {
+            if error.is_interrupted() {
                 interrupt.clear_for_rollback();
             }
             match storage.confirm_move_after_failure(source, target, &error) {
@@ -34,7 +34,7 @@ pub fn execute_upload<S: StorageClient>(
     match storage.upload_file(source, target) {
         Ok(generation) => Ok(generation),
         Err(error) => {
-            if matches!(error, AppError::Interrupted) {
+            if error.is_interrupted() {
                 interrupt.clear_for_rollback();
             }
             match storage.confirm_write_after_failure(target, &error) {

@@ -183,7 +183,7 @@ impl StorageApi {
     fn token(&self) -> Result<String, AppError> {
         self.token_override
             .clone()
-            .map_or_else(|| self.cloud.access_token(), Ok)
+            .map_or_else(|| self.cloud.access_token().map_err(AppError::token), Ok)
     }
 
     fn send(&self, request: RequestBuilder) -> Result<Response, AppError> {
@@ -263,6 +263,7 @@ impl StorageApi {
         let query = query.finish();
         let base_url = rewrite_url(&self.api_base, source, target);
         let mut rewrite_token: Option<String> = None;
+        let mut request_sent = false;
 
         loop {
             let mut url = base_url.clone();
@@ -278,10 +279,19 @@ impl StorageApi {
                 url.push_str(&query_with_token);
             }
 
-            let rewrite: RewriteResponse = self.send_json(
-                self.client.post(url),
-                "Invalid Cloud Storage rewrite response",
-            )?;
+            let rewrite: RewriteResponse = self
+                .send_json(
+                    self.client.post(url),
+                    "Invalid Cloud Storage rewrite response",
+                )
+                .map_err(|error| {
+                    if request_sent {
+                        error.mark_reached_storage()
+                    } else {
+                        error
+                    }
+                })?;
+            request_sent = true;
             if rewrite.done {
                 let resource = rewrite.resource.ok_or_else(|| {
                     AppError::Message("Cloud Storage rewrite omitted its resource".to_string())
@@ -364,8 +374,13 @@ impl StorageClient for StorageApi {
         };
         let target_generation =
             self.copy_object(source, target, Some(&source_generation), Some("0"))?;
-        self.delete_object(source, &source_generation)?;
-        if self.object_state(source, None)? != ObjectState::Missing {
+        self.delete_object(source, &source_generation)
+            .map_err(AppError::mark_reached_storage)?;
+        if self
+            .object_state(source, None)
+            .map_err(AppError::mark_reached_storage)?
+            != ObjectState::Missing
+        {
             return Err(AppError::Message(format!(
                 "Source object remains after moving {}",
                 source.uri()
@@ -391,8 +406,13 @@ impl StorageClient for StorageApi {
         }
         let source_generation =
             self.copy_object(target, source, Some(target_generation), Some("0"))?;
-        self.delete_object(target, target_generation)?;
-        if self.object_state(target, None)? != ObjectState::Missing {
+        self.delete_object(target, target_generation)
+            .map_err(AppError::mark_reached_storage)?;
+        if self
+            .object_state(target, None)
+            .map_err(AppError::mark_reached_storage)?
+            != ObjectState::Missing
+        {
             return Err(AppError::Message(format!(
                 "Rollback target remains: {}",
                 target.uri()
@@ -403,10 +423,16 @@ impl StorageClient for StorageApi {
 
     fn cleanup_object(&self, target: &ObjectPath, target_generation: &str) -> Result<(), AppError> {
         match self.object_state(target, Some(target_generation))? {
-            ObjectState::Present => self.delete_object(target, target_generation)?,
+            ObjectState::Present => self
+                .delete_object(target, target_generation)
+                .map_err(AppError::mark_reached_storage)?,
             ObjectState::Missing => {}
         }
-        if self.object_state(target, None)? != ObjectState::Missing {
+        if self
+            .object_state(target, None)
+            .map_err(AppError::mark_reached_storage)?
+            != ObjectState::Missing
+        {
             return Err(AppError::Message(format!(
                 "Cleanup target remains: {}",
                 target.uri()
@@ -430,7 +456,7 @@ impl StorageClient for StorageApi {
         let target_details = self.object_details(target);
         let no_change = matches!(source_details, Ok((ObjectState::Present, _)))
             && matches!(target_details, Ok((ObjectState::Missing, _)));
-        if no_change && !matches!(operation, AppError::Http(_) | AppError::Storage { .. }) {
+        if no_change && !operation.may_have_sent_storage_request() {
             return Ok(());
         }
         Err(AppError::Recovery {
@@ -457,7 +483,7 @@ impl StorageClient for StorageApi {
 
         let details = self.object_details(target);
         if matches!(details, Ok((ObjectState::Missing, _)))
-            && !matches!(operation, AppError::Http(_) | AppError::Storage { .. })
+            && !operation.may_have_sent_storage_request()
         {
             return Ok(());
         }
