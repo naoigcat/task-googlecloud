@@ -23,9 +23,6 @@ pub enum AppError {
         details: String,
     },
 
-    #[error("Cannot verify ownership for {0:?} without a generation")]
-    MissingGeneration(String),
-
     #[error("Manual recovery required for {paths} after {operation}; {details}")]
     Recovery {
         paths: String,
