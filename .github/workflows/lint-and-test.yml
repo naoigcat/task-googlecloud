@@ -25,6 +25,12 @@ jobs:
         name: Clippy
         run: mise run clippy
       -
+        name: Dependency audit
+        run: mise run audit
+      -
+        name: Dependency policy
+        run: mise run deny
+      -
         name: Markdownlint
         run: mise run markdownlint
   test:

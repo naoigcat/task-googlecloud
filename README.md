@@ -47,6 +47,8 @@ Run the local verification tasks:
 ```sh
 mise run fmt-check
 mise run clippy
+mise run audit
+mise run deny
 mise run test
 mise run markdownlint
 ```
