@@ -7,6 +7,7 @@ mod normalize;
 mod object_move;
 mod storage;
 mod upload;
+mod upload_source;
 
 pub use cloud::{Cloud, shell_quote};
 pub use error::AppError;

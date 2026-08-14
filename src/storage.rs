@@ -1,15 +1,3 @@
-#[cfg(unix)]
-use std::ffi::CString;
-use std::fs;
-use std::fs::File;
-#[cfg(unix)]
-use std::os::unix::ffi::OsStrExt;
-#[cfg(unix)]
-use std::os::unix::fs::OpenOptionsExt;
-#[cfg(unix)]
-use std::os::unix::io::{AsRawFd, FromRawFd, RawFd};
-#[cfg(unix)]
-use std::path::Component;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -17,10 +5,12 @@ use percent_encoding::{AsciiSet, CONTROLS, utf8_percent_encode};
 use reqwest::blocking::{Client, RequestBuilder, Response};
 use reqwest::header::{CONTENT_LENGTH, CONTENT_TYPE};
 use serde::Deserialize;
+use serde::de::DeserializeOwned;
 use url::form_urlencoded::Serializer;
 
 use crate::cloud::Cloud;
 use crate::error::AppError;
+use crate::upload_source;
 
 /// Uploads are confined to this directory, so file discovery and the confined
 /// open must agree on where it is.
@@ -196,6 +186,19 @@ impl StorageApi {
         Ok(request.bearer_auth(token).send()?)
     }
 
+    fn send_body(&self, request: RequestBuilder) -> Result<Vec<u8>, AppError> {
+        Self::response_body(self.send(request)?)
+    }
+
+    fn send_json<T>(&self, request: RequestBuilder, description: &str) -> Result<T, AppError>
+    where
+        T: DeserializeOwned,
+    {
+        let body = self.send_body(request)?;
+        serde_json::from_slice(&body)
+            .map_err(|error| AppError::Message(format!("{description}: {error}")))
+    }
+
     fn response_body(response: Response) -> Result<Vec<u8>, AppError> {
         let status = response.status();
         let body = response.bytes()?.to_vec();
@@ -209,27 +212,6 @@ impl StorageApi {
         })
     }
 
-    #[cfg(unix)]
-    fn open_upload_file(&self, source: &Path) -> Result<File, AppError> {
-        if let Some(root) = &self.upload_root {
-            let relative = source
-                .strip_prefix(root)
-                .map_err(|_| rejected_source(format!("outside {root:?}: {source:?}")))?;
-            open_relative_without_following_links(root, relative)
-        } else {
-            open_without_upload_root(source)
-        }
-    }
-
-    #[cfg(not(unix))]
-    fn open_upload_file(&self, source: &Path) -> Result<File, AppError> {
-        let metadata = fs::symlink_metadata(source).map_err(AppError::UploadSource)?;
-        if !metadata.file_type().is_file() {
-            return Err(rejected_source(format!("not a regular file: {source:?}")));
-        }
-        File::open(source).map_err(AppError::UploadSource)
-    }
-
     fn object_metadata(
         &self,
         object: &ObjectPath,
@@ -239,11 +221,8 @@ impl StorageApi {
         if let Some(generation) = generation {
             url = with_query(url, [("generation", generation)]);
         }
-        let response = self.send(self.client.get(url))?;
-        let body = Self::response_body(response)?;
-        let metadata: MetadataResponse = serde_json::from_slice(&body).map_err(|error| {
-            AppError::Message(format!("Invalid Cloud Storage metadata: {error}"))
-        })?;
+        let metadata: MetadataResponse =
+            self.send_json(self.client.get(url), "Invalid Cloud Storage metadata")?;
         Ok(ObjectMetadata {
             generation: metadata.generation,
         })
@@ -294,11 +273,10 @@ impl StorageApi {
                 url.push_str(&query_with_token);
             }
 
-            let response = self.send(self.client.post(url))?;
-            let body = Self::response_body(response)?;
-            let rewrite: RewriteResponse = serde_json::from_slice(&body).map_err(|error| {
-                AppError::Message(format!("Invalid Cloud Storage rewrite response: {error}"))
-            })?;
+            let rewrite: RewriteResponse = self.send_json(
+                self.client.post(url),
+                "Invalid Cloud Storage rewrite response",
+            )?;
             if rewrite.done {
                 let resource = rewrite.resource.ok_or_else(|| {
                     AppError::Message("Cloud Storage rewrite omitted its resource".to_string())
@@ -318,8 +296,7 @@ impl StorageApi {
             object_url(&self.api_base, object),
             [("generation", generation)],
         );
-        let response = self.send(self.client.delete(url))?;
-        Self::response_body(response).map(|_| ())
+        self.send_body(self.client.delete(url)).map(|_| ())
     }
 }
 
@@ -328,22 +305,13 @@ impl StorageClient for StorageApi {
         let mut page_token: Option<String> = None;
         let mut objects = Vec::new();
         loop {
-            let mut query = Serializer::new(String::new());
-            query.append_pair("maxResults", "1000");
+            let mut query = vec![("maxResults", "1000")];
             if let Some(page_token) = &page_token {
-                query.append_pair("pageToken", page_token);
+                query.push(("pageToken", page_token.as_str()));
             }
-            let url = format!(
-                "{}/b/{}/o?{}",
-                self.api_base,
-                encode(bucket),
-                query.finish()
-            );
-            let response = self.send(self.client.get(url))?;
-            let body = Self::response_body(response)?;
-            let listing: ListResponse = serde_json::from_slice(&body).map_err(|error| {
-                AppError::Message(format!("Invalid Cloud Storage list response: {error}"))
-            })?;
+            let url = with_query(format!("{}/b/{}/o", self.api_base, encode(bucket)), query);
+            let listing: ListResponse =
+                self.send_json(self.client.get(url), "Invalid Cloud Storage list response")?;
             objects.extend(
                 listing
                     .items
@@ -358,7 +326,7 @@ impl StorageClient for StorageApi {
     }
 
     fn upload_file(&self, source: &Path, target: &ObjectPath) -> Result<String, AppError> {
-        let file = self.open_upload_file(source)?;
+        let file = upload_source::open(self.upload_root.as_deref(), source)?;
         let size = file.metadata().map_err(AppError::UploadSource)?.len();
         let url = with_query(
             format!("{}/b/{}/o", self.upload_base, encode(&target.bucket)),
@@ -374,11 +342,8 @@ impl StorageClient for StorageApi {
             .header(CONTENT_TYPE, "application/octet-stream")
             .header(CONTENT_LENGTH, size)
             .body(file);
-        let response = self.send(request)?;
-        let body = Self::response_body(response)?;
-        let metadata: MetadataResponse = serde_json::from_slice(&body).map_err(|error| {
-            AppError::Message(format!("Invalid Cloud Storage upload response: {error}"))
-        })?;
+        let metadata: MetadataResponse =
+            self.send_json(request, "Invalid Cloud Storage upload response")?;
         Ok(metadata.generation)
     }
 
@@ -566,102 +531,6 @@ fn response_message(body: &[u8]) -> String {
 
 fn encode(value: &str) -> String {
     utf8_percent_encode(value, PATH_SEGMENT).to_string()
-}
-
-#[cfg(unix)]
-fn open_relative_without_following_links(root: &Path, source: &Path) -> Result<File, AppError> {
-    let directory = open_directory(root)?;
-    open_path_components(directory, source)
-}
-
-/// Every local rejection is an `UploadSource` failure, so callers can tell it
-/// apart from a failure that may already have reached Cloud Storage.
-fn rejected_source(message: String) -> AppError {
-    AppError::UploadSource(std::io::Error::new(
-        std::io::ErrorKind::InvalidInput,
-        message,
-    ))
-}
-
-#[cfg(unix)]
-fn open_without_upload_root(source: &Path) -> Result<File, AppError> {
-    let metadata = fs::symlink_metadata(source).map_err(AppError::UploadSource)?;
-    if !metadata.file_type().is_file() {
-        return Err(rejected_source(format!("not a regular file: {source:?}")));
-    }
-    fs::OpenOptions::new()
-        .read(true)
-        .custom_flags(libc::O_NOFOLLOW)
-        .open(source)
-        .map_err(AppError::UploadSource)
-}
-
-#[cfg(unix)]
-fn open_path_components(mut directory: File, source: &Path) -> Result<File, AppError> {
-    let mut components = source.components().peekable();
-
-    while let Some(component) = components.next() {
-        match component {
-            Component::CurDir => {}
-            Component::RootDir => {
-                return Err(rejected_source(format!("absolute path: {source:?}")));
-            }
-            Component::ParentDir => {
-                return Err(rejected_source(format!(
-                    "contains a parent path component: {source:?}"
-                )));
-            }
-            Component::Normal(name) if components.peek().is_some() => {
-                let fd = open_at(directory.as_raw_fd(), name, directory_flags())?;
-                directory = unsafe { File::from_raw_fd(fd) };
-            }
-            Component::Normal(name) => {
-                let fd = open_at(directory.as_raw_fd(), name, file_flags())?;
-                let file = unsafe { File::from_raw_fd(fd) };
-                if !file
-                    .metadata()
-                    .map_err(AppError::UploadSource)?
-                    .file_type()
-                    .is_file()
-                {
-                    return Err(rejected_source(format!("not a regular file: {source:?}")));
-                }
-                return Ok(file);
-            }
-            _ => {
-                return Err(rejected_source(format!("not a regular file: {source:?}")));
-            }
-        }
-    }
-
-    Err(rejected_source(format!("not a regular file: {source:?}")))
-}
-
-#[cfg(unix)]
-fn open_directory(path: &Path) -> Result<File, AppError> {
-    let fd = open_at(libc::AT_FDCWD, path.as_os_str(), directory_flags())?;
-    Ok(unsafe { File::from_raw_fd(fd) })
-}
-
-#[cfg(unix)]
-fn open_at(directory: RawFd, name: &std::ffi::OsStr, flags: i32) -> Result<RawFd, AppError> {
-    let name = CString::new(name.as_bytes())
-        .map_err(|_| rejected_source(format!("path contains NUL: {name:?}")))?;
-    let fd = unsafe { libc::openat(directory, name.as_ptr(), flags) };
-    if fd < 0 {
-        return Err(AppError::UploadSource(std::io::Error::last_os_error()));
-    }
-    Ok(fd)
-}
-
-#[cfg(unix)]
-fn directory_flags() -> i32 {
-    libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC | libc::O_NOFOLLOW
-}
-
-#[cfg(unix)]
-fn file_flags() -> i32 {
-    libc::O_RDONLY | libc::O_CLOEXEC | libc::O_NOFOLLOW
 }
 
 fn object_url(base: &str, object: &ObjectPath) -> String {
