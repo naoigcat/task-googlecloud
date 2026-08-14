@@ -79,6 +79,18 @@ else
 fi
 '''
 
+[tasks.shellcheck]
+description = "Run ShellCheck"
+run = '''
+set -eu
+if [ -f /.dockerenv ]; then
+    find . -type f -name '*.sh' -exec shellcheck {} +
+else
+    docker compose build app
+    docker compose run --rm --no-deps app find . -type f -name '*.sh' -exec shellcheck {} +
+fi
+'''
+
 [tasks.test]
 description = "Run Rust tests"
 run = '''

@@ -17,6 +17,7 @@ services:
         RUN apt-get update && apt-get install -y --no-install-recommends \
                 ca-certificates \
                 openssh-client \
+                shellcheck \
             && \
             rustup component add clippy rustfmt \
             && \
