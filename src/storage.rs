@@ -1,5 +1,6 @@
 use std::fs::File;
 use std::path::Path;
+use std::time::Duration;
 
 use percent_encoding::{AsciiSet, CONTROLS, utf8_percent_encode};
 use reqwest::blocking::{Client, RequestBuilder, Response};
@@ -12,6 +13,7 @@ use crate::error::AppError;
 
 const API_BASE: &str = "https://storage.googleapis.com/storage/v1";
 const UPLOAD_BASE: &str = "https://storage.googleapis.com/upload/storage/v1";
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 const PATH_SEGMENT: &AsciiSet = &CONTROLS
     .add(b' ')
     .add(b'"')
@@ -98,6 +100,7 @@ pub trait StorageClient {
 pub struct StorageApi {
     cloud: Cloud,
     client: Client,
+    upload_client: Client,
     token_override: Option<String>,
     api_base: String,
     upload_base: String,
@@ -114,16 +117,32 @@ impl StorageApi {
         upload_base: impl Into<String>,
         token: Option<String>,
     ) -> Self {
+        Self::with_endpoint_options(cloud, api_base, upload_base, token, REQUEST_TIMEOUT)
+    }
+
+    fn with_endpoint_options(
+        cloud: Cloud,
+        api_base: impl Into<String>,
+        upload_base: impl Into<String>,
+        token: Option<String>,
+        request_timeout: Duration,
+    ) -> Self {
         Self {
             cloud,
-            client: Client::builder()
-                .timeout(std::time::Duration::from_secs(30))
-                .build()
-                .expect("the static HTTP client configuration is valid"),
+            client: Self::build_client(Some(request_timeout)),
+            upload_client: Self::build_client(None),
             token_override: token,
             api_base: api_base.into(),
             upload_base: upload_base.into(),
         }
+    }
+
+    fn build_client(total_timeout: Option<Duration>) -> Client {
+        Client::builder()
+            .timeout(total_timeout)
+            .connect_timeout(REQUEST_TIMEOUT)
+            .build()
+            .expect("the static HTTP client configuration is valid")
     }
 
     fn token(&self) -> Result<String, AppError> {
@@ -297,7 +316,7 @@ impl StorageClient for StorageApi {
             ],
         );
         let request = self
-            .client
+            .upload_client
             .post(url)
             .header(CONTENT_TYPE, "application/octet-stream")
             .header(CONTENT_LENGTH, size)
@@ -514,4 +533,50 @@ where
         serializer.append_pair(key.as_ref(), value.as_ref());
     }
     format!("{base}?{}", serializer.finish())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+    use std::thread;
+
+    use tempfile::NamedTempFile;
+
+    use super::{Cloud, Duration, ObjectPath, StorageApi, StorageClient};
+
+    #[test]
+    fn uploads_files_without_a_total_request_timeout() {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let base = format!("http://{}/storage/v1", listener.local_addr().unwrap());
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = Vec::new();
+            let mut buffer = [0_u8; 1];
+            while !request.ends_with(b"\r\n\r\n") {
+                stream.read_exact(&mut buffer).unwrap();
+                request.push(buffer[0]);
+            }
+            thread::sleep(Duration::from_millis(100));
+            let body = r#"{"generation":"456"}"#;
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            stream.write_all(response.as_bytes()).unwrap();
+        });
+        let source = NamedTempFile::new().unwrap();
+        std::fs::write(source.path(), b"contents").unwrap();
+        let target = ObjectPath::parse("gs://bucket/target").unwrap();
+        let storage = StorageApi::with_endpoint_options(
+            Cloud::new(),
+            base.clone(),
+            base,
+            Some("token".to_string()),
+            Duration::from_millis(10),
+        );
+
+        assert_eq!(storage.upload_file(source.path(), &target).unwrap(), "456");
+        server.join().unwrap();
+    }
 }
