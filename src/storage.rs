@@ -22,6 +22,9 @@ use url::form_urlencoded::Serializer;
 use crate::cloud::Cloud;
 use crate::error::AppError;
 
+/// Uploads are confined to this directory, so file discovery and the confined
+/// open must agree on where it is.
+pub(crate) const UPLOAD_ROOT: &str = "uploads";
 /// Cloud Storage rejects object names longer than this, so reject them before
 /// any request is sent and the transaction is half applied.
 pub(crate) const MAX_OBJECT_NAME_BYTES: usize = 1024;
@@ -125,7 +128,7 @@ pub struct StorageApi {
 impl StorageApi {
     pub fn new(cloud: Cloud) -> Self {
         let mut storage = Self::with_endpoints(cloud, API_BASE, UPLOAD_BASE, None);
-        storage.upload_root = Some(PathBuf::from("uploads"));
+        storage.upload_root = Some(PathBuf::from(UPLOAD_ROOT));
         storage
     }
 

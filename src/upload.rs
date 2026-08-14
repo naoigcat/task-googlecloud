@@ -8,7 +8,7 @@ use crate::error::AppError;
 use crate::local;
 use crate::normalization_plan;
 use crate::object_move;
-use crate::storage::{MAX_OBJECT_NAME_BYTES, ObjectPath, StorageClient};
+use crate::storage::{MAX_OBJECT_NAME_BYTES, ObjectPath, StorageClient, UPLOAD_ROOT};
 
 #[derive(Clone, Debug)]
 pub struct RemoteChange {
@@ -23,7 +23,7 @@ pub fn run<S: StorageClient>(
     interrupt: &InterruptFlag,
     project: &str,
 ) -> Result<(), AppError> {
-    let files_by_directory = upload_files_by_directory(Path::new("uploads"))?;
+    let files_by_directory = upload_files_by_directory(Path::new(UPLOAD_ROOT))?;
     let files = files_by_directory
         .values()
         .flatten()
