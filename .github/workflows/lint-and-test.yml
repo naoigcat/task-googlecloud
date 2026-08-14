@@ -50,8 +50,5 @@ jobs:
         name: Setup mise
         uses: jdx/mise-action@c37c93293d6b742fc901e1406b8f764f6fb19dac # v2
       -
-        name: Google Cloud image
-        run: docker compose build googlecloud
-      -
         name: Rust tests
         run: mise run test
