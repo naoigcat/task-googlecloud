@@ -36,10 +36,7 @@ impl Cloud {
 
     fn run_capture(&self, remote_command: &str) -> Result<String, AppError> {
         let output = self.ssh(remote_command).output()?;
-        self.check_output("Cloud command", &output)?;
-        String::from_utf8(output.stdout).map_err(|error| {
-            AppError::Message(format!("Cloud command returned invalid UTF-8: {error}"))
-        })
+        self.output_text("Cloud command", output)
     }
 
     fn run_interactive(&self, remote_command: &str) -> Result<(), AppError> {
@@ -79,10 +76,7 @@ impl Cloud {
             .expect("stdin was configured")
             .write_all(script.as_bytes())?;
         let output = child.wait_with_output()?;
-        self.check_output("Cloud script", &output)?;
-        String::from_utf8(output.stdout).map_err(|error| {
-            AppError::Message(format!("Cloud script returned invalid UTF-8: {error}"))
-        })
+        self.output_text("Cloud script", output)
     }
 
     #[doc(hidden)]
@@ -131,6 +125,13 @@ impl Cloud {
             operation: operation.to_string(),
             status: format_status(output.status.code()),
             details,
+        })
+    }
+
+    fn output_text(&self, operation: &str, output: Output) -> Result<String, AppError> {
+        self.check_output(operation, &output)?;
+        String::from_utf8(output.stdout).map_err(|error| {
+            AppError::Message(format!("{operation} returned invalid UTF-8: {error}"))
         })
     }
 }

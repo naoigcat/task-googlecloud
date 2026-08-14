@@ -18,21 +18,22 @@ pub fn apply_normalization(
     interrupt: &InterruptFlag,
 ) -> Result<HashMap<PathBuf, PathBuf>, AppError> {
     let mut renamed = Vec::new();
-    for entry in entries {
-        let source = PathBuf::from(&entry.source);
-        let target = PathBuf::from(&entry.target);
-        if source == target {
-            continue;
+    let operation = (|| {
+        for entry in entries {
+            let source = PathBuf::from(&entry.source);
+            let target = PathBuf::from(&entry.target);
+            if source == target {
+                continue;
+            }
+            rename_without_overwrite(&source, &target)?;
+            renamed.push(RenameRecord { source, target });
+            interrupt.check()?;
         }
-        if let Err(error) = rename_without_overwrite(&source, &target) {
-            let rollback_errors = rollback(&renamed);
-            return Err(AppError::rollback(error, rollback_errors));
-        }
-        renamed.push(RenameRecord { source, target });
-        if let Err(error) = interrupt.check() {
-            let rollback_errors = rollback(&renamed);
-            return Err(AppError::rollback(error, rollback_errors));
-        }
+        Ok::<(), AppError>(())
+    })();
+
+    if let Err(error) = operation {
+        return Err(AppError::rollback(error, rollback(&renamed)));
     }
 
     Ok(entries
@@ -58,7 +59,9 @@ fn rollback(entries: &[RenameRecord]) -> Vec<AppError> {
         if entry.source == entry.target {
             continue;
         }
-        if path_entry_exists(&entry.source) && path_entry_exists(&entry.target) {
+        let source_exists = path_entry_exists(&entry.source);
+        let target_exists = path_entry_exists(&entry.target);
+        if source_exists && target_exists {
             match same_path_entry(&entry.source, &entry.target) {
                 Ok(true) => continue,
                 Ok(false) => errors.push(
@@ -69,7 +72,7 @@ fn rollback(entries: &[RenameRecord]) -> Vec<AppError> {
             }
             continue;
         }
-        if !path_entry_exists(&entry.target) {
+        if !target_exists {
             errors.push(io::Error::new(io::ErrorKind::NotFound, "target does not exist").into());
             continue;
         }
