@@ -12,21 +12,32 @@ use std::os::unix::io::{AsRawFd, FromRawFd, RawFd};
 use std::path::Component;
 use std::path::Path;
 
+use crate::atomic_rename::{DirectoryIdentity, directory_identity};
 use crate::error::AppError;
 
 #[cfg(unix)]
-pub(crate) fn open(root: Option<&Path>, source: &Path) -> Result<File, AppError> {
+pub(crate) fn open(
+    root: Option<&Path>,
+    source: &Path,
+    expected_root: Option<DirectoryIdentity>,
+) -> Result<File, AppError> {
+    ensure_upload_root_identity_supported(expected_root)?;
     if let Some(root) = root {
         let relative = source
             .strip_prefix(root)
             .map_err(|_| rejected_source(format!("outside {root:?}: {source:?}")))?;
-        return open_relative_without_following_links(root, relative);
+        return open_relative_without_following_links(root, relative, expected_root);
     }
     open_without_upload_root(source)
 }
 
 #[cfg(not(unix))]
-pub(crate) fn open(_root: Option<&Path>, source: &Path) -> Result<File, AppError> {
+pub(crate) fn open(
+    _root: Option<&Path>,
+    source: &Path,
+    expected_root: Option<DirectoryIdentity>,
+) -> Result<File, AppError> {
+    ensure_upload_root_identity_supported(expected_root)?;
     let metadata = fs::symlink_metadata(source).map_err(AppError::UploadSource)?;
     if !metadata.file_type().is_file() {
         return Err(rejected_source(format!("not a regular file: {source:?}")));
@@ -34,9 +45,33 @@ pub(crate) fn open(_root: Option<&Path>, source: &Path) -> Result<File, AppError
     File::open(source).map_err(AppError::UploadSource)
 }
 
+fn ensure_upload_root_identity_supported(
+    expected_root: Option<DirectoryIdentity>,
+) -> Result<(), AppError> {
+    if expected_root.is_some() {
+        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+        return Err(AppError::UnsupportedPlatform(
+            std::env::consts::OS.to_string(),
+        ));
+    }
+    Ok(())
+}
+
 #[cfg(unix)]
-fn open_relative_without_following_links(root: &Path, source: &Path) -> Result<File, AppError> {
+fn open_relative_without_following_links(
+    root: &Path,
+    source: &Path,
+    expected_root: Option<DirectoryIdentity>,
+) -> Result<File, AppError> {
     let directory = open_directory(root)?;
+    if let Some(expected_root) = expected_root {
+        let actual_root = directory_identity(&directory).map_err(AppError::UploadSource)?;
+        if actual_root != expected_root {
+            return Err(rejected_source(format!(
+                "upload root was replaced before opening: {root:?}"
+            )));
+        }
+    }
     open_path_components(directory, source)
 }
 

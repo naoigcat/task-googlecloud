@@ -1,19 +1,64 @@
 use std::path::{Component, Path};
+use std::{fs::File, io};
 
 use crate::error::AppError;
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 use std::ffi::{CString, OsStr};
-#[cfg(any(target_os = "linux", target_os = "macos"))]
-use std::fs::File;
 #[cfg(target_os = "macos")]
 use std::mem::MaybeUninit;
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 use std::os::unix::ffi::OsStrExt;
 #[cfg(any(target_os = "linux", target_os = "macos"))]
+use std::os::unix::fs::MetadataExt;
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 use std::os::unix::io::{AsRawFd, FromRawFd};
 
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DirectoryIdentity {
+    device: u64,
+    inode: u64,
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DirectoryIdentity;
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+pub(crate) fn directory_identity_from_metadata(metadata: &std::fs::Metadata) -> DirectoryIdentity {
+    DirectoryIdentity {
+        device: metadata.dev(),
+        inode: metadata.ino(),
+    }
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+pub(crate) fn directory_identity_from_metadata(_metadata: &std::fs::Metadata) -> DirectoryIdentity {
+    DirectoryIdentity
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+pub(crate) fn directory_identity(file: &File) -> io::Result<DirectoryIdentity> {
+    let metadata = file.metadata()?;
+    Ok(directory_identity_from_metadata(&metadata))
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+pub(crate) fn directory_identity(_file: &File) -> io::Result<DirectoryIdentity> {
+    Ok(DirectoryIdentity)
+}
+
 pub fn rename_without_overwrite(root: &Path, source: &Path, target: &Path) -> Result<(), AppError> {
+    rename_without_overwrite_with_identity(root, None, source, target)
+}
+
+pub(crate) fn rename_without_overwrite_with_identity(
+    root: &Path,
+    expected_root: Option<DirectoryIdentity>,
+    source: &Path,
+    target: &Path,
+) -> Result<(), AppError> {
     if source == target {
         return Ok(());
     }
@@ -21,6 +66,13 @@ pub fn rename_without_overwrite(root: &Path, source: &Path, target: &Path) -> Re
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     {
         let root_directory = open_directory(root)?;
+        if let Some(expected_root) = expected_root
+            && directory_identity(&root_directory)? != expected_root
+        {
+            return Err(AppError::Message(format!(
+                "Input root was replaced before renaming: {root:?}"
+            )));
+        }
         let (source_parent, source_name) = relative_parent(&root_directory, root, source)?;
         let (target_parent, target_name) = relative_parent(&root_directory, root, target)?;
 

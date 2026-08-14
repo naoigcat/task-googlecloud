@@ -1,4 +1,5 @@
 use std::path::{Path, PathBuf};
+use std::sync::Mutex;
 use std::time::Duration;
 
 use percent_encoding::{AsciiSet, CONTROLS, utf8_percent_encode};
@@ -8,6 +9,7 @@ use serde::Deserialize;
 use serde::de::DeserializeOwned;
 use url::form_urlencoded::Serializer;
 
+use crate::atomic_rename::DirectoryIdentity;
 use crate::cloud::Cloud;
 use crate::error::AppError;
 use crate::upload_source;
@@ -93,6 +95,12 @@ struct BucketLock {
 
 pub trait StorageClient {
     fn list_objects(&self, bucket: &str) -> Result<Vec<String>, AppError>;
+    fn set_upload_root_identity(
+        &self,
+        _identity: Option<DirectoryIdentity>,
+    ) -> Result<(), AppError> {
+        Ok(())
+    }
     fn upload_file(&self, source: &Path, target: &ObjectPath) -> Result<String, AppError>;
     fn move_object(
         &self,
@@ -128,6 +136,7 @@ pub struct StorageApi {
     api_base: String,
     upload_base: String,
     upload_root: Option<PathBuf>,
+    upload_root_identity: Mutex<Option<DirectoryIdentity>>,
 }
 
 impl StorageApi {
@@ -179,6 +188,7 @@ impl StorageApi {
             api_base: api_base.into(),
             upload_base: upload_base.into(),
             upload_root: None,
+            upload_root_identity: Mutex::new(None),
         }
     }
 
@@ -501,9 +511,23 @@ impl StorageClient for StorageApi {
         }
     }
 
+    fn set_upload_root_identity(
+        &self,
+        identity: Option<DirectoryIdentity>,
+    ) -> Result<(), AppError> {
+        *self.upload_root_identity.lock().map_err(|_| {
+            AppError::Message("Upload root identity lock is poisoned".to_string())
+        })? = identity;
+        Ok(())
+    }
+
     fn upload_file(&self, source: &Path, target: &ObjectPath) -> Result<String, AppError> {
         Self::reject_bucket_lock_object(target)?;
-        let file = upload_source::open(self.upload_root.as_deref(), source)?;
+        let expected_root = *self
+            .upload_root_identity
+            .lock()
+            .map_err(|_| AppError::Message("Upload root identity lock is poisoned".to_string()))?;
+        let file = upload_source::open(self.upload_root.as_deref(), source, expected_root)?;
         let size = file.metadata().map_err(AppError::UploadSource)?.len();
         self.with_bucket_locks(&[target.bucket.as_str()], || {
             let url = with_query(
@@ -1006,6 +1030,42 @@ mod tests {
         let error = storage
             .upload_file(&source_through_link, &target)
             .unwrap_err();
+
+        assert!(matches!(error, super::AppError::UploadSource(_)), "{error}");
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn refuses_upload_sources_after_upload_root_is_replaced() {
+        use crate::atomic_rename::directory_identity_from_metadata;
+
+        let parent = tempfile::tempdir().unwrap();
+        let root = parent.path().join("uploads");
+        std::fs::create_dir(&root).unwrap();
+        let expected_root =
+            directory_identity_from_metadata(&std::fs::symlink_metadata(&root).unwrap());
+        let replacement = parent.path().join("replacement");
+        std::fs::create_dir(&replacement).unwrap();
+        std::fs::remove_dir(&root).unwrap();
+        std::fs::rename(&replacement, &root).unwrap();
+
+        let source = root.join("bucket/file.txt");
+        std::fs::create_dir(source.parent().unwrap()).unwrap();
+        std::fs::write(&source, "replacement").unwrap();
+        let target = ObjectPath::parse("gs://bucket/target").unwrap();
+        let mut storage = StorageApi::with_endpoint_options(
+            Cloud::new(),
+            "http://127.0.0.1:1/storage/v1",
+            "http://127.0.0.1:1/storage/v1",
+            Some("token".to_string()),
+            Duration::from_millis(10),
+        );
+        storage.upload_root = Some(root);
+        storage
+            .set_upload_root_identity(Some(expected_root))
+            .unwrap();
+
+        let error = storage.upload_file(&source, &target).unwrap_err();
 
         assert!(matches!(error, super::AppError::UploadSource(_)), "{error}");
     }

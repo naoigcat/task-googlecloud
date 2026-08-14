@@ -3,6 +3,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use crate::InterruptFlag;
+use crate::atomic_rename::{DirectoryIdentity, directory_identity_from_metadata};
 use crate::cloud::Cloud;
 use crate::error::AppError;
 use crate::local;
@@ -17,7 +18,10 @@ pub fn run<S: StorageClient>(
     interrupt: &InterruptFlag,
     project: &str,
 ) -> Result<(), AppError> {
-    let files_by_directory = upload_files_by_directory(Path::new(UPLOAD_ROOT))?;
+    let discovery = discover_uploads(Path::new(UPLOAD_ROOT))?;
+    let files_by_directory = discovery.files_by_directory;
+    let expected_root = discovery.root_identity;
+    storage.set_upload_root_identity(expected_root)?;
     let files = files_by_directory
         .values()
         .flatten()
@@ -39,14 +43,20 @@ pub fn run<S: StorageClient>(
     cloud.login()?;
     cloud.set_project(project)?;
 
-    let normalized_files = local::apply_normalization(Path::new(UPLOAD_ROOT), &plan, interrupt)?;
+    let normalized_files = local::apply_normalization_with_identity(
+        Path::new(UPLOAD_ROOT),
+        &plan,
+        expected_root,
+        interrupt,
+    )?;
 
     let result = upload_planned_files(storage, interrupt, &uploads);
     match result {
         Ok(()) => Ok(()),
         Err(error) => {
-            let errors = local::rollback_normalization(
+            let errors = local::rollback_normalization_with_identity(
                 Path::new(UPLOAD_ROOT),
+                expected_root,
                 &normalized_files
                     .iter()
                     .map(|(source, target)| (source.clone(), target.clone()))
@@ -57,15 +67,33 @@ pub fn run<S: StorageClient>(
     }
 }
 
+struct UploadDiscovery {
+    files_by_directory: BTreeMap<PathBuf, Vec<PathBuf>>,
+    // Keep discovery tied to the same directory for every later filesystem access.
+    root_identity: Option<DirectoryIdentity>,
+}
+
 pub fn upload_files_by_directory(root: &Path) -> Result<BTreeMap<PathBuf, Vec<PathBuf>>, AppError> {
+    Ok(discover_uploads(root)?.files_by_directory)
+}
+
+fn discover_uploads(root: &Path) -> Result<UploadDiscovery, AppError> {
     let mut directories = BTreeMap::new();
     let root_metadata = match fs::symlink_metadata(root) {
         Ok(metadata) => metadata,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(directories),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(UploadDiscovery {
+                files_by_directory: directories,
+                root_identity: None,
+            });
+        }
         Err(error) => return Err(error.into()),
     };
     if root_metadata.file_type().is_symlink() {
-        return Ok(directories);
+        return Ok(UploadDiscovery {
+            files_by_directory: directories,
+            root_identity: None,
+        });
     }
     if !root_metadata.file_type().is_dir() {
         return Err(std::io::Error::new(
@@ -74,6 +102,7 @@ pub fn upload_files_by_directory(root: &Path) -> Result<BTreeMap<PathBuf, Vec<Pa
         )
         .into());
     }
+    let root_identity = directory_identity_from_metadata(&root_metadata);
     for directory in fs::read_dir(root)? {
         let directory = directory?.path();
         if !is_real_directory(&directory) {
@@ -91,7 +120,18 @@ pub fn upload_files_by_directory(root: &Path) -> Result<BTreeMap<PathBuf, Vec<Pa
         files.sort();
         directories.insert(directory, files);
     }
-    Ok(directories)
+    let current_metadata = fs::symlink_metadata(root)?;
+    if !current_metadata.file_type().is_dir()
+        || directory_identity_from_metadata(&current_metadata) != root_identity
+    {
+        return Err(AppError::Message(format!(
+            "Upload root changed during discovery: {root:?}"
+        )));
+    }
+    Ok(UploadDiscovery {
+        files_by_directory: directories,
+        root_identity: Some(root_identity),
+    })
 }
 
 fn is_real_directory(path: &Path) -> bool {

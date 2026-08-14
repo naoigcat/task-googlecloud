@@ -10,6 +10,7 @@ mod transaction;
 mod upload;
 mod upload_source;
 
+pub use atomic_rename::DirectoryIdentity;
 pub use cloud::{Cloud, shell_quote};
 pub use error::AppError;
 pub use local::{apply_normalization, path_string, rollback_normalization};
