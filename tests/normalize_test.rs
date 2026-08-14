@@ -22,7 +22,12 @@ impl StorageClient for FakeStorage {
         Ok("1".to_string())
     }
 
-    fn move_object(&self, source: &ObjectPath, target: &ObjectPath) -> Result<String, AppError> {
+    fn move_object(
+        &self,
+        source: &ObjectPath,
+        target: &ObjectPath,
+        _expected_source_generation: Option<&str>,
+    ) -> Result<String, AppError> {
         let mut moves = self.moves.borrow_mut();
         moves.push((source.uri(), target.uri()));
         if self.fail_on_move == Some(moves.len()) {
@@ -72,6 +77,81 @@ impl StorageClient for FakeStorage {
     }
 }
 
+struct ReplacingStorage {
+    move_generations: std::cell::RefCell<Vec<Option<String>>>,
+    rollbacks: std::cell::RefCell<Vec<String>>,
+}
+
+impl StorageClient for ReplacingStorage {
+    fn list_objects(&self, _bucket: &str) -> Result<Vec<String>, AppError> {
+        Ok(Vec::new())
+    }
+
+    fn upload_file(&self, _source: &Path, _target: &ObjectPath) -> Result<String, AppError> {
+        Ok("upload".to_string())
+    }
+
+    fn move_object(
+        &self,
+        _source: &ObjectPath,
+        _target: &ObjectPath,
+        expected_source_generation: Option<&str>,
+    ) -> Result<String, AppError> {
+        let call = self.move_generations.borrow().len();
+        self.move_generations
+            .borrow_mut()
+            .push(expected_source_generation.map(str::to_string));
+
+        match call {
+            0 => {
+                // A different writer replaces the temporary object before finalization.
+                Ok("staged".to_string())
+            }
+            1 if expected_source_generation.is_none() => Ok("finalized".to_string()),
+            1 => Err(AppError::Storage {
+                status: 412,
+                message: "staged object generation changed".to_string(),
+            }),
+            _ => unreachable!("the test should only perform staging and finalization"),
+        }
+    }
+
+    fn rollback_object(
+        &self,
+        _source: &ObjectPath,
+        _target: &ObjectPath,
+        _target_generation: &str,
+    ) -> Result<String, AppError> {
+        self.rollbacks.borrow_mut().push("staged move".to_string());
+        Ok("rollback".to_string())
+    }
+
+    fn cleanup_object(
+        &self,
+        _target: &ObjectPath,
+        _target_generation: &str,
+    ) -> Result<(), AppError> {
+        Ok(())
+    }
+
+    fn confirm_move_after_failure(
+        &self,
+        _source: &ObjectPath,
+        _target: &ObjectPath,
+        _operation: &AppError,
+    ) -> Result<(), AppError> {
+        Ok(())
+    }
+
+    fn confirm_write_after_failure(
+        &self,
+        _target: &ObjectPath,
+        _operation: &AppError,
+    ) -> Result<(), AppError> {
+        Ok(())
+    }
+}
+
 #[test]
 fn rolls_back_staged_moves_when_finalization_fails() {
     let storage = FakeStorage {
@@ -90,6 +170,27 @@ fn rolls_back_staged_moves_when_finalization_fails() {
     assert!(result.is_err());
     assert_eq!(storage.rollbacks.borrow().len(), 1);
     assert_eq!(storage.rollbacks.borrow()[0].0, "gs://bucket/e\u{301}.txt");
+}
+
+#[test]
+fn rejects_a_staged_object_replaced_before_finalization() {
+    let storage = ReplacingStorage {
+        move_generations: std::cell::RefCell::new(Vec::new()),
+        rollbacks: std::cell::RefCell::new(Vec::new()),
+    };
+    let interrupt = InterruptFlag::from_atomic(Arc::new(AtomicBool::new(false)));
+    let source = ObjectPath::parse("gs://bucket/source").unwrap();
+    let target = ObjectPath::parse("gs://bucket/target").unwrap();
+    let temporary = ObjectPath::parse("gs://bucket/source.task-googlecloud-token").unwrap();
+
+    let result = process_moves(&storage, &interrupt, vec![(source, target, temporary)]);
+
+    assert!(matches!(result, Err(AppError::Storage { status: 412, .. })));
+    assert_eq!(
+        *storage.move_generations.borrow(),
+        vec![None, Some("staged".to_string())]
+    );
+    assert_eq!(storage.rollbacks.borrow().len(), 1);
 }
 
 #[test]

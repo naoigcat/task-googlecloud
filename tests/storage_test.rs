@@ -348,7 +348,7 @@ fn moves_objects_and_confirms_source_deletion() {
     let source = ObjectPath::parse("gs://bucket/source").unwrap();
     let target = ObjectPath::parse("gs://bucket/target").unwrap();
 
-    let generation = storage.move_object(&source, &target).unwrap();
+    let generation = storage.move_object(&source, &target, None).unwrap();
     server.join().unwrap();
 
     assert_eq!(generation, "22");
@@ -373,6 +373,64 @@ fn moves_objects_and_confirms_source_deletion() {
 }
 
 #[test]
+fn moves_objects_using_the_expected_source_generation() {
+    let (base, requests, server) = test_server(vec![
+        (
+            200,
+            r#"{"done":true,"resource":{"generation":"22"}}"#.to_string(),
+        ),
+        (200, "{}".to_string()),
+        (404, "{}".to_string()),
+    ]);
+    let storage = storage(&base);
+    let source = ObjectPath::parse("gs://bucket/source").unwrap();
+    let target = ObjectPath::parse("gs://bucket/target").unwrap();
+
+    let generation = storage.move_object(&source, &target, Some("11")).unwrap();
+    server.join().unwrap();
+
+    assert_eq!(generation, "22");
+    let requests = requests.lock().unwrap();
+    assert_eq!(requests.len(), 3);
+    assert_eq!(
+        request_line(&requests[0]),
+        "POST /storage/v1/b/bucket/o/source/rewriteTo/b/bucket/o/target?sourceGeneration=11&ifSourceGenerationMatch=11&ifGenerationMatch=0 HTTP/1.1"
+    );
+    assert_eq!(
+        request_line(&requests[1]),
+        "DELETE /storage/v1/b/bucket/o/source?generation=11 HTTP/1.1"
+    );
+    assert_eq!(
+        request_line(&requests[2]),
+        "GET /storage/v1/b/bucket/o/source HTTP/1.1"
+    );
+}
+
+#[test]
+fn rejects_a_move_when_the_expected_source_generation_is_stale() {
+    let (base, requests, server) = test_server(vec![(
+        412,
+        r#"{"error":{"message":"generation condition not met"}}"#.to_string(),
+    )]);
+    let storage = storage(&base);
+    let source = ObjectPath::parse("gs://bucket/source").unwrap();
+    let target = ObjectPath::parse("gs://bucket/target").unwrap();
+
+    let error = storage
+        .move_object(&source, &target, Some("11"))
+        .unwrap_err();
+    server.join().unwrap();
+
+    assert!(matches!(error, AppError::Storage { status: 412, .. }));
+    let requests = requests.lock().unwrap();
+    assert_eq!(requests.len(), 1);
+    assert_eq!(
+        request_line(&requests[0]),
+        "POST /storage/v1/b/bucket/o/source/rewriteTo/b/bucket/o/target?sourceGeneration=11&ifSourceGenerationMatch=11&ifGenerationMatch=0 HTTP/1.1"
+    );
+}
+
+#[test]
 fn rejects_a_move_when_the_source_remains_after_delete() {
     let (base, requests, server) = test_server(vec![
         (200, r#"{"generation":"11"}"#.to_string()),
@@ -386,7 +444,9 @@ fn rejects_a_move_when_the_source_remains_after_delete() {
     let source = ObjectPath::parse("gs://bucket/source").unwrap();
     let target = ObjectPath::parse("gs://bucket/target").unwrap();
 
-    let error = storage(&base).move_object(&source, &target).unwrap_err();
+    let error = storage(&base)
+        .move_object(&source, &target, None)
+        .unwrap_err();
     server.join().unwrap();
 
     assert!(error.to_string().contains("Source object remains"));

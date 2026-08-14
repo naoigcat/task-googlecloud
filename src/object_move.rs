@@ -7,9 +7,10 @@ pub fn execute<S: StorageClient>(
     interrupt: &InterruptFlag,
     source: &ObjectPath,
     target: &ObjectPath,
+    expected_source_generation: Option<&str>,
 ) -> Result<String, AppError> {
     interrupt.check()?;
-    match storage.move_object(source, target) {
+    match storage.move_object(source, target, expected_source_generation) {
         Ok(generation) => Ok(generation),
         Err(error) => match storage.confirm_move_after_failure(source, target, &error) {
             Ok(()) => Err(error),

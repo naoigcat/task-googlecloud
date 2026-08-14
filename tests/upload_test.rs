@@ -24,7 +24,12 @@ impl StorageClient for FakeStorage {
         Ok("101".to_string())
     }
 
-    fn move_object(&self, _source: &ObjectPath, target: &ObjectPath) -> Result<String, AppError> {
+    fn move_object(
+        &self,
+        _source: &ObjectPath,
+        target: &ObjectPath,
+        _expected_source_generation: Option<&str>,
+    ) -> Result<String, AppError> {
         let mut moves = self.moves.borrow_mut();
         moves.push(target.uri());
         if self.fail_on_move == Some(moves.len()) {

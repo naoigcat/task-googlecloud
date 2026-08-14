@@ -84,7 +84,12 @@ pub enum ObjectState {
 pub trait StorageClient {
     fn list_objects(&self, bucket: &str) -> Result<Vec<String>, AppError>;
     fn upload_file(&self, source: &Path, target: &ObjectPath) -> Result<String, AppError>;
-    fn move_object(&self, source: &ObjectPath, target: &ObjectPath) -> Result<String, AppError>;
+    fn move_object(
+        &self,
+        source: &ObjectPath,
+        target: &ObjectPath,
+        expected_source_generation: Option<&str>,
+    ) -> Result<String, AppError>;
     fn rollback_object(
         &self,
         source: &ObjectPath,
@@ -347,8 +352,16 @@ impl StorageClient for StorageApi {
         Ok(metadata.generation)
     }
 
-    fn move_object(&self, source: &ObjectPath, target: &ObjectPath) -> Result<String, AppError> {
-        let source_generation = self.object_metadata(source, None)?.generation;
+    fn move_object(
+        &self,
+        source: &ObjectPath,
+        target: &ObjectPath,
+        expected_source_generation: Option<&str>,
+    ) -> Result<String, AppError> {
+        let source_generation = match expected_source_generation {
+            Some(generation) => generation.to_string(),
+            None => self.object_metadata(source, None)?.generation,
+        };
         let target_generation =
             self.copy_object(source, target, Some(&source_generation), Some("0"))?;
         self.delete_object(source, &source_generation)?;

@@ -42,7 +42,7 @@ pub fn process_moves<S: StorageClient>(
 
     let operation = (|| {
         for (source, _target, temporary) in &moves {
-            let generation = object_move::execute(storage, interrupt, source, temporary)?;
+            let generation = object_move::execute(storage, interrupt, source, temporary, None)?;
             staged.push(RemoteChange {
                 source: source.clone(),
                 target: temporary.clone(),
@@ -51,10 +51,16 @@ pub fn process_moves<S: StorageClient>(
             interrupt.check()?;
         }
 
-        for (source, target, temporary) in &moves {
-            let generation = object_move::execute(storage, interrupt, temporary, target)?;
+        for (change, (_, target, _)) in staged.iter().zip(&moves) {
+            let generation = object_move::execute(
+                storage,
+                interrupt,
+                &change.target,
+                target,
+                Some(&change.generation),
+            )?;
             finalized.push(RemoteChange {
-                source: source.clone(),
+                source: change.source.clone(),
                 target: target.clone(),
                 generation,
             });

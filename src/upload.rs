@@ -178,8 +178,13 @@ fn upload_planned_files<S: StorageClient>(
         }
 
         for change in &staged {
-            let generation =
-                object_move::execute(storage, interrupt, &change.source, &change.target)?;
+            let generation = object_move::execute(
+                storage,
+                interrupt,
+                &change.source,
+                &change.target,
+                Some(&change.generation),
+            )?;
             finalized.push(RemoteChange {
                 source: change.source.clone(),
                 target: change.target.clone(),
@@ -249,11 +254,17 @@ pub fn rollback_remote<S: StorageClient>(
 
 #[cfg(test)]
 mod tests {
+    use std::cell::RefCell;
     use std::collections::{BTreeMap, HashMap};
-    use std::path::PathBuf;
+    use std::path::{Path, PathBuf};
+    use std::sync::{Arc, atomic::AtomicBool};
 
-    use super::{MAX_OBJECT_NAME_BYTES, plan_uploads, staging_path};
+    use super::{
+        MAX_OBJECT_NAME_BYTES, PlannedUpload, plan_uploads, staging_path, upload_planned_files,
+    };
+    use crate::InterruptFlag;
     use crate::error::AppError;
+    use crate::storage::{ObjectPath, StorageClient};
 
     const STAGING_PREFIX: &str = ".task-googlecloud-staging/0123456789abcdef0123456789abcdef";
 
@@ -263,6 +274,91 @@ mod tests {
             object.push('a');
         }
         object
+    }
+
+    struct FakeStorage {
+        move_generations: RefCell<Vec<Option<String>>>,
+    }
+
+    impl StorageClient for FakeStorage {
+        fn list_objects(&self, _bucket: &str) -> Result<Vec<String>, AppError> {
+            Ok(Vec::new())
+        }
+
+        fn upload_file(&self, _source: &Path, _target: &ObjectPath) -> Result<String, AppError> {
+            Ok("101".to_string())
+        }
+
+        fn move_object(
+            &self,
+            _source: &ObjectPath,
+            _target: &ObjectPath,
+            expected_source_generation: Option<&str>,
+        ) -> Result<String, AppError> {
+            self.move_generations
+                .borrow_mut()
+                .push(expected_source_generation.map(str::to_string));
+            Ok("202".to_string())
+        }
+
+        fn rollback_object(
+            &self,
+            _source: &ObjectPath,
+            _target: &ObjectPath,
+            _target_generation: &str,
+        ) -> Result<String, AppError> {
+            Ok("rollback".to_string())
+        }
+
+        fn cleanup_object(
+            &self,
+            _target: &ObjectPath,
+            _target_generation: &str,
+        ) -> Result<(), AppError> {
+            Ok(())
+        }
+
+        fn confirm_move_after_failure(
+            &self,
+            _source: &ObjectPath,
+            _target: &ObjectPath,
+            _operation: &AppError,
+        ) -> Result<(), AppError> {
+            Ok(())
+        }
+
+        fn confirm_write_after_failure(
+            &self,
+            _target: &ObjectPath,
+            _operation: &AppError,
+        ) -> Result<(), AppError> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn finalizes_uploaded_objects_using_their_uploaded_generation() {
+        let storage = FakeStorage {
+            move_generations: RefCell::new(Vec::new()),
+        };
+        let interrupt = InterruptFlag::from_atomic(Arc::new(AtomicBool::new(false)));
+        let staging = ObjectPath::parse("gs://bucket/.task-googlecloud-staging/file").unwrap();
+        let target = ObjectPath::parse("gs://bucket/file").unwrap();
+        let uploads = vec![(
+            PathBuf::from("uploads/bucket"),
+            vec![PlannedUpload {
+                file: PathBuf::from("uploads/bucket/file"),
+                staging,
+                target,
+            }],
+        )];
+
+        upload_planned_files(&storage, &interrupt, &uploads).unwrap();
+
+        assert_eq!(
+            *storage.move_generations.borrow(),
+            vec![Some("101".to_string())]
+        );
     }
 
     #[test]
