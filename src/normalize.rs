@@ -3,9 +3,8 @@ use crate::cloud::Cloud;
 use crate::error::AppError;
 use crate::normalization_plan;
 use crate::object_move;
-use crate::storage::{ObjectPath, StorageClient};
+use crate::storage::{MAX_OBJECT_NAME_BYTES, ObjectPath, StorageClient};
 
-const MAX_OBJECT_NAME_BYTES: usize = 1024;
 const TEMPORARY_SUFFIX_PREFIX: &str = ".task-googlecloud-";
 
 #[derive(Clone, Debug)]

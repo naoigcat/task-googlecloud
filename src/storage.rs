@@ -22,6 +22,9 @@ use url::form_urlencoded::Serializer;
 use crate::cloud::Cloud;
 use crate::error::AppError;
 
+/// Cloud Storage rejects object names longer than this, so reject them before
+/// any request is sent and the transaction is half applied.
+pub(crate) const MAX_OBJECT_NAME_BYTES: usize = 1024;
 const API_BASE: &str = "https://storage.googleapis.com/storage/v1";
 const UPLOAD_BASE: &str = "https://storage.googleapis.com/upload/storage/v1";
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);

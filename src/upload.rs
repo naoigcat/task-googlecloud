@@ -8,7 +8,7 @@ use crate::error::AppError;
 use crate::local;
 use crate::normalization_plan;
 use crate::object_move;
-use crate::storage::{ObjectPath, StorageClient};
+use crate::storage::{MAX_OBJECT_NAME_BYTES, ObjectPath, StorageClient};
 
 #[derive(Clone, Debug)]
 pub struct RemoteChange {
@@ -137,8 +137,7 @@ fn upload_normalized_files<S: StorageClient>(
                     .ok_or_else(|| {
                         AppError::Message(format!("File is not valid UTF-8: {normalized_file:?}"))
                     })?;
-                let staging =
-                    ObjectPath::parse(&format!("gs://{bucket}/{staging_prefix}/{object_name}"))?;
+                let staging = staging_path(bucket, &staging_prefix, object_name)?;
                 let final_path = ObjectPath::parse(&format!("gs://{bucket}/{object_name}"))?;
                 let generation =
                     object_move::execute_upload(storage, interrupt, normalized_file, &staging)?;
@@ -173,6 +172,22 @@ fn upload_normalized_files<S: StorageClient>(
     }
 }
 
+/// The staging prefix lengthens the object name, so a name that Cloud Storage
+/// accepts on its own can still overflow the limit once staged.
+fn staging_path(
+    bucket: &str,
+    staging_prefix: &str,
+    object_name: &str,
+) -> Result<ObjectPath, AppError> {
+    let staging_name = format!("{staging_prefix}/{object_name}");
+    if staging_name.len() > MAX_OBJECT_NAME_BYTES {
+        return Err(AppError::Message(format!(
+            "Object name is too long for temporary staging: gs://{bucket}/{object_name}"
+        )));
+    }
+    ObjectPath::parse(&format!("gs://{bucket}/{staging_name}"))
+}
+
 pub fn rollback_remote<S: StorageClient>(
     storage: &S,
     staged: &[RemoteChange],
@@ -203,4 +218,40 @@ pub fn rollback_remote<S: StorageClient>(
         }
     }
     errors
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{MAX_OBJECT_NAME_BYTES, staging_path};
+    use crate::error::AppError;
+
+    const STAGING_PREFIX: &str = ".task-googlecloud-staging/0123456789abcdef0123456789abcdef";
+
+    fn object_name_with_bytes(length: usize) -> String {
+        let mut object = "é".repeat(length / 2);
+        if object.len() < length {
+            object.push('a');
+        }
+        object
+    }
+
+    #[test]
+    fn rejects_object_names_that_would_overflow_the_staging_prefix() {
+        let object_name = object_name_with_bytes(MAX_OBJECT_NAME_BYTES - STAGING_PREFIX.len());
+
+        let error = staging_path("bucket", STAGING_PREFIX, &object_name).unwrap_err();
+
+        assert!(
+            matches!(error, AppError::Message(message) if message.contains("temporary staging"))
+        );
+    }
+
+    #[test]
+    fn accepts_object_names_at_the_staging_limit() {
+        let object_name = object_name_with_bytes(MAX_OBJECT_NAME_BYTES - STAGING_PREFIX.len() - 1);
+
+        let staging = staging_path("bucket", STAGING_PREFIX, &object_name).unwrap();
+
+        assert_eq!(staging.object.len(), MAX_OBJECT_NAME_BYTES);
+    }
 }
