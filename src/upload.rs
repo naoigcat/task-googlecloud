@@ -9,13 +9,7 @@ use crate::local;
 use crate::normalization_plan;
 use crate::object_move;
 use crate::storage::{MAX_OBJECT_NAME_BYTES, ObjectPath, StorageClient, UPLOAD_ROOT};
-
-#[derive(Clone, Debug)]
-pub struct RemoteChange {
-    pub source: ObjectPath,
-    pub target: ObjectPath,
-    pub generation: String,
-}
+use crate::transaction::RemoteChange;
 
 pub fn run<S: StorageClient>(
     cloud: &Cloud,

@@ -4,15 +4,9 @@ use crate::error::AppError;
 use crate::normalization_plan;
 use crate::object_move;
 use crate::storage::{MAX_OBJECT_NAME_BYTES, ObjectPath, StorageClient};
+use crate::transaction::{RemoteChange, rollback_moves};
 
 const TEMPORARY_SUFFIX_PREFIX: &str = ".task-googlecloud-";
-
-#[derive(Clone, Debug)]
-struct RemoteMove {
-    source: ObjectPath,
-    target: ObjectPath,
-    generation: String,
-}
 
 pub fn run<S: StorageClient>(
     cloud: &Cloud,
@@ -49,7 +43,7 @@ pub fn process_moves<S: StorageClient>(
     let operation = (|| {
         for (source, _target, temporary) in &moves {
             let generation = object_move::execute(storage, interrupt, source, temporary)?;
-            staged.push(RemoteMove {
+            staged.push(RemoteChange {
                 source: source.clone(),
                 target: temporary.clone(),
                 generation,
@@ -59,7 +53,7 @@ pub fn process_moves<S: StorageClient>(
 
         for (source, target, temporary) in &moves {
             let generation = object_move::execute(storage, interrupt, temporary, target)?;
-            finalized.push(RemoteMove {
+            finalized.push(RemoteChange {
                 source: source.clone(),
                 target: target.clone(),
                 generation,
@@ -73,44 +67,9 @@ pub fn process_moves<S: StorageClient>(
         Ok(()) => Ok(()),
         Err(error) => Err(AppError::rollback(
             error,
-            rollback(storage, &staged, &finalized),
+            rollback_moves(storage, &staged, &finalized),
         )),
     }
-}
-
-fn rollback<S: StorageClient>(
-    storage: &S,
-    staged: &[RemoteMove],
-    finalized: &[RemoteMove],
-) -> Vec<AppError> {
-    let mut errors = Vec::new();
-    for move_record in finalized.iter().rev() {
-        if let Err(error) = storage.rollback_object(
-            &move_record.source,
-            &move_record.target,
-            &move_record.generation,
-        ) {
-            errors.push(error);
-        }
-    }
-
-    let finalized_sources = finalized
-        .iter()
-        .map(|record| &record.source)
-        .collect::<Vec<_>>();
-    for move_record in staged.iter().rev() {
-        if finalized_sources.contains(&&move_record.source) {
-            continue;
-        }
-        if let Err(error) = storage.rollback_object(
-            &move_record.source,
-            &move_record.target,
-            &move_record.generation,
-        ) {
-            errors.push(error);
-        }
-    }
-    errors
 }
 
 fn temporary_path(source: &ObjectPath) -> Result<ObjectPath, AppError> {

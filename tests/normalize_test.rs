@@ -93,6 +93,100 @@ fn rolls_back_staged_moves_when_finalization_fails() {
 }
 
 #[test]
+fn rolls_back_finalized_moves_before_unfinalized_staged_moves() {
+    let storage = FakeStorage {
+        moves: std::cell::RefCell::new(Vec::new()),
+        rollbacks: std::cell::RefCell::new(Vec::new()),
+        fail_on_move: Some(6),
+        interrupt_after_move: None,
+    };
+    let interrupt = InterruptFlag::from_atomic(Arc::new(AtomicBool::new(false)));
+    let first_source = ObjectPath::parse("gs://bucket/first-source").unwrap();
+    let first_target = ObjectPath::parse("gs://bucket/first-target").unwrap();
+    let first_temporary = ObjectPath::parse("gs://bucket/first-temporary").unwrap();
+    let second_source = ObjectPath::parse("gs://bucket/second-source").unwrap();
+    let second_target = ObjectPath::parse("gs://bucket/second-target").unwrap();
+    let second_temporary = ObjectPath::parse("gs://bucket/second-temporary").unwrap();
+    let third_source = ObjectPath::parse("gs://bucket/third-source").unwrap();
+    let third_target = ObjectPath::parse("gs://bucket/third-target").unwrap();
+    let third_temporary = ObjectPath::parse("gs://bucket/third-temporary").unwrap();
+
+    let result = process_moves(
+        &storage,
+        &interrupt,
+        vec![
+            (first_source, first_target, first_temporary),
+            (second_source, second_target, second_temporary),
+            (third_source, third_target, third_temporary),
+        ],
+    );
+
+    assert!(result.is_err());
+    assert_eq!(
+        *storage.rollbacks.borrow(),
+        vec![
+            (
+                "gs://bucket/second-source".to_string(),
+                "gs://bucket/second-target".to_string(),
+            ),
+            (
+                "gs://bucket/first-source".to_string(),
+                "gs://bucket/first-target".to_string(),
+            ),
+            (
+                "gs://bucket/third-source".to_string(),
+                "gs://bucket/third-temporary".to_string(),
+            ),
+        ]
+    );
+}
+
+#[test]
+fn rolls_back_staged_moves_in_reverse_order_when_staging_fails() {
+    let storage = FakeStorage {
+        moves: std::cell::RefCell::new(Vec::new()),
+        rollbacks: std::cell::RefCell::new(Vec::new()),
+        fail_on_move: Some(3),
+        interrupt_after_move: None,
+    };
+    let interrupt = InterruptFlag::from_atomic(Arc::new(AtomicBool::new(false)));
+    let first_source = ObjectPath::parse("gs://bucket/first-source").unwrap();
+    let first_target = ObjectPath::parse("gs://bucket/first-target").unwrap();
+    let first_temporary = ObjectPath::parse("gs://bucket/first-temporary").unwrap();
+    let second_source = ObjectPath::parse("gs://bucket/second-source").unwrap();
+    let second_target = ObjectPath::parse("gs://bucket/second-target").unwrap();
+    let second_temporary = ObjectPath::parse("gs://bucket/second-temporary").unwrap();
+    let third_source = ObjectPath::parse("gs://bucket/third-source").unwrap();
+    let third_target = ObjectPath::parse("gs://bucket/third-target").unwrap();
+    let third_temporary = ObjectPath::parse("gs://bucket/third-temporary").unwrap();
+
+    let result = process_moves(
+        &storage,
+        &interrupt,
+        vec![
+            (first_source, first_target, first_temporary),
+            (second_source, second_target, second_temporary),
+            (third_source, third_target, third_temporary),
+        ],
+    );
+
+    assert!(result.is_err());
+    assert_eq!(
+        *storage.rollbacks.borrow(),
+        vec![
+            (
+                "gs://bucket/second-source".to_string(),
+                "gs://bucket/second-temporary".to_string(),
+            ),
+            (
+                "gs://bucket/first-source".to_string(),
+                "gs://bucket/first-temporary".to_string(),
+            ),
+        ]
+    );
+}
+
+#[test]
 fn records_a_remote_side_effect_before_handling_an_interrupt() {
     let interrupted = Arc::new(AtomicBool::new(false));
     let storage = FakeStorage {

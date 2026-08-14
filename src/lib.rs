@@ -6,6 +6,7 @@ mod normalization_plan;
 mod normalize;
 mod object_move;
 mod storage;
+mod transaction;
 mod upload;
 mod upload_source;
 
@@ -16,7 +17,8 @@ pub use normalization_plan::{Entry, build as build_normalization_plan, normalize
 pub use normalize::process_moves;
 pub use storage::StorageApi;
 pub use storage::{ObjectPath, StorageClient};
-pub use upload::{RemoteChange, rollback_remote, upload_files_by_directory};
+pub use transaction::RemoteChange;
+pub use upload::{rollback_remote, upload_files_by_directory};
 
 use std::sync::{
     Arc,
