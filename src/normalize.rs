@@ -5,6 +5,9 @@ use crate::normalization_plan;
 use crate::object_move;
 use crate::storage::{ObjectPath, StorageClient};
 
+const MAX_OBJECT_NAME_BYTES: usize = 1024;
+const TEMPORARY_SUFFIX_PREFIX: &str = ".task-googlecloud-";
+
 #[derive(Clone, Debug)]
 struct RemoteMove {
     source: ObjectPath,
@@ -27,11 +30,10 @@ pub fn run<S: StorageClient>(
         .into_iter()
         .filter(|entry| entry.source != entry.target)
         .map(|entry| {
-            Ok((
-                ObjectPath::parse(&entry.source)?,
-                ObjectPath::parse(&entry.target)?,
-                temporary_path(&entry.source),
-            ))
+            let source = ObjectPath::parse(&entry.source)?;
+            let target = ObjectPath::parse(&entry.target)?;
+            let temporary = temporary_path(&source)?;
+            Ok((source, target, temporary))
         })
         .collect::<Result<Vec<_>, AppError>>()?;
     process_moves(storage, interrupt, moves)
@@ -112,10 +114,64 @@ fn rollback<S: StorageClient>(
     errors
 }
 
-fn temporary_path(source: &str) -> ObjectPath {
-    ObjectPath::parse(&format!(
-        "{source}.task-googlecloud-{}",
-        uuid::Uuid::new_v4().simple()
-    ))
-    .expect("source is already a valid Cloud Storage URI")
+fn temporary_path(source: &ObjectPath) -> Result<ObjectPath, AppError> {
+    let suffix = temporary_suffix();
+    if source.object.len() + suffix.len() > MAX_OBJECT_NAME_BYTES {
+        return Err(AppError::Message(format!(
+            "Object name is too long for temporary staging: {}",
+            source.uri()
+        )));
+    }
+
+    Ok(ObjectPath {
+        bucket: source.bucket.clone(),
+        object: format!("{}{}", source.object, suffix),
+    })
+}
+
+fn temporary_suffix() -> String {
+    format!("{TEMPORARY_SUFFIX_PREFIX}{}", uuid::Uuid::new_v4().simple())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{MAX_OBJECT_NAME_BYTES, temporary_path, temporary_suffix};
+    use crate::error::AppError;
+    use crate::storage::ObjectPath;
+
+    fn object_name_with_bytes(length: usize) -> String {
+        let mut object = "é".repeat(length / 2);
+        if object.len() < length {
+            object.push('a');
+        }
+        object
+    }
+
+    #[test]
+    fn rejects_object_names_that_would_overflow_temporary_staging() {
+        let suffix_len = temporary_suffix().len();
+        let source = ObjectPath {
+            bucket: "bucket".to_string(),
+            object: object_name_with_bytes(MAX_OBJECT_NAME_BYTES - suffix_len + 1),
+        };
+
+        let error = temporary_path(&source).unwrap_err();
+
+        assert!(
+            matches!(error, AppError::Message(message) if message.contains("temporary staging"))
+        );
+    }
+
+    #[test]
+    fn accepts_object_names_at_the_temporary_staging_limit() {
+        let suffix_len = temporary_suffix().len();
+        let source = ObjectPath {
+            bucket: "bucket".to_string(),
+            object: object_name_with_bytes(MAX_OBJECT_NAME_BYTES - suffix_len),
+        };
+
+        let temporary = temporary_path(&source).unwrap();
+
+        assert_eq!(temporary.object.len(), MAX_OBJECT_NAME_BYTES);
+    }
 }
