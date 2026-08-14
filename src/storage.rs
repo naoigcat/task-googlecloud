@@ -313,6 +313,31 @@ impl StorageApi {
         );
         self.send_body(self.client.delete(url)).map(|_| ())
     }
+
+    fn confirm_object_generation(
+        &self,
+        object: &ObjectPath,
+        expected_generation: &str,
+        operation: &str,
+    ) -> Result<(), AppError> {
+        let details = self.object_details(object);
+        if matches!(
+            &details,
+            Ok((ObjectState::Present, Some(generation)))
+                if generation == expected_generation
+        ) {
+            return Ok(());
+        }
+
+        Err(AppError::Recovery {
+            paths: format!("{:?}", object.uri()),
+            operation: operation.to_string(),
+            details: format!(
+                "Expected generation {expected_generation}; {}",
+                state_details(object, details)
+            ),
+        })
+    }
 }
 
 impl StorageClient for StorageApi {
@@ -374,13 +399,14 @@ impl StorageClient for StorageApi {
         };
         let target_generation =
             self.copy_object(source, target, Some(&source_generation), Some("0"))?;
+        self.confirm_object_generation(target, &target_generation, "move object")?;
         self.delete_object(source, &source_generation)
             .map_err(AppError::mark_reached_storage)?;
-        if self
+        let source_state = self
             .object_state(source, None)
-            .map_err(AppError::mark_reached_storage)?
-            != ObjectState::Missing
-        {
+            .map_err(AppError::mark_reached_storage)?;
+        self.confirm_object_generation(target, &target_generation, "move object")?;
+        if source_state != ObjectState::Missing {
             return Err(AppError::Message(format!(
                 "Source object remains after moving {}",
                 source.uri()
@@ -406,13 +432,14 @@ impl StorageClient for StorageApi {
         }
         let source_generation =
             self.copy_object(target, source, Some(target_generation), Some("0"))?;
+        self.confirm_object_generation(source, &source_generation, "rollback object")?;
         self.delete_object(target, target_generation)
             .map_err(AppError::mark_reached_storage)?;
-        if self
+        let target_state = self
             .object_state(target, None)
-            .map_err(AppError::mark_reached_storage)?
-            != ObjectState::Missing
-        {
+            .map_err(AppError::mark_reached_storage)?;
+        self.confirm_object_generation(source, &source_generation, "rollback object")?;
+        if target_state != ObjectState::Missing {
             return Err(AppError::Message(format!(
                 "Rollback target remains: {}",
                 target.uri()

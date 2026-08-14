@@ -8,8 +8,22 @@ use task_googlecloud::{AppError, Cloud, ObjectPath, StorageApi, StorageClient};
 use tempfile::{NamedTempFile, tempdir};
 
 const SERVER_TIMEOUT: Duration = Duration::from_secs(5);
+const EARLY_CLOSE_TIMEOUT: Duration = Duration::from_millis(100);
 
 fn test_server(responses: Vec<(u16, String)>) -> (String, Arc<Mutex<Vec<String>>>, JoinHandle<()>) {
+    response_server(responses, SERVER_TIMEOUT)
+}
+
+fn test_server_allowing_early_close(
+    responses: Vec<(u16, String)>,
+) -> (String, Arc<Mutex<Vec<String>>>, JoinHandle<()>) {
+    response_server(responses, EARLY_CLOSE_TIMEOUT)
+}
+
+fn response_server(
+    responses: Vec<(u16, String)>,
+    accept_timeout: Duration,
+) -> (String, Arc<Mutex<Vec<String>>>, JoinHandle<()>) {
     let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
     listener.set_nonblocking(true).unwrap();
     let address = format!("http://{}/storage/v1", listener.local_addr().unwrap());
@@ -17,7 +31,9 @@ fn test_server(responses: Vec<(u16, String)>) -> (String, Arc<Mutex<Vec<String>>
     let recorded_requests = Arc::clone(&requests);
     let handle = thread::spawn(move || {
         for (status, body) in responses {
-            let mut stream = accept_connection(&listener);
+            let Some(mut stream) = accept_connection(&listener, accept_timeout) else {
+                break;
+            };
             let request = read_request(&mut stream);
             recorded_requests.lock().unwrap().push(request);
             let reason = match status {
@@ -43,7 +59,7 @@ fn incomplete_response_server() -> (String, Arc<Mutex<Vec<String>>>, JoinHandle<
     let requests = Arc::new(Mutex::new(Vec::new()));
     let recorded_requests = Arc::clone(&requests);
     let handle = thread::spawn(move || {
-        let mut stream = accept_connection(&listener);
+        let mut stream = accept_connection(&listener, SERVER_TIMEOUT).unwrap();
         recorded_requests
             .lock()
             .unwrap()
@@ -57,20 +73,21 @@ fn incomplete_response_server() -> (String, Arc<Mutex<Vec<String>>>, JoinHandle<
     (address, requests, handle)
 }
 
-fn accept_connection(listener: &TcpListener) -> TcpStream {
-    let deadline = Instant::now() + SERVER_TIMEOUT;
+fn accept_connection(listener: &TcpListener, timeout: Duration) -> Option<TcpStream> {
+    let deadline = Instant::now() + timeout;
     loop {
         match listener.accept() {
             Ok((stream, _)) => {
                 stream.set_read_timeout(Some(SERVER_TIMEOUT)).unwrap();
                 stream.set_write_timeout(Some(SERVER_TIMEOUT)).unwrap();
-                return stream;
+                return Some(stream);
             }
             Err(error)
                 if error.kind() == std::io::ErrorKind::WouldBlock && Instant::now() < deadline =>
             {
                 thread::sleep(Duration::from_millis(10));
             }
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => return None,
             Err(error) => panic!("failed to accept test request: {error}"),
         }
     }
@@ -393,8 +410,10 @@ fn moves_objects_and_confirms_source_deletion() {
             200,
             r#"{"done":true,"resource":{"generation":"22"}}"#.to_string(),
         ),
+        (200, r#"{"generation":"22"}"#.to_string()),
         (200, "{}".to_string()),
         (404, "{}".to_string()),
+        (200, r#"{"generation":"22"}"#.to_string()),
     ]);
     let storage = storage(&base);
     let source = ObjectPath::parse("gs://bucket/source").unwrap();
@@ -405,7 +424,7 @@ fn moves_objects_and_confirms_source_deletion() {
 
     assert_eq!(generation, "22");
     let requests = requests.lock().unwrap();
-    assert_eq!(requests.len(), 4);
+    assert_eq!(requests.len(), 6);
     assert_eq!(
         request_line(&requests[0]),
         "GET /storage/v1/b/bucket/o/source HTTP/1.1"
@@ -416,11 +435,19 @@ fn moves_objects_and_confirms_source_deletion() {
     );
     assert_eq!(
         request_line(&requests[2]),
-        "DELETE /storage/v1/b/bucket/o/source?generation=11 HTTP/1.1"
+        "GET /storage/v1/b/bucket/o/target HTTP/1.1"
     );
     assert_eq!(
         request_line(&requests[3]),
+        "DELETE /storage/v1/b/bucket/o/source?generation=11 HTTP/1.1"
+    );
+    assert_eq!(
+        request_line(&requests[4]),
         "GET /storage/v1/b/bucket/o/source HTTP/1.1"
+    );
+    assert_eq!(
+        request_line(&requests[5]),
+        "GET /storage/v1/b/bucket/o/target HTTP/1.1"
     );
 }
 
@@ -431,8 +458,10 @@ fn moves_objects_using_the_expected_source_generation() {
             200,
             r#"{"done":true,"resource":{"generation":"22"}}"#.to_string(),
         ),
+        (200, r#"{"generation":"22"}"#.to_string()),
         (200, "{}".to_string()),
         (404, "{}".to_string()),
+        (200, r#"{"generation":"22"}"#.to_string()),
     ]);
     let storage = storage(&base);
     let source = ObjectPath::parse("gs://bucket/source").unwrap();
@@ -443,18 +472,84 @@ fn moves_objects_using_the_expected_source_generation() {
 
     assert_eq!(generation, "22");
     let requests = requests.lock().unwrap();
-    assert_eq!(requests.len(), 3);
+    assert_eq!(requests.len(), 5);
     assert_eq!(
         request_line(&requests[0]),
         "POST /storage/v1/b/bucket/o/source/rewriteTo/b/bucket/o/target?sourceGeneration=11&ifSourceGenerationMatch=11&ifGenerationMatch=0 HTTP/1.1"
     );
     assert_eq!(
         request_line(&requests[1]),
-        "DELETE /storage/v1/b/bucket/o/source?generation=11 HTTP/1.1"
+        "GET /storage/v1/b/bucket/o/target HTTP/1.1"
     );
     assert_eq!(
         request_line(&requests[2]),
+        "DELETE /storage/v1/b/bucket/o/source?generation=11 HTTP/1.1"
+    );
+    assert_eq!(
+        request_line(&requests[3]),
         "GET /storage/v1/b/bucket/o/source HTTP/1.1"
+    );
+    assert_eq!(
+        request_line(&requests[4]),
+        "GET /storage/v1/b/bucket/o/target HTTP/1.1"
+    );
+}
+
+#[test]
+fn rejects_a_move_when_the_target_generation_changes_after_copy() {
+    let (base, requests, server) = test_server_allowing_early_close(vec![
+        (200, r#"{"generation":"11"}"#.to_string()),
+        (
+            200,
+            r#"{"done":true,"resource":{"generation":"22"}}"#.to_string(),
+        ),
+        (200, r#"{"generation":"23"}"#.to_string()),
+        (404, "{}".to_string()),
+    ]);
+    let source = ObjectPath::parse("gs://bucket/source").unwrap();
+    let target = ObjectPath::parse("gs://bucket/target").unwrap();
+
+    let error = storage(&base)
+        .move_object(&source, &target, None)
+        .unwrap_err();
+    server.join().unwrap();
+
+    assert!(matches!(error, AppError::Recovery { .. }));
+    let requests = requests.lock().unwrap();
+    assert_eq!(requests.len(), 3);
+    assert_eq!(
+        request_line(&requests[2]),
+        "GET /storage/v1/b/bucket/o/target HTTP/1.1"
+    );
+}
+
+#[test]
+fn rejects_a_move_when_the_target_generation_changes_after_source_deletion() {
+    let (base, requests, server) = test_server_allowing_early_close(vec![
+        (200, r#"{"generation":"11"}"#.to_string()),
+        (
+            200,
+            r#"{"done":true,"resource":{"generation":"22"}}"#.to_string(),
+        ),
+        (200, r#"{"generation":"22"}"#.to_string()),
+        (200, "{}".to_string()),
+        (404, "{}".to_string()),
+        (200, r#"{"generation":"23"}"#.to_string()),
+    ]);
+    let source = ObjectPath::parse("gs://bucket/source").unwrap();
+    let target = ObjectPath::parse("gs://bucket/target").unwrap();
+
+    let error = storage(&base)
+        .move_object(&source, &target, None)
+        .unwrap_err();
+    server.join().unwrap();
+
+    assert!(matches!(error, AppError::Recovery { .. }));
+    let requests = requests.lock().unwrap();
+    assert_eq!(requests.len(), 6);
+    assert_eq!(
+        request_line(&requests[5]),
+        "GET /storage/v1/b/bucket/o/target HTTP/1.1"
     );
 }
 
@@ -490,8 +585,10 @@ fn rejects_a_move_when_the_source_remains_after_delete() {
             200,
             r#"{"done":true,"resource":{"generation":"22"}}"#.to_string(),
         ),
+        (200, r#"{"generation":"22"}"#.to_string()),
         (200, "{}".to_string()),
         (200, r#"{"generation":"11"}"#.to_string()),
+        (200, r#"{"generation":"22"}"#.to_string()),
     ]);
     let source = ObjectPath::parse("gs://bucket/source").unwrap();
     let target = ObjectPath::parse("gs://bucket/target").unwrap();
@@ -503,7 +600,7 @@ fn rejects_a_move_when_the_source_remains_after_delete() {
 
     assert!(error.to_string().contains("Source object remains"));
     let requests = requests.lock().unwrap();
-    assert_eq!(requests.len(), 4);
+    assert_eq!(requests.len(), 6);
     assert_eq!(
         request_line(&requests[0]),
         "GET /storage/v1/b/bucket/o/source HTTP/1.1"
@@ -514,11 +611,19 @@ fn rejects_a_move_when_the_source_remains_after_delete() {
     );
     assert_eq!(
         request_line(&requests[2]),
-        "DELETE /storage/v1/b/bucket/o/source?generation=11 HTTP/1.1"
+        "GET /storage/v1/b/bucket/o/target HTTP/1.1"
     );
     assert_eq!(
         request_line(&requests[3]),
+        "DELETE /storage/v1/b/bucket/o/source?generation=11 HTTP/1.1"
+    );
+    assert_eq!(
+        request_line(&requests[4]),
         "GET /storage/v1/b/bucket/o/source HTTP/1.1"
+    );
+    assert_eq!(
+        request_line(&requests[5]),
+        "GET /storage/v1/b/bucket/o/target HTTP/1.1"
     );
 }
 
@@ -531,8 +636,10 @@ fn rolls_back_objects_and_confirms_target_deletion() {
             200,
             r#"{"done":true,"resource":{"generation":"33"}}"#.to_string(),
         ),
+        (200, r#"{"generation":"33"}"#.to_string()),
         (200, "{}".to_string()),
         (404, "{}".to_string()),
+        (200, r#"{"generation":"33"}"#.to_string()),
     ]);
     let storage = storage(&base);
     let source = ObjectPath::parse("gs://bucket/source").unwrap();
@@ -543,7 +650,7 @@ fn rolls_back_objects_and_confirms_target_deletion() {
 
     assert_eq!(generation, "33");
     let requests = requests.lock().unwrap();
-    assert_eq!(requests.len(), 5);
+    assert_eq!(requests.len(), 7);
     assert_eq!(
         request_line(&requests[0]),
         "GET /storage/v1/b/bucket/o/source HTTP/1.1"
@@ -558,11 +665,79 @@ fn rolls_back_objects_and_confirms_target_deletion() {
     );
     assert_eq!(
         request_line(&requests[3]),
-        "DELETE /storage/v1/b/bucket/o/target?generation=22 HTTP/1.1"
+        "GET /storage/v1/b/bucket/o/source HTTP/1.1"
     );
     assert_eq!(
         request_line(&requests[4]),
+        "DELETE /storage/v1/b/bucket/o/target?generation=22 HTTP/1.1"
+    );
+    assert_eq!(
+        request_line(&requests[5]),
         "GET /storage/v1/b/bucket/o/target HTTP/1.1"
+    );
+    assert_eq!(
+        request_line(&requests[6]),
+        "GET /storage/v1/b/bucket/o/source HTTP/1.1"
+    );
+}
+
+#[test]
+fn rejects_a_rollback_when_the_source_generation_changes_after_copy() {
+    let (base, requests, server) = test_server_allowing_early_close(vec![
+        (404, "{}".to_string()),
+        (200, r#"{"generation":"22"}"#.to_string()),
+        (
+            200,
+            r#"{"done":true,"resource":{"generation":"33"}}"#.to_string(),
+        ),
+        (200, r#"{"generation":"34"}"#.to_string()),
+        (404, "{}".to_string()),
+    ]);
+    let source = ObjectPath::parse("gs://bucket/source").unwrap();
+    let target = ObjectPath::parse("gs://bucket/target").unwrap();
+
+    let error = storage(&base)
+        .rollback_object(&source, &target, "22")
+        .unwrap_err();
+    server.join().unwrap();
+
+    assert!(matches!(error, AppError::Recovery { .. }));
+    let requests = requests.lock().unwrap();
+    assert_eq!(requests.len(), 4);
+    assert_eq!(
+        request_line(&requests[3]),
+        "GET /storage/v1/b/bucket/o/source HTTP/1.1"
+    );
+}
+
+#[test]
+fn rejects_a_rollback_when_the_source_generation_changes_after_target_deletion() {
+    let (base, requests, server) = test_server_allowing_early_close(vec![
+        (404, "{}".to_string()),
+        (200, r#"{"generation":"22"}"#.to_string()),
+        (
+            200,
+            r#"{"done":true,"resource":{"generation":"33"}}"#.to_string(),
+        ),
+        (200, r#"{"generation":"33"}"#.to_string()),
+        (200, "{}".to_string()),
+        (404, "{}".to_string()),
+        (200, r#"{"generation":"34"}"#.to_string()),
+    ]);
+    let source = ObjectPath::parse("gs://bucket/source").unwrap();
+    let target = ObjectPath::parse("gs://bucket/target").unwrap();
+
+    let error = storage(&base)
+        .rollback_object(&source, &target, "22")
+        .unwrap_err();
+    server.join().unwrap();
+
+    assert!(matches!(error, AppError::Recovery { .. }));
+    let requests = requests.lock().unwrap();
+    assert_eq!(requests.len(), 7);
+    assert_eq!(
+        request_line(&requests[6]),
+        "GET /storage/v1/b/bucket/o/source HTTP/1.1"
     );
 }
 
@@ -575,8 +750,10 @@ fn rejects_a_rollback_when_the_target_remains_after_delete() {
             200,
             r#"{"done":true,"resource":{"generation":"33"}}"#.to_string(),
         ),
+        (200, r#"{"generation":"33"}"#.to_string()),
         (200, "{}".to_string()),
         (200, r#"{"generation":"22"}"#.to_string()),
+        (200, r#"{"generation":"33"}"#.to_string()),
     ]);
     let source = ObjectPath::parse("gs://bucket/source").unwrap();
     let target = ObjectPath::parse("gs://bucket/target").unwrap();
@@ -588,7 +765,7 @@ fn rejects_a_rollback_when_the_target_remains_after_delete() {
 
     assert!(error.to_string().contains("Rollback target remains"));
     let requests = requests.lock().unwrap();
-    assert_eq!(requests.len(), 5);
+    assert_eq!(requests.len(), 7);
     assert_eq!(
         request_line(&requests[0]),
         "GET /storage/v1/b/bucket/o/source HTTP/1.1"
@@ -603,11 +780,19 @@ fn rejects_a_rollback_when_the_target_remains_after_delete() {
     );
     assert_eq!(
         request_line(&requests[3]),
-        "DELETE /storage/v1/b/bucket/o/target?generation=22 HTTP/1.1"
+        "GET /storage/v1/b/bucket/o/source HTTP/1.1"
     );
     assert_eq!(
         request_line(&requests[4]),
+        "DELETE /storage/v1/b/bucket/o/target?generation=22 HTTP/1.1"
+    );
+    assert_eq!(
+        request_line(&requests[5]),
         "GET /storage/v1/b/bucket/o/target HTTP/1.1"
+    );
+    assert_eq!(
+        request_line(&requests[6]),
+        "GET /storage/v1/b/bucket/o/source HTTP/1.1"
     );
 }
 
