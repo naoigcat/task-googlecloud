@@ -25,6 +25,7 @@ use crate::error::AppError;
 const API_BASE: &str = "https://storage.googleapis.com/storage/v1";
 const UPLOAD_BASE: &str = "https://storage.googleapis.com/upload/storage/v1";
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+const UPLOAD_TIMEOUT: Duration = Duration::from_secs(60 * 60);
 const PATH_SEGMENT: &AsciiSet = &CONTROLS
     .add(b' ')
     .add(b'"')
@@ -141,10 +142,28 @@ impl StorageApi {
         token: Option<String>,
         request_timeout: Duration,
     ) -> Self {
+        Self::with_endpoint_options_and_upload_timeout(
+            cloud,
+            api_base,
+            upload_base,
+            token,
+            request_timeout,
+            UPLOAD_TIMEOUT,
+        )
+    }
+
+    fn with_endpoint_options_and_upload_timeout(
+        cloud: Cloud,
+        api_base: impl Into<String>,
+        upload_base: impl Into<String>,
+        token: Option<String>,
+        request_timeout: Duration,
+        upload_timeout: Duration,
+    ) -> Self {
         Self {
             cloud,
             client: Self::build_client(Some(request_timeout)),
-            upload_client: Self::build_client(None),
+            upload_client: Self::build_client(Some(upload_timeout)),
             token_override: token,
             api_base: api_base.into(),
             upload_base: upload_base.into(),
@@ -688,6 +707,7 @@ where
 mod tests {
     use std::io::{Read, Write};
     use std::net::TcpListener;
+    use std::sync::mpsc;
     use std::thread;
 
     use tempfile::NamedTempFile;
@@ -695,7 +715,7 @@ mod tests {
     use super::{Cloud, Duration, ObjectPath, StorageApi, StorageClient};
 
     #[test]
-    fn uploads_files_without_a_total_request_timeout() {
+    fn uploads_files_with_a_longer_timeout_than_api_requests() {
         let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
         let base = format!("http://{}/storage/v1", listener.local_addr().unwrap());
         let server = thread::spawn(move || {
@@ -727,6 +747,54 @@ mod tests {
 
         assert_eq!(storage.upload_file(source.path(), &target).unwrap(), "456");
         server.join().unwrap();
+    }
+
+    #[test]
+    fn times_out_uploads_that_stop_responding() {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let base = format!("http://{}/storage/v1", listener.local_addr().unwrap());
+        let (headers_sent, headers_received) = mpsc::channel();
+        let (release_sender, release_receiver) = mpsc::channel();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = Vec::new();
+            let mut buffer = [0_u8; 1];
+            while !request.ends_with(b"\r\n\r\n") {
+                stream.read_exact(&mut buffer).unwrap();
+                request.push(buffer[0]);
+            }
+            headers_sent.send(()).unwrap();
+            release_receiver.recv().unwrap();
+        });
+        let source = NamedTempFile::new().unwrap();
+        std::fs::write(source.path(), b"contents").unwrap();
+        let target = ObjectPath::parse("gs://bucket/target").unwrap();
+        let storage = StorageApi::with_endpoint_options_and_upload_timeout(
+            Cloud::new(),
+            base.clone(),
+            base,
+            Some("token".to_string()),
+            Duration::from_secs(30),
+            Duration::from_millis(10),
+        );
+        let (result_sender, result_receiver) = mpsc::channel();
+        let upload = thread::spawn(move || {
+            result_sender
+                .send(storage.upload_file(source.path(), &target))
+                .unwrap();
+        });
+
+        headers_received
+            .recv_timeout(Duration::from_secs(1))
+            .unwrap();
+        let result = result_receiver.recv_timeout(Duration::from_secs(1));
+        release_sender.send(()).unwrap();
+        upload.join().unwrap();
+        server.join().unwrap();
+
+        let error = result.unwrap().unwrap_err();
+
+        assert!(matches!(error, super::AppError::Http(_)));
     }
 
     #[cfg(unix)]
