@@ -12,10 +12,15 @@ pub fn execute<S: StorageClient>(
     interrupt.check()?;
     match storage.move_object(source, target, expected_source_generation) {
         Ok(generation) => Ok(generation),
-        Err(error) => match storage.confirm_move_after_failure(source, target, &error) {
-            Ok(()) => Err(error),
-            Err(recovery) => Err(recovery),
-        },
+        Err(error) => {
+            if matches!(error, AppError::Interrupted) {
+                interrupt.clear_for_rollback();
+            }
+            match storage.confirm_move_after_failure(source, target, &error) {
+                Ok(()) => Err(error),
+                Err(recovery) => Err(recovery),
+            }
+        }
     }
 }
 
@@ -28,9 +33,14 @@ pub fn execute_upload<S: StorageClient>(
     interrupt.check()?;
     match storage.upload_file(source, target) {
         Ok(generation) => Ok(generation),
-        Err(error) => match storage.confirm_write_after_failure(target, &error) {
-            Ok(()) => Err(error),
-            Err(recovery) => Err(recovery),
-        },
+        Err(error) => {
+            if matches!(error, AppError::Interrupted) {
+                interrupt.clear_for_rollback();
+            }
+            match storage.confirm_write_after_failure(target, &error) {
+                Ok(()) => Err(error),
+                Err(recovery) => Err(recovery),
+            }
+        }
     }
 }

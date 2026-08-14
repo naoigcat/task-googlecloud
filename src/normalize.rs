@@ -71,10 +71,13 @@ pub fn process_moves<S: StorageClient>(
 
     match operation {
         Ok(()) => Ok(()),
-        Err(error) => Err(AppError::rollback(
-            error,
-            rollback_moves(storage, &staged, &finalized),
-        )),
+        Err(error) => {
+            interrupt.clear_for_rollback();
+            Err(AppError::rollback(
+                error,
+                rollback_moves(storage, &staged, &finalized),
+            ))
+        }
     }
 }
 

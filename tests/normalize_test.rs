@@ -296,7 +296,7 @@ fn records_a_remote_side_effect_before_handling_an_interrupt() {
         fail_on_move: None,
         interrupt_after_move: Some(Arc::clone(&interrupted)),
     };
-    let interrupt = InterruptFlag::from_atomic(interrupted);
+    let interrupt = InterruptFlag::from_atomic(Arc::clone(&interrupted));
     let source = ObjectPath::parse("gs://bucket/source.txt").unwrap();
     let target = ObjectPath::parse("gs://bucket/target.txt").unwrap();
     let temporary = ObjectPath::parse("gs://bucket/source.txt.task-googlecloud-token").unwrap();
@@ -305,4 +305,5 @@ fn records_a_remote_side_effect_before_handling_an_interrupt() {
 
     assert!(matches!(result, Err(AppError::Interrupted)));
     assert_eq!(storage.rollbacks.borrow().len(), 1);
+    assert!(!interrupted.load(Ordering::Relaxed));
 }

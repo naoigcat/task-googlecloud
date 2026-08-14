@@ -197,10 +197,13 @@ fn upload_planned_files<S: StorageClient>(
 
     match operation {
         Ok(()) => Ok(()),
-        Err(error) => Err(AppError::rollback(
-            error,
-            rollback_remote(storage, &staged, &finalized),
-        )),
+        Err(error) => {
+            interrupt.clear_for_rollback();
+            Err(AppError::rollback(
+                error,
+                rollback_remote(storage, &staged, &finalized),
+            ))
+        }
     }
 }
 

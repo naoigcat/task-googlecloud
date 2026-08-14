@@ -27,6 +27,7 @@ use std::sync::{
 
 use signal_hook::consts::{SIGINT, SIGTERM};
 
+#[derive(Clone, Debug)]
 pub struct InterruptFlag {
     interrupted: Arc<AtomicBool>,
 }
@@ -44,8 +45,17 @@ impl InterruptFlag {
         Self { interrupted }
     }
 
+    pub(crate) fn is_interrupted(&self) -> bool {
+        self.interrupted.load(Ordering::Relaxed)
+    }
+
+    pub(crate) fn clear_for_rollback(&self) {
+        // The signal aborts the in-flight command, but rollback must still be able to reach Cloud Storage.
+        self.interrupted.store(false, Ordering::Relaxed);
+    }
+
     pub(crate) fn check(&self) -> Result<(), AppError> {
-        if self.interrupted.load(Ordering::Relaxed) {
+        if self.is_interrupted() {
             return Err(AppError::Interrupted);
         }
         Ok(())

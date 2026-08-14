@@ -28,6 +28,8 @@ fn ssh_options_require_key_authentication_and_host_verification() {
     let args = Cloud::new().ssh_arguments("gcloud auth login");
     assert!(args.contains(&"StrictHostKeyChecking=yes".to_string()));
     assert!(args.contains(&"UserKnownHostsFile=/run/googlecloud-ssh/known_hosts".to_string()));
+    assert!(args.contains(&"ServerAliveInterval=5".to_string()));
+    assert!(args.contains(&"ServerAliveCountMax=3".to_string()));
     assert!(args.contains(&"cloud@googlecloud".to_string()));
     assert!(!args.contains(&"root@googlecloud".to_string()));
 }

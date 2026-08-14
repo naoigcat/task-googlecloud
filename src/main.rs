@@ -20,7 +20,7 @@ fn main() {
     let cli = Cli::parse();
     let result = (|| -> Result<(), AppError> {
         let interrupt = InterruptFlag::install()?;
-        let cloud = Cloud::new();
+        let cloud = Cloud::with_interrupt(interrupt.clone());
         let storage = StorageApi::new(cloud.clone());
         let command = match cli.command {
             Command::Normalize { project, bucket } => TaskCommand::Normalize { project, bucket },
