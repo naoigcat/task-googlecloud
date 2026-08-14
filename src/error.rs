@@ -10,6 +10,11 @@ pub enum AppError {
     #[error("I/O failed: {0}")]
     Io(#[from] io::Error),
 
+    /// Raised while reading a local upload source, before any request leaves the
+    /// process, so Cloud Storage cannot have been changed by the attempt.
+    #[error("Cannot read the upload source: {0}")]
+    UploadSource(io::Error),
+
     #[error("HTTP request failed: {0}")]
     Http(#[from] reqwest::Error),
 

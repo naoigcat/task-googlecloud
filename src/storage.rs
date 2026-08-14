@@ -212,9 +212,9 @@ impl StorageApi {
     #[cfg(unix)]
     fn open_upload_file(&self, source: &Path) -> Result<File, AppError> {
         if let Some(root) = &self.upload_root {
-            let relative = source.strip_prefix(root).map_err(|_| {
-                AppError::Message(format!("Upload source is outside {root:?}: {source:?}"))
-            })?;
+            let relative = source
+                .strip_prefix(root)
+                .map_err(|_| rejected_source(format!("outside {root:?}: {source:?}")))?;
             open_relative_without_following_links(root, relative)
         } else {
             open_without_upload_root(source)
@@ -223,15 +223,11 @@ impl StorageApi {
 
     #[cfg(not(unix))]
     fn open_upload_file(&self, source: &Path) -> Result<File, AppError> {
-        let metadata = fs::symlink_metadata(source)?;
+        let metadata = fs::symlink_metadata(source).map_err(AppError::UploadSource)?;
         if !metadata.file_type().is_file() {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                format!("Upload source is not a regular file: {source:?}"),
-            )
-            .into());
+            return Err(rejected_source(format!("not a regular file: {source:?}")));
         }
-        File::open(source).map_err(AppError::from)
+        File::open(source).map_err(AppError::UploadSource)
     }
 
     fn object_metadata(
@@ -363,7 +359,7 @@ impl StorageClient for StorageApi {
 
     fn upload_file(&self, source: &Path, target: &ObjectPath) -> Result<String, AppError> {
         let file = self.open_upload_file(source)?;
-        let size = file.metadata()?.len();
+        let size = file.metadata().map_err(AppError::UploadSource)?.len();
         let url = with_query(
             format!("{}/b/{}/o", self.upload_base, encode(&target.bucket)),
             [
@@ -470,6 +466,12 @@ impl StorageClient for StorageApi {
         target: &ObjectPath,
         operation: &AppError,
     ) -> Result<(), AppError> {
+        // Nothing was sent, so the target cannot exist and asking would only
+        // turn a local failure into a spurious manual recovery.
+        if matches!(operation, AppError::UploadSource(_)) {
+            return Ok(());
+        }
+
         let details = self.object_details(target);
         if matches!(details, Ok((ObjectState::Missing, _)))
             && !matches!(operation, AppError::Http(_) | AppError::Storage { .. })
@@ -567,21 +569,26 @@ fn open_relative_without_following_links(root: &Path, source: &Path) -> Result<F
     open_path_components(directory, source)
 }
 
+/// Every local rejection is an `UploadSource` failure, so callers can tell it
+/// apart from a failure that may already have reached Cloud Storage.
+fn rejected_source(message: String) -> AppError {
+    AppError::UploadSource(std::io::Error::new(
+        std::io::ErrorKind::InvalidInput,
+        message,
+    ))
+}
+
 #[cfg(unix)]
 fn open_without_upload_root(source: &Path) -> Result<File, AppError> {
-    let metadata = fs::symlink_metadata(source)?;
+    let metadata = fs::symlink_metadata(source).map_err(AppError::UploadSource)?;
     if !metadata.file_type().is_file() {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidInput,
-            format!("Upload source is not a regular file: {source:?}"),
-        )
-        .into());
+        return Err(rejected_source(format!("not a regular file: {source:?}")));
     }
     fs::OpenOptions::new()
         .read(true)
         .custom_flags(libc::O_NOFOLLOW)
         .open(source)
-        .map_err(AppError::from)
+        .map_err(AppError::UploadSource)
 }
 
 #[cfg(unix)]
@@ -592,18 +599,12 @@ fn open_path_components(mut directory: File, source: &Path) -> Result<File, AppE
         match component {
             Component::CurDir => {}
             Component::RootDir => {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::InvalidInput,
-                    format!("Upload source is absolute: {source:?}"),
-                )
-                .into());
+                return Err(rejected_source(format!("absolute path: {source:?}")));
             }
             Component::ParentDir => {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::InvalidInput,
-                    format!("Upload source contains a parent path component: {source:?}"),
-                )
-                .into());
+                return Err(rejected_source(format!(
+                    "contains a parent path component: {source:?}"
+                )));
             }
             Component::Normal(name) if components.peek().is_some() => {
                 let fd = open_at(directory.as_raw_fd(), name, directory_flags())?;
@@ -612,30 +613,23 @@ fn open_path_components(mut directory: File, source: &Path) -> Result<File, AppE
             Component::Normal(name) => {
                 let fd = open_at(directory.as_raw_fd(), name, file_flags())?;
                 let file = unsafe { File::from_raw_fd(fd) };
-                if !file.metadata()?.file_type().is_file() {
-                    return Err(std::io::Error::new(
-                        std::io::ErrorKind::InvalidInput,
-                        format!("Upload source is not a regular file: {source:?}"),
-                    )
-                    .into());
+                if !file
+                    .metadata()
+                    .map_err(AppError::UploadSource)?
+                    .file_type()
+                    .is_file()
+                {
+                    return Err(rejected_source(format!("not a regular file: {source:?}")));
                 }
                 return Ok(file);
             }
             _ => {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::InvalidInput,
-                    format!("Upload source is not a regular file: {source:?}"),
-                )
-                .into());
+                return Err(rejected_source(format!("not a regular file: {source:?}")));
             }
         }
     }
 
-    Err(std::io::Error::new(
-        std::io::ErrorKind::InvalidInput,
-        format!("Upload source is not a regular file: {source:?}"),
-    )
-    .into())
+    Err(rejected_source(format!("not a regular file: {source:?}")))
 }
 
 #[cfg(unix)]
@@ -647,10 +641,10 @@ fn open_directory(path: &Path) -> Result<File, AppError> {
 #[cfg(unix)]
 fn open_at(directory: RawFd, name: &std::ffi::OsStr, flags: i32) -> Result<RawFd, AppError> {
     let name = CString::new(name.as_bytes())
-        .map_err(|_| AppError::Message(format!("Path contains NUL: {name:?}")))?;
+        .map_err(|_| rejected_source(format!("path contains NUL: {name:?}")))?;
     let fd = unsafe { libc::openat(directory, name.as_ptr(), flags) };
     if fd < 0 {
-        return Err(std::io::Error::last_os_error().into());
+        return Err(AppError::UploadSource(std::io::Error::last_os_error()));
     }
     Ok(fd)
 }
@@ -823,6 +817,6 @@ mod tests {
             .upload_file(&source_through_link, &target)
             .unwrap_err();
 
-        assert!(matches!(error, super::AppError::Io(_)), "{error}");
+        assert!(matches!(error, super::AppError::UploadSource(_)), "{error}");
     }
 }

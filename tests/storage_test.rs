@@ -267,7 +267,29 @@ fn refuses_symlinked_upload_sources() {
 
     let error = storage.upload_file(&linked_file, &target).unwrap_err();
 
-    assert!(matches!(error, AppError::Io(_)), "{error}");
+    assert!(matches!(error, AppError::UploadSource(_)), "{error}");
+}
+
+#[test]
+fn does_not_confirm_uploads_that_never_reached_storage() {
+    // A dead endpoint proves no request is attempted: any lookup would fail.
+    let storage = StorageApi::with_endpoints(
+        Cloud::new(),
+        "http://127.0.0.1:1/storage/v1",
+        "http://127.0.0.1:1/storage/v1",
+        Some("token".to_string()),
+    );
+    let target = ObjectPath::parse("gs://bucket/target").unwrap();
+
+    storage
+        .confirm_write_after_failure(
+            &target,
+            &AppError::UploadSource(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                "not a regular file",
+            )),
+        )
+        .unwrap();
 }
 
 #[test]
