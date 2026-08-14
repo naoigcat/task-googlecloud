@@ -39,13 +39,14 @@ pub fn run<S: StorageClient>(
     cloud.login()?;
     cloud.set_project(project)?;
 
-    let normalized_files = local::apply_normalization(&plan, interrupt)?;
+    let normalized_files = local::apply_normalization(Path::new(UPLOAD_ROOT), &plan, interrupt)?;
 
     let result = upload_planned_files(storage, interrupt, &uploads);
     match result {
         Ok(()) => Ok(()),
         Err(error) => {
             let errors = local::rollback_normalization(
+                Path::new(UPLOAD_ROOT),
                 &normalized_files
                     .iter()
                     .map(|(source, target)| (source.clone(), target.clone()))

@@ -19,7 +19,7 @@ fn renames_without_changing_contents() {
         source: source.to_str().unwrap().to_string(),
         target: target.to_str().unwrap().to_string(),
     }];
-    let normalized = apply_normalization(&entries, &no_interrupt()).unwrap();
+    let normalized = apply_normalization(directory.path(), &entries, &no_interrupt()).unwrap();
 
     assert_eq!(normalized.get(&source), Some(&target));
     assert_eq!(fs::read_to_string(target).unwrap(), "content");
@@ -38,13 +38,42 @@ fn does_not_overwrite_a_target_that_appears_after_planning() {
         source: source.to_str().unwrap().to_string(),
         target: target.to_str().unwrap().to_string(),
     }];
-    let error = apply_normalization(&entries, &no_interrupt()).unwrap_err();
+    let error = apply_normalization(directory.path(), &entries, &no_interrupt()).unwrap_err();
 
     assert!(
         error.to_string().contains("File exists") || error.to_string().contains("already exists")
     );
     assert_eq!(fs::read_to_string(source).unwrap(), "original");
     assert_eq!(fs::read_to_string(target).unwrap(), "competitor");
+}
+
+#[cfg(unix)]
+#[test]
+fn refuses_to_rename_through_a_replaced_root() {
+    use std::os::unix::fs::symlink;
+
+    let parent = tempdir().unwrap();
+    let root = parent.path().join("uploads");
+    let outside = tempdir().unwrap();
+    let outside_bucket = outside.path().join("bucket");
+    fs::create_dir(&root).unwrap();
+    fs::create_dir(&outside_bucket).unwrap();
+    let outside_source = outside_bucket.join("source.txt");
+    let outside_target = outside_bucket.join("target.txt");
+    fs::write(&outside_source, "outside").unwrap();
+
+    fs::remove_dir(&root).unwrap();
+    symlink(outside.path(), &root).unwrap();
+    let source = root.join("bucket/source.txt");
+    let target = root.join("bucket/target.txt");
+    let entries = vec![Entry {
+        source: source.to_str().unwrap().to_string(),
+        target: target.to_str().unwrap().to_string(),
+    }];
+
+    assert!(apply_normalization(&root, &entries, &no_interrupt()).is_err());
+    assert_eq!(fs::read_to_string(outside_source).unwrap(), "outside");
+    assert!(!outside_target.exists());
 }
 
 #[test]
@@ -55,11 +84,39 @@ fn rollback_does_not_overwrite_a_new_source() {
     fs::write(&source, "source").unwrap();
     fs::write(&target, "target").unwrap();
 
-    let errors = rollback_normalization(&[(source.clone(), target.clone())]);
+    let errors = rollback_normalization(directory.path(), &[(source.clone(), target.clone())]);
 
     assert_eq!(errors.len(), 1);
     assert_eq!(fs::read_to_string(source).unwrap(), "source");
     assert_eq!(fs::read_to_string(target).unwrap(), "target");
+}
+
+#[cfg(unix)]
+#[test]
+fn refuses_to_rollback_through_a_replaced_bucket() {
+    use std::os::unix::fs::symlink;
+
+    let parent = tempdir().unwrap();
+    let root = parent.path().join("uploads");
+    let bucket = root.join("bucket");
+    let outside = tempdir().unwrap();
+    fs::create_dir(&root).unwrap();
+    fs::write(outside.path().join("target.txt"), "outside").unwrap();
+
+    fs::create_dir(&bucket).unwrap();
+    fs::remove_dir(&bucket).unwrap();
+    symlink(outside.path(), &bucket).unwrap();
+    let source = bucket.join("source.txt");
+    let target = bucket.join("target.txt");
+
+    let errors = rollback_normalization(&root, &[(source.clone(), target.clone())]);
+
+    assert_eq!(errors.len(), 1);
+    assert_eq!(
+        fs::read_to_string(outside.path().join("target.txt")).unwrap(),
+        "outside"
+    );
+    assert!(!outside.path().join("source.txt").exists());
 }
 
 #[cfg(target_os = "macos")]
@@ -74,11 +131,11 @@ fn rollback_ignores_nfc_and_nfd_aliases() {
         source: source.to_str().unwrap().to_string(),
         target: target.to_str().unwrap().to_string(),
     }];
-    apply_normalization(&entries, &no_interrupt()).unwrap();
+    apply_normalization(directory.path(), &entries, &no_interrupt()).unwrap();
     assert_eq!(fs::read_to_string(&source).unwrap(), "content");
     assert_eq!(fs::read_to_string(&target).unwrap(), "content");
 
-    let errors = rollback_normalization(&[(source.clone(), target.clone())]);
+    let errors = rollback_normalization(directory.path(), &[(source.clone(), target.clone())]);
 
     assert!(errors.is_empty());
     assert_eq!(fs::read_to_string(&source).unwrap(), "content");
@@ -94,7 +151,7 @@ fn rollback_treats_dangling_symlinks_as_existing_entries() {
     fs::write(&source, "source").unwrap();
     std::os::unix::fs::symlink(directory.path().join("missing.txt"), &target).unwrap();
 
-    let errors = rollback_normalization(&[(source, target)]);
+    let errors = rollback_normalization(directory.path(), &[(source, target)]);
 
     assert_eq!(errors.len(), 1);
     assert!(

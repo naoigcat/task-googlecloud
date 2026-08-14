@@ -3,7 +3,7 @@ use std::io;
 use std::path::{Path, PathBuf};
 
 use crate::InterruptFlag;
-use crate::atomic_rename::{path_entry_exists, rename_without_overwrite, same_path_entry};
+use crate::atomic_rename::rename_without_overwrite;
 use crate::error::AppError;
 use crate::normalization_plan::Entry;
 
@@ -14,6 +14,7 @@ struct RenameRecord {
 }
 
 pub fn apply_normalization(
+    root: &Path,
     entries: &[Entry],
     interrupt: &InterruptFlag,
 ) -> Result<HashMap<PathBuf, PathBuf>, AppError> {
@@ -25,7 +26,7 @@ pub fn apply_normalization(
             if source == target {
                 continue;
             }
-            rename_without_overwrite(&source, &target)?;
+            rename_without_overwrite(root, &source, &target)?;
             renamed.push(RenameRecord { source, target });
             interrupt.check()?;
         }
@@ -33,7 +34,7 @@ pub fn apply_normalization(
     })();
 
     if let Err(error) = operation {
-        return Err(AppError::rollback(error, rollback(&renamed)));
+        return Err(AppError::rollback(error, rollback(root, &renamed)));
     }
 
     Ok(entries
@@ -42,7 +43,7 @@ pub fn apply_normalization(
         .collect())
 }
 
-pub fn rollback_normalization(entries: &[(PathBuf, PathBuf)]) -> Vec<AppError> {
+pub fn rollback_normalization(root: &Path, entries: &[(PathBuf, PathBuf)]) -> Vec<AppError> {
     let records = entries
         .iter()
         .map(|(source, target)| RenameRecord {
@@ -50,34 +51,29 @@ pub fn rollback_normalization(entries: &[(PathBuf, PathBuf)]) -> Vec<AppError> {
             target: target.clone(),
         })
         .collect::<Vec<_>>();
-    rollback(&records)
+    rollback(root, &records)
 }
 
-fn rollback(entries: &[RenameRecord]) -> Vec<AppError> {
+fn rollback(root: &Path, entries: &[RenameRecord]) -> Vec<AppError> {
     let mut errors = Vec::new();
     for entry in entries.iter().rev() {
         if entry.source == entry.target {
             continue;
         }
-        let source_exists = path_entry_exists(&entry.source);
-        let target_exists = path_entry_exists(&entry.target);
-        if source_exists && target_exists {
-            match same_path_entry(&entry.source, &entry.target) {
-                Ok(true) => continue,
-                Ok(false) => errors.push(
+        if let Err(error) = rename_without_overwrite(root, &entry.target, &entry.source) {
+            if matches!(&error, AppError::Io(error) if error.kind() == io::ErrorKind::AlreadyExists)
+            {
+                errors.push(
                     io::Error::new(io::ErrorKind::AlreadyExists, "source and target both exist")
                         .into(),
-                ),
-                Err(error) => errors.push(error),
+                );
+            } else if matches!(&error, AppError::Io(error) if error.kind() == io::ErrorKind::NotFound)
+            {
+                errors
+                    .push(io::Error::new(io::ErrorKind::NotFound, "target does not exist").into());
+            } else {
+                errors.push(error);
             }
-            continue;
-        }
-        if !target_exists {
-            errors.push(io::Error::new(io::ErrorKind::NotFound, "target does not exist").into());
-            continue;
-        }
-        if let Err(error) = rename_without_overwrite(&entry.target, &entry.source) {
-            errors.push(error);
         }
     }
     errors
