@@ -2,17 +2,22 @@ use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
+use std::time::{Duration, Instant};
 
-use task_googlecloud::{Cloud, ObjectPath, StorageApi, StorageClient};
+use task_googlecloud::{AppError, Cloud, ObjectPath, StorageApi, StorageClient};
+use tempfile::NamedTempFile;
+
+const SERVER_TIMEOUT: Duration = Duration::from_secs(5);
 
 fn test_server(responses: Vec<(u16, String)>) -> (String, Arc<Mutex<Vec<String>>>, JoinHandle<()>) {
     let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+    listener.set_nonblocking(true).unwrap();
     let address = format!("http://{}/storage/v1", listener.local_addr().unwrap());
     let requests = Arc::new(Mutex::new(Vec::new()));
     let recorded_requests = Arc::clone(&requests);
     let handle = thread::spawn(move || {
         for (status, body) in responses {
-            let (mut stream, _) = listener.accept().unwrap();
+            let mut stream = accept_connection(&listener);
             let request = read_request(&mut stream);
             recorded_requests.lock().unwrap().push(request);
             let reason = match status {
@@ -31,6 +36,46 @@ fn test_server(responses: Vec<(u16, String)>) -> (String, Arc<Mutex<Vec<String>>
     (address, requests, handle)
 }
 
+fn incomplete_response_server() -> (String, Arc<Mutex<Vec<String>>>, JoinHandle<()>) {
+    let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let address = format!("http://{}/storage/v1", listener.local_addr().unwrap());
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    let recorded_requests = Arc::clone(&requests);
+    let handle = thread::spawn(move || {
+        let mut stream = accept_connection(&listener);
+        recorded_requests
+            .lock()
+            .unwrap()
+            .push(read_request(&mut stream));
+        stream
+            .write_all(
+                b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 10\r\nConnection: close\r\n\r\n{}",
+            )
+            .unwrap();
+    });
+    (address, requests, handle)
+}
+
+fn accept_connection(listener: &TcpListener) -> TcpStream {
+    let deadline = Instant::now() + SERVER_TIMEOUT;
+    loop {
+        match listener.accept() {
+            Ok((stream, _)) => {
+                stream.set_read_timeout(Some(SERVER_TIMEOUT)).unwrap();
+                stream.set_write_timeout(Some(SERVER_TIMEOUT)).unwrap();
+                return stream;
+            }
+            Err(error)
+                if error.kind() == std::io::ErrorKind::WouldBlock && Instant::now() < deadline =>
+            {
+                thread::sleep(Duration::from_millis(10));
+            }
+            Err(error) => panic!("failed to accept test request: {error}"),
+        }
+    }
+}
+
 fn read_request(stream: &mut TcpStream) -> String {
     let mut request = Vec::new();
     let mut buffer = [0_u8; 1];
@@ -38,7 +83,22 @@ fn read_request(stream: &mut TcpStream) -> String {
         stream.read_exact(&mut buffer).unwrap();
         request.push(buffer[0]);
     }
+    let content_length = String::from_utf8_lossy(&request)
+        .lines()
+        .find_map(|line| {
+            let (name, value) = line.split_once(':')?;
+            name.eq_ignore_ascii_case("content-length")
+                .then(|| value.trim().parse::<usize>().unwrap())
+        })
+        .unwrap_or(0);
+    let mut body = vec![0; content_length];
+    stream.read_exact(&mut body).unwrap();
+    request.extend(body);
     String::from_utf8(request).unwrap()
+}
+
+fn request_line(request: &str) -> &str {
+    request.split_once("\r\n").map_or(request, |(line, _)| line)
 }
 
 fn storage(base: &str) -> StorageApi {
@@ -67,10 +127,11 @@ fn encodes_object_names_as_path_data() {
     server.join().unwrap();
 
     let requests = requests.lock().unwrap();
-    assert!(requests[0].contains(
-        "folder%2A%3F%5B%5D%23%2Fsource/rewriteTo/b/bucket/o/folder%2A%3F%5B%5D%23%2Ftarget"
-    ));
-    assert!(!requests[0].contains("?[]#"));
+    assert_eq!(requests.len(), 1);
+    assert_eq!(
+        request_line(&requests[0]),
+        "POST /storage/v1/b/bucket/o/folder%2A%3F%5B%5D%23%2Fsource/rewriteTo/b/bucket/o/folder%2A%3F%5B%5D%23%2Ftarget HTTP/1.1"
+    );
 }
 
 #[test]
@@ -89,10 +150,11 @@ fn keeps_leading_hyphens_in_object_names() {
     server.join().unwrap();
 
     let requests = requests.lock().unwrap();
-    assert!(requests[0].contains("/o/-target%3F?"));
-    assert!(requests[0].contains("sourceGeneration=123"));
-    assert!(requests[0].contains("ifSourceGenerationMatch=123"));
-    assert!(requests[0].contains("ifGenerationMatch=0"));
+    assert_eq!(requests.len(), 1);
+    assert_eq!(
+        request_line(&requests[0]),
+        "POST /storage/v1/b/bucket/o/source/rewriteTo/b/bucket/o/-target%3F?sourceGeneration=123&ifSourceGenerationMatch=123&ifGenerationMatch=0 HTTP/1.1"
+    );
 }
 
 #[test]
@@ -101,7 +163,12 @@ fn lists_empty_and_paginated_responses() {
     let objects = storage(&base).list_objects("bucket").unwrap();
     server.join().unwrap();
     assert!(objects.is_empty());
-    assert_eq!(requests.lock().unwrap().len(), 1);
+    let requests = requests.lock().unwrap();
+    assert_eq!(requests.len(), 1);
+    assert_eq!(
+        request_line(&requests[0]),
+        "GET /storage/v1/b/bucket/o?maxResults=1000 HTTP/1.1"
+    );
 
     let (base, requests, server) = test_server(vec![
         (
@@ -121,8 +188,15 @@ fn lists_empty_and_paginated_responses() {
         ]
     );
     let requests = requests.lock().unwrap();
-    assert!(requests[0].starts_with("GET /storage/v1/b/bucket/o?maxResults=1000 "));
-    assert!(requests[1].starts_with("GET /storage/v1/b/bucket/o?maxResults=1000&pageToken=next "));
+    assert_eq!(requests.len(), 2);
+    assert_eq!(
+        request_line(&requests[0]),
+        "GET /storage/v1/b/bucket/o?maxResults=1000 HTTP/1.1"
+    );
+    assert_eq!(
+        request_line(&requests[1]),
+        "GET /storage/v1/b/bucket/o?maxResults=1000&pageToken=next HTTP/1.1"
+    );
     assert!(
         requests[0]
             .to_ascii_lowercase()
@@ -132,7 +206,7 @@ fn lists_empty_and_paginated_responses() {
 
 #[test]
 fn reports_api_error_messages() {
-    let (base, _requests, server) = test_server(vec![(
+    let (base, requests, server) = test_server(vec![(
         403,
         r#"{"error":{"message":"permission denied"}}"#.to_string(),
     )]);
@@ -141,6 +215,453 @@ fn reports_api_error_messages() {
     server.join().unwrap();
 
     assert!(error.to_string().contains("permission denied"));
+    let requests = requests.lock().unwrap();
+    assert_eq!(requests.len(), 1);
+    assert_eq!(
+        request_line(&requests[0]),
+        "GET /storage/v1/b/bucket/o?maxResults=1000 HTTP/1.1"
+    );
+}
+
+#[test]
+fn uploads_files_and_preserves_generation_preconditions() {
+    let (base, requests, server) = test_server(vec![(200, r#"{"generation":"789"}"#.to_string())]);
+    let source = NamedTempFile::new().unwrap();
+    std::fs::write(source.path(), b"contents").unwrap();
+    let target = ObjectPath::parse("gs://bucket/target.txt").unwrap();
+
+    let generation = storage(&base).upload_file(source.path(), &target).unwrap();
+    server.join().unwrap();
+
+    assert_eq!(generation, "789");
+    let requests = requests.lock().unwrap();
+    assert_eq!(requests.len(), 1);
+    assert_eq!(
+        request_line(&requests[0]),
+        "POST /storage/v1/b/bucket/o?uploadType=media&name=target.txt&ifGenerationMatch=0 HTTP/1.1"
+    );
+    let request = requests[0].to_ascii_lowercase();
+    assert!(request.contains("uploadtype=media"));
+    assert!(request.contains("name=target.txt"));
+    assert!(request.contains("ifgenerationmatch=0"));
+    assert!(request.contains("content-length: 8"));
+    assert!(request.ends_with("\r\n\r\ncontents"));
+}
+
+#[test]
+fn reports_upload_server_errors() {
+    let (base, requests, server) = test_server(vec![(
+        500,
+        r#"{"error":{"message":"backend unavailable"}}"#.to_string(),
+    )]);
+    let source = NamedTempFile::new().unwrap();
+    std::fs::write(source.path(), b"contents").unwrap();
+    let target = ObjectPath::parse("gs://bucket/target.txt").unwrap();
+
+    let error = storage(&base)
+        .upload_file(source.path(), &target)
+        .unwrap_err();
+    server.join().unwrap();
+
+    assert!(matches!(
+        error,
+        AppError::Storage {
+            status: 500,
+            message: _
+        }
+    ));
+    assert!(error.to_string().contains("backend unavailable"));
+    let requests = requests.lock().unwrap();
+    assert_eq!(requests.len(), 1);
+    assert_eq!(
+        request_line(&requests[0]),
+        "POST /storage/v1/b/bucket/o?uploadType=media&name=target.txt&ifGenerationMatch=0 HTTP/1.1"
+    );
+}
+
+#[test]
+fn moves_objects_and_confirms_source_deletion() {
+    let (base, requests, server) = test_server(vec![
+        (200, r#"{"generation":"11"}"#.to_string()),
+        (
+            200,
+            r#"{"done":true,"resource":{"generation":"22"}}"#.to_string(),
+        ),
+        (200, "{}".to_string()),
+        (404, "{}".to_string()),
+    ]);
+    let storage = storage(&base);
+    let source = ObjectPath::parse("gs://bucket/source").unwrap();
+    let target = ObjectPath::parse("gs://bucket/target").unwrap();
+
+    let generation = storage.move_object(&source, &target).unwrap();
+    server.join().unwrap();
+
+    assert_eq!(generation, "22");
+    let requests = requests.lock().unwrap();
+    assert_eq!(requests.len(), 4);
+    assert_eq!(
+        request_line(&requests[0]),
+        "GET /storage/v1/b/bucket/o/source HTTP/1.1"
+    );
+    assert_eq!(
+        request_line(&requests[1]),
+        "POST /storage/v1/b/bucket/o/source/rewriteTo/b/bucket/o/target?sourceGeneration=11&ifSourceGenerationMatch=11&ifGenerationMatch=0 HTTP/1.1"
+    );
+    assert_eq!(
+        request_line(&requests[2]),
+        "DELETE /storage/v1/b/bucket/o/source?generation=11 HTTP/1.1"
+    );
+    assert_eq!(
+        request_line(&requests[3]),
+        "GET /storage/v1/b/bucket/o/source HTTP/1.1"
+    );
+}
+
+#[test]
+fn rejects_a_move_when_the_source_remains_after_delete() {
+    let (base, requests, server) = test_server(vec![
+        (200, r#"{"generation":"11"}"#.to_string()),
+        (
+            200,
+            r#"{"done":true,"resource":{"generation":"22"}}"#.to_string(),
+        ),
+        (200, "{}".to_string()),
+        (200, r#"{"generation":"11"}"#.to_string()),
+    ]);
+    let source = ObjectPath::parse("gs://bucket/source").unwrap();
+    let target = ObjectPath::parse("gs://bucket/target").unwrap();
+
+    let error = storage(&base).move_object(&source, &target).unwrap_err();
+    server.join().unwrap();
+
+    assert!(error.to_string().contains("Source object remains"));
+    let requests = requests.lock().unwrap();
+    assert_eq!(requests.len(), 4);
+    assert_eq!(
+        request_line(&requests[0]),
+        "GET /storage/v1/b/bucket/o/source HTTP/1.1"
+    );
+    assert_eq!(
+        request_line(&requests[1]),
+        "POST /storage/v1/b/bucket/o/source/rewriteTo/b/bucket/o/target?sourceGeneration=11&ifSourceGenerationMatch=11&ifGenerationMatch=0 HTTP/1.1"
+    );
+    assert_eq!(
+        request_line(&requests[2]),
+        "DELETE /storage/v1/b/bucket/o/source?generation=11 HTTP/1.1"
+    );
+    assert_eq!(
+        request_line(&requests[3]),
+        "GET /storage/v1/b/bucket/o/source HTTP/1.1"
+    );
+}
+
+#[test]
+fn rolls_back_objects_and_confirms_target_deletion() {
+    let (base, requests, server) = test_server(vec![
+        (404, "{}".to_string()),
+        (200, r#"{"generation":"22"}"#.to_string()),
+        (
+            200,
+            r#"{"done":true,"resource":{"generation":"33"}}"#.to_string(),
+        ),
+        (200, "{}".to_string()),
+        (404, "{}".to_string()),
+    ]);
+    let storage = storage(&base);
+    let source = ObjectPath::parse("gs://bucket/source").unwrap();
+    let target = ObjectPath::parse("gs://bucket/target").unwrap();
+
+    let generation = storage.rollback_object(&source, &target, "22").unwrap();
+    server.join().unwrap();
+
+    assert_eq!(generation, "33");
+    let requests = requests.lock().unwrap();
+    assert_eq!(requests.len(), 5);
+    assert_eq!(
+        request_line(&requests[0]),
+        "GET /storage/v1/b/bucket/o/source HTTP/1.1"
+    );
+    assert_eq!(
+        request_line(&requests[1]),
+        "GET /storage/v1/b/bucket/o/target?generation=22 HTTP/1.1"
+    );
+    assert_eq!(
+        request_line(&requests[2]),
+        "POST /storage/v1/b/bucket/o/target/rewriteTo/b/bucket/o/source?sourceGeneration=22&ifSourceGenerationMatch=22&ifGenerationMatch=0 HTTP/1.1"
+    );
+    assert_eq!(
+        request_line(&requests[3]),
+        "DELETE /storage/v1/b/bucket/o/target?generation=22 HTTP/1.1"
+    );
+    assert_eq!(
+        request_line(&requests[4]),
+        "GET /storage/v1/b/bucket/o/target HTTP/1.1"
+    );
+}
+
+#[test]
+fn rejects_a_rollback_when_the_target_remains_after_delete() {
+    let (base, requests, server) = test_server(vec![
+        (404, "{}".to_string()),
+        (200, r#"{"generation":"22"}"#.to_string()),
+        (
+            200,
+            r#"{"done":true,"resource":{"generation":"33"}}"#.to_string(),
+        ),
+        (200, "{}".to_string()),
+        (200, r#"{"generation":"22"}"#.to_string()),
+    ]);
+    let source = ObjectPath::parse("gs://bucket/source").unwrap();
+    let target = ObjectPath::parse("gs://bucket/target").unwrap();
+
+    let error = storage(&base)
+        .rollback_object(&source, &target, "22")
+        .unwrap_err();
+    server.join().unwrap();
+
+    assert!(error.to_string().contains("Rollback target remains"));
+    let requests = requests.lock().unwrap();
+    assert_eq!(requests.len(), 5);
+    assert_eq!(
+        request_line(&requests[0]),
+        "GET /storage/v1/b/bucket/o/source HTTP/1.1"
+    );
+    assert_eq!(
+        request_line(&requests[1]),
+        "GET /storage/v1/b/bucket/o/target?generation=22 HTTP/1.1"
+    );
+    assert_eq!(
+        request_line(&requests[2]),
+        "POST /storage/v1/b/bucket/o/target/rewriteTo/b/bucket/o/source?sourceGeneration=22&ifSourceGenerationMatch=22&ifGenerationMatch=0 HTTP/1.1"
+    );
+    assert_eq!(
+        request_line(&requests[3]),
+        "DELETE /storage/v1/b/bucket/o/target?generation=22 HTTP/1.1"
+    );
+    assert_eq!(
+        request_line(&requests[4]),
+        "GET /storage/v1/b/bucket/o/target HTTP/1.1"
+    );
+}
+
+#[test]
+fn cleans_up_owned_objects_and_accepts_missing_objects() {
+    let (base, requests, server) = test_server(vec![
+        (200, r#"{"generation":"22"}"#.to_string()),
+        (200, "{}".to_string()),
+        (404, "{}".to_string()),
+    ]);
+    let api = storage(&base);
+    let target = ObjectPath::parse("gs://bucket/target").unwrap();
+
+    api.cleanup_object(&target, "22").unwrap();
+    server.join().unwrap();
+
+    let requests = requests.lock().unwrap();
+    assert_eq!(requests.len(), 3);
+    assert_eq!(
+        request_line(&requests[0]),
+        "GET /storage/v1/b/bucket/o/target?generation=22 HTTP/1.1"
+    );
+    assert_eq!(
+        request_line(&requests[1]),
+        "DELETE /storage/v1/b/bucket/o/target?generation=22 HTTP/1.1"
+    );
+    assert_eq!(
+        request_line(&requests[2]),
+        "GET /storage/v1/b/bucket/o/target HTTP/1.1"
+    );
+
+    let (base, requests, server) =
+        test_server(vec![(404, "{}".to_string()), (404, "{}".to_string())]);
+    storage(&base).cleanup_object(&target, "22").unwrap();
+    server.join().unwrap();
+    let requests = requests.lock().unwrap();
+    assert_eq!(requests.len(), 2);
+    assert_eq!(
+        request_line(&requests[0]),
+        "GET /storage/v1/b/bucket/o/target?generation=22 HTTP/1.1"
+    );
+    assert_eq!(
+        request_line(&requests[1]),
+        "GET /storage/v1/b/bucket/o/target HTTP/1.1"
+    );
+}
+
+#[test]
+fn rejects_cleanup_when_the_target_remains_after_delete() {
+    let (base, requests, server) = test_server(vec![
+        (200, r#"{"generation":"22"}"#.to_string()),
+        (200, "{}".to_string()),
+        (200, r#"{"generation":"22"}"#.to_string()),
+    ]);
+    let target = ObjectPath::parse("gs://bucket/target").unwrap();
+
+    let error = storage(&base).cleanup_object(&target, "22").unwrap_err();
+    server.join().unwrap();
+
+    assert!(error.to_string().contains("Cleanup target remains"));
+    let requests = requests.lock().unwrap();
+    assert_eq!(requests.len(), 3);
+    assert_eq!(
+        request_line(&requests[0]),
+        "GET /storage/v1/b/bucket/o/target?generation=22 HTTP/1.1"
+    );
+    assert_eq!(
+        request_line(&requests[1]),
+        "DELETE /storage/v1/b/bucket/o/target?generation=22 HTTP/1.1"
+    );
+    assert_eq!(
+        request_line(&requests[2]),
+        "GET /storage/v1/b/bucket/o/target HTTP/1.1"
+    );
+}
+
+#[test]
+fn confirms_missing_objects_after_non_http_failures() {
+    let (base, requests, server) = test_server(vec![
+        (200, r#"{"generation":"11"}"#.to_string()),
+        (404, "{}".to_string()),
+        (404, "{}".to_string()),
+    ]);
+    let storage = storage(&base);
+    let source = ObjectPath::parse("gs://bucket/source").unwrap();
+    let target = ObjectPath::parse("gs://bucket/target").unwrap();
+
+    storage
+        .confirm_move_after_failure(
+            &source,
+            &target,
+            &AppError::Message("move interrupted".to_string()),
+        )
+        .unwrap();
+    storage
+        .confirm_write_after_failure(
+            &target,
+            &AppError::Message("upload interrupted".to_string()),
+        )
+        .unwrap();
+    server.join().unwrap();
+
+    let requests = requests.lock().unwrap();
+    assert_eq!(requests.len(), 3);
+    assert_eq!(
+        request_line(&requests[0]),
+        "GET /storage/v1/b/bucket/o/source HTTP/1.1"
+    );
+    assert_eq!(
+        request_line(&requests[1]),
+        "GET /storage/v1/b/bucket/o/target HTTP/1.1"
+    );
+    assert_eq!(
+        request_line(&requests[2]),
+        "GET /storage/v1/b/bucket/o/target HTTP/1.1"
+    );
+}
+
+#[test]
+fn requires_recovery_for_http_failures_with_unknown_state() {
+    let (base, requests, server) = test_server(vec![
+        (200, r#"{"generation":"11"}"#.to_string()),
+        (404, "{}".to_string()),
+    ]);
+    let source = ObjectPath::parse("gs://bucket/source").unwrap();
+    let target = ObjectPath::parse("gs://bucket/target").unwrap();
+
+    let error = storage(&base)
+        .confirm_move_after_failure(
+            &source,
+            &target,
+            &AppError::Storage {
+                status: 503,
+                message: "service unavailable".to_string(),
+            },
+        )
+        .unwrap_err();
+    server.join().unwrap();
+
+    assert!(matches!(error, AppError::Recovery { .. }));
+    let requests = requests.lock().unwrap();
+    assert_eq!(requests.len(), 2);
+    assert_eq!(
+        request_line(&requests[0]),
+        "GET /storage/v1/b/bucket/o/source HTTP/1.1"
+    );
+    assert_eq!(
+        request_line(&requests[1]),
+        "GET /storage/v1/b/bucket/o/target HTTP/1.1"
+    );
+}
+
+#[test]
+fn requires_recovery_for_http_upload_failures_with_existing_state() {
+    let (base, requests, server) = test_server(vec![(200, r#"{"generation":"44"}"#.to_string())]);
+    let target = ObjectPath::parse("gs://bucket/target").unwrap();
+
+    let error = storage(&base)
+        .confirm_write_after_failure(
+            &target,
+            &AppError::Storage {
+                status: 503,
+                message: "service unavailable".to_string(),
+            },
+        )
+        .unwrap_err();
+    server.join().unwrap();
+
+    assert!(matches!(error, AppError::Recovery { .. }));
+    let requests = requests.lock().unwrap();
+    assert_eq!(requests.len(), 1);
+    assert_eq!(
+        request_line(&requests[0]),
+        "GET /storage/v1/b/bucket/o/target HTTP/1.1"
+    );
+}
+
+#[test]
+fn reports_http_failure_when_state_confirmation_gets_a_server_error() {
+    let (base, requests, server) = test_server(vec![(
+        503,
+        r#"{"error":{"message":"service unavailable"}}"#.to_string(),
+    )]);
+    let target = ObjectPath::parse("gs://bucket/target").unwrap();
+
+    let error = storage(&base)
+        .confirm_write_after_failure(&target, &AppError::Message("upload failed".to_string()))
+        .unwrap_err();
+    server.join().unwrap();
+
+    assert!(matches!(
+        error,
+        AppError::Storage {
+            status: 503,
+            message: _
+        }
+    ));
+    assert!(error.to_string().contains("service unavailable"));
+    let requests = requests.lock().unwrap();
+    assert_eq!(requests.len(), 1);
+    assert_eq!(
+        request_line(&requests[0]),
+        "GET /storage/v1/b/bucket/o/target HTTP/1.1"
+    );
+}
+
+#[test]
+fn reports_an_incomplete_http_response() {
+    let (base, requests, server) = incomplete_response_server();
+
+    let error = storage(&base).list_objects("bucket").unwrap_err();
+    server.join().unwrap();
+
+    assert!(matches!(error, AppError::Http(_)));
+    let requests = requests.lock().unwrap();
+    assert_eq!(requests.len(), 1);
+    assert_eq!(
+        request_line(&requests[0]),
+        "GET /storage/v1/b/bucket/o?maxResults=1000 HTTP/1.1"
+    );
 }
 
 #[test]
@@ -166,8 +687,13 @@ fn rewrites_objects_with_generations_and_continuation_tokens() {
 
     assert_eq!(generation, "456");
     let requests = requests.lock().unwrap();
-    assert!(requests[0].contains("sourceGeneration=123"));
-    assert!(requests[0].contains("ifSourceGenerationMatch=123"));
-    assert!(requests[0].contains("ifGenerationMatch=0"));
-    assert!(requests[1].contains("rewriteToken=continue+token"));
+    assert_eq!(requests.len(), 2);
+    assert_eq!(
+        request_line(&requests[0]),
+        "POST /storage/v1/b/bucket/o/folder%2A%3F%5B%5D%23%2Fsource/rewriteTo/b/bucket/o/folder%2A%3F%5B%5D%23%2Ftarget?sourceGeneration=123&ifSourceGenerationMatch=123&ifGenerationMatch=0 HTTP/1.1"
+    );
+    assert_eq!(
+        request_line(&requests[1]),
+        "POST /storage/v1/b/bucket/o/folder%2A%3F%5B%5D%23%2Fsource/rewriteTo/b/bucket/o/folder%2A%3F%5B%5D%23%2Ftarget?sourceGeneration=123&ifSourceGenerationMatch=123&ifGenerationMatch=0&rewriteToken=continue+token HTTP/1.1"
+    );
 }
