@@ -334,20 +334,12 @@ impl StorageClient for StorageApi {
             if let Some(page_token) = &page_token {
                 query.append_pair("pageToken", page_token);
             }
-            let url = with_query(
-                format!("{}/b/{}/o", self.api_base, encode(bucket)),
-                [("maxResults", "1000")],
+            let url = format!(
+                "{}/b/{}/o?{}",
+                self.api_base,
+                encode(bucket),
+                query.finish()
             );
-            let url = if page_token.is_some() {
-                format!(
-                    "{}/b/{}/o?{}",
-                    self.api_base,
-                    encode(bucket),
-                    query.finish()
-                )
-            } else {
-                url
-            };
             let response = self.send(self.client.get(url))?;
             let body = Self::response_body(response)?;
             let listing: ListResponse = serde_json::from_slice(&body).map_err(|error| {
