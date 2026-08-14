@@ -3,7 +3,7 @@ use std::io;
 use std::path::{Path, PathBuf};
 
 use crate::InterruptFlag;
-use crate::atomic_rename::rename_without_overwrite;
+use crate::atomic_rename::{path_entry_exists, rename_without_overwrite, same_path_entry};
 use crate::error::AppError;
 use crate::normalization_plan::Entry;
 
@@ -58,13 +58,18 @@ fn rollback(entries: &[RenameRecord]) -> Vec<AppError> {
         if entry.source == entry.target {
             continue;
         }
-        if entry.source.exists() && entry.target.exists() {
-            errors.push(
-                io::Error::new(io::ErrorKind::AlreadyExists, "source and target both exist").into(),
-            );
+        if path_entry_exists(&entry.source) && path_entry_exists(&entry.target) {
+            match same_path_entry(&entry.source, &entry.target) {
+                Ok(true) => continue,
+                Ok(false) => errors.push(
+                    io::Error::new(io::ErrorKind::AlreadyExists, "source and target both exist")
+                        .into(),
+                ),
+                Err(error) => errors.push(error),
+            }
             continue;
         }
-        if !entry.target.exists() {
+        if !path_entry_exists(&entry.target) {
             errors.push(io::Error::new(io::ErrorKind::NotFound, "target does not exist").into());
             continue;
         }

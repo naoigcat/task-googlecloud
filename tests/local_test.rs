@@ -61,3 +61,45 @@ fn rollback_does_not_overwrite_a_new_source() {
     assert_eq!(fs::read_to_string(source).unwrap(), "source");
     assert_eq!(fs::read_to_string(target).unwrap(), "target");
 }
+
+#[cfg(target_os = "macos")]
+#[test]
+fn rollback_ignores_nfc_and_nfd_aliases() {
+    let directory = tempdir().unwrap();
+    let source = directory.path().join("cafe\u{301}.txt");
+    let target = directory.path().join("caf\u{e9}.txt");
+    fs::write(&source, "content").unwrap();
+    assert!(target.exists());
+    let entries = vec![Entry {
+        source: source.to_str().unwrap().to_string(),
+        target: target.to_str().unwrap().to_string(),
+    }];
+    apply_normalization(&entries, &no_interrupt()).unwrap();
+    assert_eq!(fs::read_to_string(&source).unwrap(), "content");
+    assert_eq!(fs::read_to_string(&target).unwrap(), "content");
+
+    let errors = rollback_normalization(&[(source.clone(), target.clone())]);
+
+    assert!(errors.is_empty());
+    assert_eq!(fs::read_to_string(&source).unwrap(), "content");
+    assert_eq!(fs::read_to_string(&target).unwrap(), "content");
+}
+
+#[cfg(unix)]
+#[test]
+fn rollback_treats_dangling_symlinks_as_existing_entries() {
+    let directory = tempdir().unwrap();
+    let source = directory.path().join("source.txt");
+    let target = directory.path().join("target.txt");
+    fs::write(&source, "source").unwrap();
+    std::os::unix::fs::symlink(directory.path().join("missing.txt"), &target).unwrap();
+
+    let errors = rollback_normalization(&[(source, target)]);
+
+    assert_eq!(errors.len(), 1);
+    assert!(
+        errors[0]
+            .to_string()
+            .contains("source and target both exist")
+    );
+}
