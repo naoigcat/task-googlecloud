@@ -1,5 +1,16 @@
+#[cfg(unix)]
+use std::ffi::CString;
+use std::fs;
 use std::fs::File;
-use std::path::Path;
+#[cfg(unix)]
+use std::os::unix::ffi::OsStrExt;
+#[cfg(unix)]
+use std::os::unix::fs::OpenOptionsExt;
+#[cfg(unix)]
+use std::os::unix::io::{AsRawFd, FromRawFd, RawFd};
+#[cfg(unix)]
+use std::path::Component;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use percent_encoding::{AsciiSet, CONTROLS, utf8_percent_encode};
@@ -104,11 +115,14 @@ pub struct StorageApi {
     token_override: Option<String>,
     api_base: String,
     upload_base: String,
+    upload_root: Option<PathBuf>,
 }
 
 impl StorageApi {
     pub fn new(cloud: Cloud) -> Self {
-        Self::with_endpoints(cloud, API_BASE, UPLOAD_BASE, None)
+        let mut storage = Self::with_endpoints(cloud, API_BASE, UPLOAD_BASE, None);
+        storage.upload_root = Some(PathBuf::from("uploads"));
+        storage
     }
 
     pub fn with_endpoints(
@@ -134,6 +148,7 @@ impl StorageApi {
             token_override: token,
             api_base: api_base.into(),
             upload_base: upload_base.into(),
+            upload_root: None,
         }
     }
 
@@ -167,6 +182,31 @@ impl StorageApi {
             status: status.as_u16(),
             message: response_message(&body),
         })
+    }
+
+    #[cfg(unix)]
+    fn open_upload_file(&self, source: &Path) -> Result<File, AppError> {
+        if let Some(root) = &self.upload_root {
+            let relative = source.strip_prefix(root).map_err(|_| {
+                AppError::Message(format!("Upload source is outside {root:?}: {source:?}"))
+            })?;
+            open_relative_without_following_links(root, relative)
+        } else {
+            open_without_upload_root(source)
+        }
+    }
+
+    #[cfg(not(unix))]
+    fn open_upload_file(&self, source: &Path) -> Result<File, AppError> {
+        let metadata = fs::symlink_metadata(source)?;
+        if !metadata.file_type().is_file() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!("Upload source is not a regular file: {source:?}"),
+            )
+            .into());
+        }
+        File::open(source).map_err(AppError::from)
     }
 
     fn object_metadata(
@@ -305,7 +345,7 @@ impl StorageClient for StorageApi {
     }
 
     fn upload_file(&self, source: &Path, target: &ObjectPath) -> Result<String, AppError> {
-        let file = File::open(source)?;
+        let file = self.open_upload_file(source)?;
         let size = file.metadata()?.len();
         let url = with_query(
             format!("{}/b/{}/o", self.upload_base, encode(&target.bucket)),
@@ -498,6 +538,115 @@ fn encode(value: &str) -> String {
     utf8_percent_encode(value, PATH_SEGMENT).to_string()
 }
 
+#[cfg(unix)]
+fn open_relative_without_following_links(root: &Path, source: &Path) -> Result<File, AppError> {
+    let directory = open_directory(root)?;
+    open_path_components(directory, source, false)
+}
+
+#[cfg(unix)]
+fn open_without_upload_root(source: &Path) -> Result<File, AppError> {
+    let metadata = fs::symlink_metadata(source)?;
+    if !metadata.file_type().is_file() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("Upload source is not a regular file: {source:?}"),
+        )
+        .into());
+    }
+    fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(source)
+        .map_err(AppError::from)
+}
+
+#[cfg(unix)]
+fn open_path_components(
+    mut directory: File,
+    source: &Path,
+    allow_root: bool,
+) -> Result<File, AppError> {
+    let mut components = source.components().peekable();
+
+    while let Some(component) = components.next() {
+        match component {
+            Component::RootDir if allow_root => {}
+            Component::CurDir => {}
+            Component::RootDir => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    format!("Upload source is absolute: {source:?}"),
+                )
+                .into());
+            }
+            Component::ParentDir => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    format!("Upload source contains a parent path component: {source:?}"),
+                )
+                .into());
+            }
+            Component::Normal(name) if components.peek().is_some() => {
+                let fd = open_at(directory.as_raw_fd(), name, directory_flags())?;
+                directory = unsafe { File::from_raw_fd(fd) };
+            }
+            Component::Normal(name) => {
+                let fd = open_at(directory.as_raw_fd(), name, file_flags())?;
+                let file = unsafe { File::from_raw_fd(fd) };
+                if !file.metadata()?.file_type().is_file() {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        format!("Upload source is not a regular file: {source:?}"),
+                    )
+                    .into());
+                }
+                return Ok(file);
+            }
+            _ => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    format!("Upload source is not a regular file: {source:?}"),
+                )
+                .into());
+            }
+        }
+    }
+
+    Err(std::io::Error::new(
+        std::io::ErrorKind::InvalidInput,
+        format!("Upload source is not a regular file: {source:?}"),
+    )
+    .into())
+}
+
+#[cfg(unix)]
+fn open_directory(path: &Path) -> Result<File, AppError> {
+    let fd = open_at(libc::AT_FDCWD, path.as_os_str(), directory_flags())?;
+    Ok(unsafe { File::from_raw_fd(fd) })
+}
+
+#[cfg(unix)]
+fn open_at(directory: RawFd, name: &std::ffi::OsStr, flags: i32) -> Result<RawFd, AppError> {
+    let name = CString::new(name.as_bytes())
+        .map_err(|_| AppError::Message(format!("Path contains NUL: {name:?}")))?;
+    let fd = unsafe { libc::openat(directory, name.as_ptr(), flags) };
+    if fd < 0 {
+        return Err(std::io::Error::last_os_error().into());
+    }
+    Ok(fd)
+}
+
+#[cfg(unix)]
+fn directory_flags() -> i32 {
+    libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC | libc::O_NOFOLLOW
+}
+
+#[cfg(unix)]
+fn file_flags() -> i32 {
+    libc::O_RDONLY | libc::O_CLOEXEC | libc::O_NOFOLLOW
+}
+
 fn object_url(base: &str, object: &ObjectPath) -> String {
     format!(
         "{base}/b/{}/o/{}",
@@ -578,5 +727,35 @@ mod tests {
 
         assert_eq!(storage.upload_file(source.path(), &target).unwrap(), "456");
         server.join().unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn refuses_upload_sources_through_parent_symlinks() {
+        use std::os::unix::fs::symlink;
+
+        let root = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(root.path()).unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let source = outside.path().join("secret.txt");
+        std::fs::write(&source, "secret").unwrap();
+        let linked_bucket = root.join("linked-bucket");
+        symlink(outside.path(), &linked_bucket).unwrap();
+        let source_through_link = linked_bucket.join("secret.txt");
+        let target = ObjectPath::parse("gs://bucket/target").unwrap();
+        let mut storage = StorageApi::with_endpoint_options(
+            Cloud::new(),
+            "http://127.0.0.1:1/storage/v1",
+            "http://127.0.0.1:1/storage/v1",
+            Some("token".to_string()),
+            Duration::from_millis(10),
+        );
+        storage.upload_root = Some(root);
+
+        let error = storage
+            .upload_file(&source_through_link, &target)
+            .unwrap_err();
+
+        assert!(matches!(error, super::AppError::Io(_)), "{error}");
     }
 }

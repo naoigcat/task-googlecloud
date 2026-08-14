@@ -58,19 +58,31 @@ pub fn run<S: StorageClient>(
 
 pub fn upload_files_by_directory(root: &Path) -> Result<BTreeMap<PathBuf, Vec<PathBuf>>, AppError> {
     let mut directories = BTreeMap::new();
-    if !root.exists() {
+    let root_metadata = match fs::symlink_metadata(root) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(directories),
+        Err(error) => return Err(error.into()),
+    };
+    if root_metadata.file_type().is_symlink() {
         return Ok(directories);
+    }
+    if !root_metadata.file_type().is_dir() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::NotADirectory,
+            format!("Upload root is not a directory: {root:?}"),
+        )
+        .into());
     }
     for directory in fs::read_dir(root)? {
         let directory = directory?.path();
-        if !directory.is_dir() {
+        if !is_real_directory(&directory) {
             continue;
         }
         let mut files = fs::read_dir(&directory)?
             .map(|entry| entry.map(|entry| entry.path()))
             .collect::<Result<Vec<_>, _>>()?;
         files.retain(|file| {
-            file.is_file()
+            is_regular_file(file)
                 && file
                     .file_name()
                     .is_some_and(|name| !name.to_string_lossy().starts_with('.'))
@@ -79,6 +91,18 @@ pub fn upload_files_by_directory(root: &Path) -> Result<BTreeMap<PathBuf, Vec<Pa
         directories.insert(directory, files);
     }
     Ok(directories)
+}
+
+fn is_real_directory(path: &Path) -> bool {
+    fs::symlink_metadata(path)
+        .map(|metadata| metadata.file_type().is_dir())
+        .unwrap_or(false)
+}
+
+fn is_regular_file(path: &Path) -> bool {
+    fs::symlink_metadata(path)
+        .map(|metadata| metadata.file_type().is_file())
+        .unwrap_or(false)
 }
 
 fn upload_normalized_files<S: StorageClient>(

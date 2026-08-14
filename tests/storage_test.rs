@@ -5,7 +5,7 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 use task_googlecloud::{AppError, Cloud, ObjectPath, StorageApi, StorageClient};
-use tempfile::NamedTempFile;
+use tempfile::{NamedTempFile, tempdir};
 
 const SERVER_TIMEOUT: Duration = Duration::from_secs(5);
 
@@ -246,6 +246,28 @@ fn uploads_files_and_preserves_generation_preconditions() {
     assert!(request.contains("ifgenerationmatch=0"));
     assert!(request.contains("content-length: 8"));
     assert!(request.ends_with("\r\n\r\ncontents"));
+}
+
+#[cfg(unix)]
+#[test]
+fn refuses_symlinked_upload_sources() {
+    use std::os::unix::fs::symlink;
+
+    let directory = tempdir().unwrap();
+    let source = NamedTempFile::new().unwrap();
+    let linked_file = directory.path().join("linked.txt");
+    symlink(source.path(), &linked_file).unwrap();
+    let target = ObjectPath::parse("gs://bucket/target.txt").unwrap();
+    let storage = StorageApi::with_endpoints(
+        Cloud::new(),
+        "http://127.0.0.1:1/storage/v1",
+        "http://127.0.0.1:1/storage/v1",
+        Some("token".to_string()),
+    );
+
+    let error = storage.upload_file(&linked_file, &target).unwrap_err();
+
+    assert!(matches!(error, AppError::Io(_)), "{error}");
 }
 
 #[test]
