@@ -93,6 +93,7 @@ fn accept_connection(listener: &TcpListener, timeout: Duration) -> Option<TcpStr
     loop {
         match listener.accept() {
             Ok((stream, _)) => {
+                stream.set_nonblocking(false).unwrap();
                 stream.set_read_timeout(Some(SERVER_TIMEOUT)).unwrap();
                 stream.set_write_timeout(Some(SERVER_TIMEOUT)).unwrap();
                 return Some(stream);
@@ -106,6 +107,27 @@ fn accept_connection(listener: &TcpListener, timeout: Duration) -> Option<TcpStr
             Err(error) => panic!("failed to accept test request: {error}"),
         }
     }
+}
+
+#[test]
+fn accepted_connections_are_blocking() {
+    let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let address = listener.local_addr().unwrap();
+    let (connected, client_ready) = std::sync::mpsc::channel();
+    let client = thread::spawn(move || {
+        let mut stream = TcpStream::connect(address).unwrap();
+        connected.send(()).unwrap();
+        thread::sleep(Duration::from_millis(200));
+        stream.write_all(b"x").unwrap();
+    });
+
+    client_ready.recv().unwrap();
+    let mut stream = accept_connection(&listener, SERVER_TIMEOUT).unwrap();
+    let mut byte = [0_u8; 1];
+    stream.read_exact(&mut byte).unwrap();
+    assert_eq!(byte, [b'x']);
+    client.join().unwrap();
 }
 
 fn read_request(stream: &mut TcpStream) -> String {
