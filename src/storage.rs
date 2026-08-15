@@ -55,54 +55,40 @@ pub struct ObjectMetadata {
     pub generation: String,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-/// Result of an object lookup, including generation-constrained lookups.
-pub enum ObjectState {
-    Present,
+#[derive(Clone, Debug, PartialEq, Eq)]
+/// Result of an object lookup, retaining the generation of the observed version.
+enum ObjectState {
+    Present { generation: String },
     Missing,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
-/// A point-in-time object state with its generation when the object exists.
-struct ObjectDetails {
-    state: ObjectState,
-    generation: Option<String>,
-}
-
-impl ObjectDetails {
+impl ObjectState {
     fn present(generation: String) -> Self {
-        Self {
-            state: ObjectState::Present,
-            generation: Some(generation),
-        }
+        Self::Present { generation }
     }
 
     fn missing() -> Self {
-        Self {
-            state: ObjectState::Missing,
-            generation: None,
-        }
+        Self::Missing
     }
 
     fn is_present(&self) -> bool {
-        self.state == ObjectState::Present
+        matches!(self, Self::Present { .. })
     }
 
     fn is_missing(&self) -> bool {
-        self.state == ObjectState::Missing
+        matches!(self, Self::Missing)
     }
 
     fn has_generation(&self, expected: &str) -> bool {
-        self.generation.as_deref() == Some(expected)
+        matches!(self, Self::Present { generation } if generation == expected)
     }
 
     fn describe(&self, object: &ObjectPath) -> String {
-        match (&self.state, &self.generation) {
-            (ObjectState::Missing, _) => format!("{} is missing", object.uri()),
-            (ObjectState::Present, Some(generation)) => {
+        match self {
+            Self::Missing => format!("{} is missing", object.uri()),
+            Self::Present { generation } => {
                 format!("{}: generation {generation}", object.uri())
             }
-            (ObjectState::Present, None) => format!("{}: generation unknown", object.uri()),
         }
     }
 }
@@ -465,8 +451,8 @@ impl StorageApi {
         generation: Option<&str>,
     ) -> Result<ObjectState, AppError> {
         match self.object_metadata(object, generation) {
-            Ok(_) => Ok(ObjectState::Present),
-            Err(error) if error.status() == Some(404) => Ok(ObjectState::Missing),
+            Ok(metadata) => Ok(ObjectState::present(metadata.generation)),
+            Err(error) if error.status() == Some(404) => Ok(ObjectState::missing()),
             Err(error) => Err(error),
         }
     }
@@ -601,7 +587,7 @@ impl StorageApi {
         // A copied object already changed remote state, so verification token
         // failures must remain recoverable.
         let details = match self
-            .object_details(object)
+            .object_state(object, None)
             .map_err(AppError::mark_storage_reached)
         {
             Ok(details) => Ok(details),
@@ -697,8 +683,8 @@ impl StorageClient for StorageApi {
             return Ok(());
         }
 
-        let source_details = self.object_details(source);
-        let target_details = self.object_details(target);
+        let source_details = self.object_state(source, None);
+        let target_details = self.object_state(target, None);
         let no_change = matches!(
             (&source_details, &target_details),
             (Ok(source), Ok(target)) if source.is_present() && target.is_missing()
@@ -728,7 +714,7 @@ impl StorageClient for StorageApi {
             return Ok(());
         }
 
-        let details = self.object_details(target);
+        let details = self.object_state(target, None);
         if matches!(&details, Ok(details) if details.is_missing())
             && !operation.may_have_sent_storage_request()
         {
@@ -883,7 +869,7 @@ impl StorageApi {
         // Source presence distinguishes a copy that was not followed by delete
         // from a move whose source deletion already succeeded.
         match self.object_state(source, None)? {
-            ObjectState::Present => {
+            ObjectState::Present { .. } => {
                 self.cleanup_object_unlocked(target, target_generation)?;
                 Ok(None)
             }
@@ -902,7 +888,10 @@ impl StorageApi {
         // Confirm ownership before restoring so a rollback cannot delete or
         // overwrite an object created by another writer after the failure.
         if self.object_state(source, None)? != ObjectState::Missing
-            || self.object_state(target, Some(target_generation))? != ObjectState::Present
+            || !matches!(
+                self.object_state(target, Some(target_generation))?,
+                ObjectState::Present { .. }
+            )
         {
             return Err(AppError::Message(format!(
                 "Rollback ownership check failed for {} and {}",
@@ -936,7 +925,7 @@ impl StorageApi {
         // Delete only the generation recorded by this run; an object at the
         // same path with a newer generation belongs to someone else.
         match self.object_state(target, Some(target_generation))? {
-            ObjectState::Present => self
+            ObjectState::Present { .. } => self
                 .delete_object(target, target_generation)
                 .map_err(AppError::mark_storage_reached)?,
             ObjectState::Missing => {}
@@ -953,21 +942,13 @@ impl StorageApi {
         }
         Ok(())
     }
-
-    fn object_details(&self, object: &ObjectPath) -> Result<ObjectDetails, AppError> {
-        match self.object_metadata(object, None) {
-            Ok(metadata) => Ok(ObjectDetails::present(metadata.generation)),
-            Err(error) if error.status() == Some(404) => Ok(ObjectDetails::missing()),
-            Err(error) => Err(error),
-        }
-    }
 }
 
 /// A failed lookup is reported rather than propagated so that the caller still
 /// learns which objects need manual recovery.
-fn state_details(object: &ObjectPath, details: Result<ObjectDetails, AppError>) -> String {
+fn state_details(object: &ObjectPath, details: Result<ObjectState, AppError>) -> String {
     match details {
-        Ok(details) => details.describe(object),
+        Ok(state) => state.describe(object),
         Err(error) => format!("{}: state unknown ({error})", object.uri()),
     }
 }
