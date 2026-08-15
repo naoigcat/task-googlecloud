@@ -32,19 +32,10 @@ pub fn run<S: StorageClient>(
     let directory_identities = discovery.directory_identities;
     let file_identities = discovery.file_identities;
     storage.set_upload_root_identity(expected_root.clone())?;
-    let bucket_names = files_by_directory
+    let buckets = files_by_directory
         .keys()
-        .map(|directory| {
-            directory
-                .file_name()
-                .and_then(|name| name.to_str())
-                .map(str::to_string)
-                .ok_or_else(|| {
-                    AppError::Message(format!("Directory is not valid UTF-8: {directory:?}"))
-                })
-        })
+        .map(|directory| bucket_name(directory))
         .collect::<Result<Vec<_>, _>>()?;
-    let buckets = bucket_names.iter().map(String::as_str).collect::<Vec<_>>();
 
     storage.with_bucket_locks(&buckets, || {
         let files = files_by_directory
@@ -196,6 +187,13 @@ fn discover_uploads(root: &Path) -> Result<UploadDiscovery, AppError> {
     })
 }
 
+fn bucket_name(directory: &Path) -> Result<&str, AppError> {
+    directory
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| AppError::Message(format!("Directory is not valid UTF-8: {directory:?}")))
+}
+
 #[cfg(test)]
 fn is_real_directory(path: &Path) -> Result<bool, AppError> {
     Ok(fs::symlink_metadata(path)?.file_type().is_dir())
@@ -253,12 +251,7 @@ fn plan_uploads_with_identities(
 ) -> Result<Vec<PlannedDirectoryUploads>, AppError> {
     let mut planned = Vec::new();
     for (directory, files) in files_by_directory {
-        let bucket = directory
-            .file_name()
-            .and_then(|name| name.to_str())
-            .ok_or_else(|| {
-                AppError::Message(format!("Directory is not valid UTF-8: {directory:?}"))
-            })?;
+        let bucket = bucket_name(directory)?;
         let mut uploads = Vec::new();
         for file in files {
             // Keep the original discovered identity attached to the normalized
