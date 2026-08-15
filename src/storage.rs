@@ -62,6 +62,51 @@ pub enum ObjectState {
     Missing,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+/// A point-in-time object state with its generation when the object exists.
+struct ObjectDetails {
+    state: ObjectState,
+    generation: Option<String>,
+}
+
+impl ObjectDetails {
+    fn present(generation: String) -> Self {
+        Self {
+            state: ObjectState::Present,
+            generation: Some(generation),
+        }
+    }
+
+    fn missing() -> Self {
+        Self {
+            state: ObjectState::Missing,
+            generation: None,
+        }
+    }
+
+    fn is_present(&self) -> bool {
+        self.state == ObjectState::Present
+    }
+
+    fn is_missing(&self) -> bool {
+        self.state == ObjectState::Missing
+    }
+
+    fn has_generation(&self, expected: &str) -> bool {
+        self.generation.as_deref() == Some(expected)
+    }
+
+    fn describe(&self, object: &ObjectPath) -> String {
+        match (&self.state, &self.generation) {
+            (ObjectState::Missing, _) => format!("{} is missing", object.uri()),
+            (ObjectState::Present, Some(generation)) => {
+                format!("{}: generation {generation}", object.uri())
+            }
+            (ObjectState::Present, None) => format!("{}: generation unknown", object.uri()),
+        }
+    }
+}
+
 #[derive(Debug)]
 struct BucketLock {
     object: ObjectPath,
@@ -563,11 +608,7 @@ impl StorageApi {
             Err(error) if propagate_interrupt && error.is_interrupted() => return Err(error),
             Err(error) => Err(error),
         };
-        if matches!(
-            &details,
-            Ok((ObjectState::Present, Some(generation)))
-                if generation == expected_generation
-        ) {
+        if matches!(&details, Ok(details) if details.has_generation(expected_generation)) {
             return Ok(());
         }
 
@@ -658,8 +699,10 @@ impl StorageClient for StorageApi {
 
         let source_details = self.object_details(source);
         let target_details = self.object_details(target);
-        let no_change = matches!(source_details, Ok((ObjectState::Present, _)))
-            && matches!(target_details, Ok((ObjectState::Missing, _)));
+        let no_change = matches!(
+            (&source_details, &target_details),
+            (Ok(source), Ok(target)) if source.is_present() && target.is_missing()
+        );
         if no_change && !operation.may_have_sent_storage_request() {
             return Ok(());
         }
@@ -686,7 +729,7 @@ impl StorageClient for StorageApi {
         }
 
         let details = self.object_details(target);
-        if matches!(details, Ok((ObjectState::Missing, _)))
+        if matches!(&details, Ok(details) if details.is_missing())
             && !operation.may_have_sent_storage_request()
         {
             return Ok(());
@@ -911,13 +954,10 @@ impl StorageApi {
         Ok(())
     }
 
-    fn object_details(
-        &self,
-        object: &ObjectPath,
-    ) -> Result<(ObjectState, Option<String>), AppError> {
+    fn object_details(&self, object: &ObjectPath) -> Result<ObjectDetails, AppError> {
         match self.object_metadata(object, None) {
-            Ok(metadata) => Ok((ObjectState::Present, Some(metadata.generation))),
-            Err(error) if error.status() == Some(404) => Ok((ObjectState::Missing, None)),
+            Ok(metadata) => Ok(ObjectDetails::present(metadata.generation)),
+            Err(error) if error.status() == Some(404) => Ok(ObjectDetails::missing()),
             Err(error) => Err(error),
         }
     }
@@ -925,16 +965,9 @@ impl StorageApi {
 
 /// A failed lookup is reported rather than propagated so that the caller still
 /// learns which objects need manual recovery.
-fn state_details(
-    object: &ObjectPath,
-    details: Result<(ObjectState, Option<String>), AppError>,
-) -> String {
+fn state_details(object: &ObjectPath, details: Result<ObjectDetails, AppError>) -> String {
     match details {
-        Ok((ObjectState::Missing, _)) => format!("{} is missing", object.uri()),
-        Ok((ObjectState::Present, Some(generation))) => {
-            format!("{}: generation {generation}", object.uri())
-        }
-        Ok((ObjectState::Present, None)) => format!("{}: generation unknown", object.uri()),
+        Ok(details) => details.describe(object),
         Err(error) => format!("{}: state unknown ({error})", object.uri()),
     }
 }
