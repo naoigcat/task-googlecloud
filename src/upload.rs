@@ -105,18 +105,20 @@ fn discover_uploads(root: &Path) -> Result<UploadDiscovery, AppError> {
     let root_identity = directory_identity_from_metadata(&root_metadata);
     for directory in fs::read_dir(root)? {
         let directory = directory?.path();
-        if !is_real_directory(&directory) {
+        if !is_real_directory(&directory)? {
             continue;
         }
-        let mut files = fs::read_dir(&directory)?
-            .map(|entry| entry.map(|entry| entry.path()))
-            .collect::<Result<Vec<_>, _>>()?;
-        files.retain(|file| {
-            is_regular_file(file)
+        let mut files = Vec::new();
+        for entry in fs::read_dir(&directory)? {
+            let file = entry?.path();
+            if is_regular_file(&file)?
                 && file
                     .file_name()
                     .is_some_and(|name| !name.to_string_lossy().starts_with('.'))
-        });
+            {
+                files.push(file);
+            }
+        }
         files.sort();
         directories.insert(directory, files);
     }
@@ -134,16 +136,12 @@ fn discover_uploads(root: &Path) -> Result<UploadDiscovery, AppError> {
     })
 }
 
-fn is_real_directory(path: &Path) -> bool {
-    fs::symlink_metadata(path)
-        .map(|metadata| metadata.file_type().is_dir())
-        .unwrap_or(false)
+fn is_real_directory(path: &Path) -> Result<bool, AppError> {
+    Ok(fs::symlink_metadata(path)?.file_type().is_dir())
 }
 
-fn is_regular_file(path: &Path) -> bool {
-    fs::symlink_metadata(path)
-        .map(|metadata| metadata.file_type().is_file())
-        .unwrap_or(false)
+fn is_regular_file(path: &Path) -> Result<bool, AppError> {
+    Ok(fs::symlink_metadata(path)?.file_type().is_file())
 }
 
 #[derive(Clone, Debug)]

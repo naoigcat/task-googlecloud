@@ -7,7 +7,8 @@ use std::sync::{Arc, atomic::AtomicBool};
 use std::thread;
 
 use super::{
-    MAX_OBJECT_NAME_BYTES, PlannedUpload, plan_uploads, staging_path, upload_planned_files,
+    MAX_OBJECT_NAME_BYTES, PlannedUpload, is_real_directory, is_regular_file, plan_uploads,
+    staging_path, upload_planned_files,
 };
 use crate::InterruptFlag;
 use crate::cloud::Cloud;
@@ -211,6 +212,20 @@ fn plans_uploads_from_discovery_alone() {
         uploads[0].staging.uri(),
         format!("gs://bucket/{STAGING_PREFIX}/\u{e9}.txt")
     );
+}
+
+#[test]
+fn propagates_upload_metadata_errors() {
+    let invalid_path = Path::new("\0");
+
+    assert!(matches!(
+        is_real_directory(invalid_path),
+        Err(AppError::Io(error)) if error.kind() == std::io::ErrorKind::InvalidInput
+    ));
+    assert!(matches!(
+        is_regular_file(invalid_path),
+        Err(AppError::Io(error)) if error.kind() == std::io::ErrorKind::InvalidInput
+    ));
 }
 
 #[test]
