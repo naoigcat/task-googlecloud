@@ -99,11 +99,11 @@ impl AppError {
     /// Whether the failure may have left Cloud Storage changed. Upload-source
     /// failures, pre-request interruptions, and token failures before any
     /// request cannot have; token failures after an earlier request are marked
-    /// as reached.
-    pub(crate) fn reached_storage(&self) -> bool {
+    /// as possibly reached.
+    pub(crate) fn may_have_reached_storage(&self) -> bool {
         match self {
             Self::UploadSource(_) | Self::Command { .. } | Self::Interrupted => false,
-            Self::Token(_, reached_storage) => *reached_storage,
+            Self::Token(_, may_have_reached_storage) => *may_have_reached_storage,
             _ => true,
         }
     }
@@ -146,7 +146,7 @@ impl AppError {
         Self::Token(Box::new(error), false)
     }
 
-    pub(crate) fn mark_reached_storage(self) -> Self {
+    pub(crate) fn mark_storage_reached(self) -> Self {
         match self {
             Self::Token(error, _) => Self::Token(error, true),
             error => error,

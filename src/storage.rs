@@ -218,7 +218,7 @@ impl StorageApi {
                 return Err(AppError::BucketLockConflict(Box::new(error)));
             }
             Ok(metadata) => metadata,
-            Err(error) if error.reached_storage() => {
+            Err(error) if error.may_have_reached_storage() => {
                 self.transport.clear_interrupt_for_rollback();
                 match self.recover_unacknowledged_bucket_lock(&object, &token) {
                     Ok(()) => return Err(error),
@@ -484,7 +484,7 @@ impl StorageApi {
                 )
                 .map_err(|error| {
                     if request_sent {
-                        error.mark_reached_storage()
+                        error.mark_storage_reached()
                     } else {
                         error
                     }
@@ -557,7 +557,7 @@ impl StorageApi {
         // failures must remain recoverable.
         let details = match self
             .object_details(object)
-            .map_err(AppError::mark_reached_storage)
+            .map_err(AppError::mark_storage_reached)
         {
             Ok(details) => Ok(details),
             Err(error) if propagate_interrupt && error.is_interrupted() => return Err(error),
@@ -652,7 +652,7 @@ impl StorageClient for StorageApi {
         operation: &AppError,
     ) -> Result<(), AppError> {
         // Nothing was sent, so neither object can have moved.
-        if !operation.reached_storage() {
+        if !operation.may_have_reached_storage() {
             return Ok(());
         }
 
@@ -681,7 +681,7 @@ impl StorageClient for StorageApi {
     ) -> Result<(), AppError> {
         // Nothing was sent, so the target cannot exist and asking would only
         // turn a local failure into a spurious manual recovery.
-        if !operation.reached_storage() {
+        if !operation.may_have_reached_storage() {
             return Ok(());
         }
 
@@ -800,10 +800,10 @@ impl StorageApi {
         let result = (|| {
             self.confirm_move_generation(target, &target_generation, "move object")?;
             self.delete_object(source, &source_generation)
-                .map_err(AppError::mark_reached_storage)?;
+                .map_err(AppError::mark_storage_reached)?;
             let source_state = self
                 .object_state(source, None)
-                .map_err(AppError::mark_reached_storage)?;
+                .map_err(AppError::mark_storage_reached)?;
             self.confirm_move_generation(target, &target_generation, "move object")?;
             if source_state != ObjectState::Missing {
                 return Err(AppError::Message(format!(
@@ -871,10 +871,10 @@ impl StorageApi {
             self.copy_object_unlocked(target, source, Some(target_generation), Some("0"))?;
         self.confirm_object_generation(source, &source_generation, "rollback object")?;
         self.delete_object(target, target_generation)
-            .map_err(AppError::mark_reached_storage)?;
+            .map_err(AppError::mark_storage_reached)?;
         let target_state = self
             .object_state(target, None)
-            .map_err(AppError::mark_reached_storage)?;
+            .map_err(AppError::mark_storage_reached)?;
         self.confirm_object_generation(source, &source_generation, "rollback object")?;
         if target_state != ObjectState::Missing {
             return Err(AppError::Message(format!(
@@ -895,12 +895,12 @@ impl StorageApi {
         match self.object_state(target, Some(target_generation))? {
             ObjectState::Present => self
                 .delete_object(target, target_generation)
-                .map_err(AppError::mark_reached_storage)?,
+                .map_err(AppError::mark_storage_reached)?,
             ObjectState::Missing => {}
         }
         if self
             .object_state(target, None)
-            .map_err(AppError::mark_reached_storage)?
+            .map_err(AppError::mark_storage_reached)?
             != ObjectState::Missing
         {
             return Err(AppError::Message(format!(

@@ -305,7 +305,7 @@ fn distinguishes_interrupts_before_and_after_a_storage_request() {
         .unwrap_err();
 
     assert!(matches!(&before_request, super::AppError::Interrupted));
-    assert!(!before_request.reached_storage());
+    assert!(!before_request.may_have_reached_storage());
     assert!(!before_request.may_have_sent_storage_request());
 
     let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
@@ -354,7 +354,7 @@ fn distinguishes_interrupts_before_and_after_a_storage_request() {
         &after_request,
         super::AppError::InterruptedAfterRequest
     ));
-    assert!(after_request.reached_storage());
+    assert!(after_request.may_have_reached_storage());
     assert!(after_request.may_have_sent_storage_request());
 }
 
