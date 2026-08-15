@@ -50,12 +50,6 @@ const PATH_SEGMENT: &AsciiSet = &CONTROLS
     .add(b'}');
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-/// Metadata needed to identify one immutable Cloud Storage object version.
-pub struct ObjectMetadata {
-    pub generation: String,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
 /// Result of an object lookup, retaining the generation of the observed version.
 enum ObjectState {
     Present { generation: String },
@@ -226,7 +220,7 @@ impl StorageApi {
         let object = ObjectPath::from_parts(bucket, BUCKET_LOCK_OBJECT);
         let token = uuid::Uuid::new_v4().simple().to_string();
         let url = with_query(
-            format!("{}/b/{}/o", self.transport.upload_base(), encode(bucket)),
+            bucket_objects_url(self.transport.upload_base(), bucket),
             [
                 ("uploadType", "media"),
                 ("name", BUCKET_LOCK_OBJECT),
@@ -278,7 +272,7 @@ impl StorageApi {
         if body != token.as_bytes() {
             return Ok(());
         }
-        let generation = self.object_metadata(object, None)?.generation;
+        let generation = self.object_generation(object, None)?;
         self.delete_object(object, &generation)
     }
 
@@ -427,11 +421,11 @@ impl StorageApi {
         Ok(())
     }
 
-    fn object_metadata(
+    fn object_generation(
         &self,
         object: &ObjectPath,
         generation: Option<&str>,
-    ) -> Result<ObjectMetadata, AppError> {
+    ) -> Result<String, AppError> {
         let mut url = object_url(self.transport.api_base(), object);
         if let Some(generation) = generation {
             url = with_query(url, [("generation", generation)]);
@@ -440,9 +434,7 @@ impl StorageApi {
             self.transport.client().get(url),
             "Invalid Cloud Storage metadata",
         )?;
-        Ok(ObjectMetadata {
-            generation: metadata.generation,
-        })
+        Ok(metadata.generation)
     }
 
     fn object_state(
@@ -450,8 +442,8 @@ impl StorageApi {
         object: &ObjectPath,
         generation: Option<&str>,
     ) -> Result<ObjectState, AppError> {
-        match self.object_metadata(object, generation) {
-            Ok(metadata) => Ok(ObjectState::present(metadata.generation)),
+        match self.object_generation(object, generation) {
+            Ok(generation) => Ok(ObjectState::present(generation)),
             Err(error) if error.status() == Some(404) => Ok(ObjectState::missing()),
             Err(error) => Err(error),
         }
@@ -750,11 +742,7 @@ impl StorageApi {
         let size = file.metadata().map_err(AppError::UploadSource)?.len();
         self.with_object_locks(&[target], || {
             let url = with_query(
-                format!(
-                    "{}/b/{}/o",
-                    self.transport.upload_base(),
-                    encode(&target.bucket)
-                ),
+                bucket_objects_url(self.transport.upload_base(), &target.bucket),
                 [
                     ("uploadType", "media"),
                     ("name", target.object.as_str()),
@@ -787,10 +775,7 @@ impl StorageApi {
             if let Some(page_token) = &page_token {
                 query.push(("pageToken", page_token.as_str()));
             }
-            let url = with_query(
-                format!("{}/b/{}/o", self.transport.api_base(), encode(bucket)),
-                query,
-            );
+            let url = with_query(bucket_objects_url(self.transport.api_base(), bucket), query);
             let listing: ListResponse = self.transport.send_json(
                 self.transport.client().get(url),
                 "Invalid Cloud Storage list response",
@@ -822,7 +807,7 @@ impl StorageApi {
         // treat as a move even when a response is lost between requests.
         let source_generation = match expected_source_generation {
             Some(generation) => generation.to_string(),
-            None => self.object_metadata(source, None)?.generation,
+            None => self.object_generation(source, None)?,
         };
         let target_generation =
             self.copy_object_unlocked(source, target, Some(&source_generation), Some("0"))?;
@@ -989,6 +974,10 @@ fn object_url(base: &str, object: &ObjectPath) -> String {
         encode(&object.bucket),
         encode(&object.object)
     )
+}
+
+fn bucket_objects_url(base: &str, bucket: &str) -> String {
+    format!("{base}/b/{}/o", encode(bucket))
 }
 
 fn rewrite_url(base: &str, source: &ObjectPath, target: &ObjectPath) -> String {
