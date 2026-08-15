@@ -1,3 +1,4 @@
+use crate::InterruptFlag;
 use crate::error::AppError;
 use crate::storage::{ObjectPath, StorageClient};
 
@@ -7,6 +8,57 @@ pub struct RemoteChange {
     pub source: ObjectPath,
     pub target: ObjectPath,
     pub generation: String,
+}
+
+#[derive(Default)]
+pub(crate) struct RemoteTransaction {
+    staged: Vec<RemoteChange>,
+    finalized: Vec<RemoteChange>,
+}
+
+impl RemoteTransaction {
+    pub(crate) fn new() -> Self {
+        Self::default()
+    }
+
+    pub(crate) fn stage(&mut self, change: RemoteChange) {
+        self.staged.push(change);
+    }
+
+    pub(crate) fn staged(&self) -> &[RemoteChange] {
+        &self.staged
+    }
+
+    pub(crate) fn finalized(&self) -> &[RemoteChange] {
+        &self.finalized
+    }
+
+    /// Finalizes each staged change while retaining enough state to roll it
+    /// back if the finalization or its interrupt boundary fails.
+    pub(crate) fn finalize<F>(
+        &mut self,
+        interrupt: &InterruptFlag,
+        mut operation: F,
+    ) -> Result<(), AppError>
+    where
+        F: FnMut(usize, &RemoteChange) -> Result<RemoteChange, AppError>,
+    {
+        for index in 0..self.staged.len() {
+            let staged = self.staged[index].clone();
+            let finalized = match operation(index, &staged) {
+                Ok(finalized) => finalized,
+                Err(error) => {
+                    if let Some(restored_generation) = error.restored_move_generation() {
+                        self.staged[index].generation = restored_generation.to_string();
+                    }
+                    return Err(error);
+                }
+            };
+            self.finalized.push(finalized);
+            interrupt.check()?;
+        }
+        Ok(())
+    }
 }
 
 pub(crate) fn rollback_moves<S: StorageClient>(
@@ -41,3 +93,7 @@ pub(crate) fn rollback_moves<S: StorageClient>(
     }
     errors
 }
+
+#[cfg(test)]
+#[path = "../tests/unit/transaction.rs"]
+mod tests;

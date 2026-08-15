@@ -4,7 +4,7 @@ use crate::error::AppError;
 use crate::normalization_plan;
 use crate::object_move;
 use crate::storage::{ObjectPath, StorageClient};
-use crate::transaction::{RemoteChange, rollback_moves};
+use crate::transaction::{RemoteChange, RemoteTransaction, rollback_moves};
 
 #[cfg(test)]
 pub(crate) use crate::object_path::MAX_OBJECT_NAME_BYTES;
@@ -92,8 +92,7 @@ fn process_moves_unlocked<S: StorageClient>(
     interrupt: &InterruptFlag,
     moves: &[PlannedMove],
 ) -> Result<(), AppError> {
-    let mut staged = Vec::new();
-    let mut finalized = Vec::new();
+    let mut transaction = RemoteTransaction::new();
 
     let operation = (|| {
         // Separate staging from finalization so no finalization depends on a
@@ -106,7 +105,7 @@ fn process_moves_unlocked<S: StorageClient>(
                 &planned.temporary,
                 None,
             )?;
-            staged.push(RemoteChange {
+            transaction.stage(RemoteChange {
                 source: planned.source.clone(),
                 target: planned.temporary.clone(),
                 generation,
@@ -114,29 +113,21 @@ fn process_moves_unlocked<S: StorageClient>(
             interrupt.check()?;
         }
 
-        for (change, planned) in staged.iter_mut().zip(moves) {
-            let generation = match object_move::execute(
+        transaction.finalize(interrupt, |index, change| {
+            let planned = &moves[index];
+            let generation = object_move::execute(
                 storage,
                 interrupt,
                 &change.target,
                 &planned.target,
                 Some(&change.generation),
-            ) {
-                Ok(generation) => generation,
-                Err(error) => {
-                    if let Some(restored_generation) = error.restored_move_generation() {
-                        change.generation = restored_generation.to_string();
-                    }
-                    return Err(error);
-                }
-            };
-            finalized.push(RemoteChange {
+            )?;
+            Ok(RemoteChange {
                 source: change.source.clone(),
                 target: planned.target.clone(),
                 generation,
-            });
-            interrupt.check()?;
-        }
+            })
+        })?;
         Ok::<(), AppError>(())
     })();
 
@@ -146,7 +137,7 @@ fn process_moves_unlocked<S: StorageClient>(
             interrupt.clear_for_rollback();
             Err(AppError::rollback(
                 error,
-                rollback_moves(storage, &staged, &finalized),
+                rollback_moves(storage, transaction.staged(), transaction.finalized()),
             ))
         }
     }

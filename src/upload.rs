@@ -12,7 +12,7 @@ use crate::local;
 use crate::normalization_plan;
 use crate::object_move;
 use crate::storage::{ObjectPath, StorageClient, UPLOAD_ROOT};
-use crate::transaction::RemoteChange;
+use crate::transaction::{RemoteChange, RemoteTransaction};
 use crate::upload_source::UploadSourceIdentity;
 
 #[cfg(test)]
@@ -330,8 +330,7 @@ fn upload_planned_files_unlocked<S: StorageClient>(
     interrupt: &InterruptFlag,
     uploads: &[PlannedDirectoryUploads],
 ) -> Result<(), AppError> {
-    let mut staged = Vec::new();
-    let mut finalized = Vec::new();
+    let mut transaction = RemoteTransaction::new();
 
     let operation = (|| {
         // Upload everything to private staging names first. Finalization is
@@ -355,7 +354,7 @@ fn upload_planned_files_unlocked<S: StorageClient>(
                         &upload.staging,
                     )?,
                 };
-                staged.push(RemoteChange {
+                transaction.stage(RemoteChange {
                     source: upload.staging.clone(),
                     target: upload.target.clone(),
                     generation,
@@ -364,29 +363,20 @@ fn upload_planned_files_unlocked<S: StorageClient>(
             }
         }
 
-        for change in &mut staged {
-            let generation = match object_move::execute(
+        transaction.finalize(interrupt, |_, change| {
+            let generation = object_move::execute(
                 storage,
                 interrupt,
                 &change.source,
                 &change.target,
                 Some(&change.generation),
-            ) {
-                Ok(generation) => generation,
-                Err(error) => {
-                    if let Some(restored_generation) = error.restored_move_generation() {
-                        change.generation = restored_generation.to_string();
-                    }
-                    return Err(error);
-                }
-            };
-            finalized.push(RemoteChange {
+            )?;
+            Ok(RemoteChange {
                 source: change.source.clone(),
                 target: change.target.clone(),
                 generation,
-            });
-            interrupt.check()?;
-        }
+            })
+        })?;
         Ok::<(), AppError>(())
     })();
 
@@ -396,7 +386,7 @@ fn upload_planned_files_unlocked<S: StorageClient>(
             interrupt.clear_for_rollback();
             Err(AppError::rollback(
                 error,
-                rollback_remote(storage, &staged, &finalized),
+                rollback_remote(storage, transaction.staged(), transaction.finalized()),
             ))
         }
     }
