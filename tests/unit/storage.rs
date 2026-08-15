@@ -138,12 +138,18 @@ fn interrupts_a_blocking_cloud_storage_request() {
     let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
     let base = format!("http://{}/storage/v1", listener.local_addr().unwrap());
     let (request_sender, request_received) = mpsc::channel();
-    let (release_sender, release_server) = mpsc::channel();
     let server = thread::spawn(move || {
+        let (mut lock_stream, _) = listener.accept().unwrap();
+        read_headers(&mut lock_stream);
+        write_json(&mut lock_stream, r#"{"generation":"lock"}"#);
+
         let (mut stream, _) = listener.accept().unwrap();
         read_headers(&mut stream);
         request_sender.send(()).unwrap();
-        release_server.recv().unwrap();
+
+        let (mut release_stream, _) = listener.accept().unwrap();
+        read_headers(&mut release_stream);
+        write_json(&mut release_stream, "{}");
     });
     let interrupted = Arc::new(AtomicBool::new(false));
     let interrupt = super::InterruptFlag::from_atomic(Arc::clone(&interrupted));
@@ -171,7 +177,6 @@ fn interrupts_a_blocking_cloud_storage_request() {
     assert!(started.elapsed() < Duration::from_millis(500));
     assert!(matches!(result, Err(super::AppError::Interrupted)));
     request.join().unwrap();
-    release_sender.send(()).unwrap();
     server.join().unwrap();
 }
 

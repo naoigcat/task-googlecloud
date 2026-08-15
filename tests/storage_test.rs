@@ -2,7 +2,7 @@ use std::env;
 use std::ffi::OsString;
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, atomic::AtomicBool};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
@@ -63,6 +63,17 @@ fn incomplete_response_server() -> (String, Arc<Mutex<Vec<String>>>, JoinHandle<
     let requests = Arc::new(Mutex::new(Vec::new()));
     let recorded_requests = Arc::clone(&requests);
     let handle = thread::spawn(move || {
+        let mut stream = accept_connection(&listener, SERVER_TIMEOUT).unwrap();
+        recorded_requests
+            .lock()
+            .unwrap()
+            .push(read_request(&mut stream));
+        stream
+            .write_all(
+                b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 21\r\nConnection: close\r\n\r\n{\"generation\":\"lock\"}",
+            )
+            .unwrap();
+
         let mut stream = accept_connection(&listener, SERVER_TIMEOUT).unwrap();
         recorded_requests
             .lock()
@@ -332,23 +343,29 @@ fn refuses_to_modify_the_reserved_bucket_lock_object() {
 
 #[test]
 fn lists_empty_and_paginated_responses() {
-    let (base, requests, server) = test_server(vec![(200, "{}".to_string())]);
+    let (base, requests, server) = test_server(vec![
+        bucket_lock_created(),
+        (200, "{}".to_string()),
+        bucket_lock_deleted(),
+    ]);
     let objects = storage(&base).list_objects("bucket").unwrap();
     server.join().unwrap();
     assert!(objects.is_empty());
     let requests = requests.lock().unwrap();
-    assert_eq!(requests.len(), 1);
+    assert_eq!(requests.len(), 3);
     assert_eq!(
-        request_line(&requests[0]),
+        request_line(&requests[1]),
         "GET /storage/v1/b/bucket/o?maxResults=1000 HTTP/1.1"
     );
 
     let (base, requests, server) = test_server(vec![
+        bucket_lock_created(),
         (
             200,
             r#"{"items":[{"name":"folder*?[]#/é.txt"},{"name":".task-googlecloud-lock"}],"nextPageToken":"next"}"#.to_string(),
         ),
         (200, r#"{"items":[{"name":"plain.txt"}]}"#.to_string()),
+        bucket_lock_deleted(),
     ]);
     let objects = storage(&base).list_objects("bucket").unwrap();
     server.join().unwrap();
@@ -361,17 +378,17 @@ fn lists_empty_and_paginated_responses() {
         ]
     );
     let requests = requests.lock().unwrap();
-    assert_eq!(requests.len(), 2);
+    assert_eq!(requests.len(), 4);
     assert_eq!(
-        request_line(&requests[0]),
+        request_line(&requests[1]),
         "GET /storage/v1/b/bucket/o?maxResults=1000 HTTP/1.1"
     );
     assert_eq!(
-        request_line(&requests[1]),
+        request_line(&requests[2]),
         "GET /storage/v1/b/bucket/o?maxResults=1000&pageToken=next HTTP/1.1"
     );
     assert!(
-        requests[0]
+        requests[1]
             .to_ascii_lowercase()
             .contains("authorization: bearer token")
     );
@@ -379,19 +396,23 @@ fn lists_empty_and_paginated_responses() {
 
 #[test]
 fn reports_api_error_messages() {
-    let (base, requests, server) = test_server(vec![(
-        403,
-        r#"{"error":{"message":"permission denied"}}"#.to_string(),
-    )]);
+    let (base, requests, server) = test_server(vec![
+        bucket_lock_created(),
+        (
+            403,
+            r#"{"error":{"message":"permission denied"}}"#.to_string(),
+        ),
+        bucket_lock_deleted(),
+    ]);
 
     let error = storage(&base).list_objects("bucket").unwrap_err();
     server.join().unwrap();
 
     assert!(error.to_string().contains("permission denied"));
     let requests = requests.lock().unwrap();
-    assert_eq!(requests.len(), 1);
+    assert_eq!(requests.len(), 3);
     assert_eq!(
-        request_line(&requests[0]),
+        request_line(&requests[1]),
         "GET /storage/v1/b/bucket/o?maxResults=1000 HTTP/1.1"
     );
 }
@@ -667,6 +688,67 @@ fn moves_objects_using_the_expected_source_generation() {
     );
     assert_eq!(
         request_line(&requests[6]),
+        "DELETE /storage/v1/b/bucket/o/.task-googlecloud-lock?generation=lock HTTP/1.1"
+    );
+}
+
+#[test]
+fn keeps_one_bucket_lock_for_all_moves_in_a_transaction() {
+    let mut responses = vec![bucket_lock_created()];
+    for (source_generation, staged_generation) in [("11", "12"), ("21", "22")] {
+        responses.extend([
+            (200, format!(r#"{{"generation":"{source_generation}"}}"#)),
+            (
+                200,
+                format!(r#"{{"done":true,"resource":{{"generation":"{staged_generation}"}}}}"#),
+            ),
+            (200, format!(r#"{{"generation":"{staged_generation}"}}"#)),
+            (200, "{}".to_string()),
+            (404, "{}".to_string()),
+            (200, format!(r#"{{"generation":"{staged_generation}"}}"#)),
+        ]);
+    }
+    for finalized_generation in ["13", "23"] {
+        responses.extend([
+            (
+                200,
+                format!(r#"{{"done":true,"resource":{{"generation":"{finalized_generation}"}}}}"#),
+            ),
+            (200, format!(r#"{{"generation":"{finalized_generation}"}}"#)),
+            (200, "{}".to_string()),
+            (404, "{}".to_string()),
+            (200, format!(r#"{{"generation":"{finalized_generation}"}}"#)),
+        ]);
+    }
+    responses.push(bucket_lock_deleted());
+
+    let (base, requests, server) = test_server(responses);
+    let storage = storage(&base);
+    let interrupt = InterruptFlag::from_atomic(Arc::new(AtomicBool::new(false)));
+    let moves = vec![
+        (
+            ObjectPath::parse("gs://bucket/first-source").unwrap(),
+            ObjectPath::parse("gs://bucket/first-target").unwrap(),
+            ObjectPath::parse("gs://bucket/first-temporary").unwrap(),
+        ),
+        (
+            ObjectPath::parse("gs://bucket/second-source").unwrap(),
+            ObjectPath::parse("gs://bucket/second-target").unwrap(),
+            ObjectPath::parse("gs://bucket/second-temporary").unwrap(),
+        ),
+    ];
+
+    process_moves(&storage, &interrupt, moves).unwrap();
+    server.join().unwrap();
+
+    let requests = requests.lock().unwrap();
+    assert_eq!(requests.len(), 24);
+    assert_eq!(
+        request_line(&requests[0]),
+        "POST /storage/v1/b/bucket/o?uploadType=media&name=.task-googlecloud-lock&ifGenerationMatch=0 HTTP/1.1"
+    );
+    assert_eq!(
+        request_line(&requests[23]),
         "DELETE /storage/v1/b/bucket/o/.task-googlecloud-lock?generation=lock HTTP/1.1"
     );
 }
@@ -1409,11 +1491,14 @@ fn reports_an_incomplete_http_response() {
     let error = storage(&base).list_objects("bucket").unwrap_err();
     server.join().unwrap();
 
-    assert!(matches!(error, AppError::Http(_)));
+    assert!(matches!(
+        error,
+        AppError::Rollback { original, .. } if matches!(*original, AppError::Http(_))
+    ));
     let requests = requests.lock().unwrap();
-    assert_eq!(requests.len(), 1);
+    assert_eq!(requests.len(), 2);
     assert_eq!(
-        request_line(&requests[0]),
+        request_line(&requests[1]),
         "GET /storage/v1/b/bucket/o?maxResults=1000 HTTP/1.1"
     );
 }

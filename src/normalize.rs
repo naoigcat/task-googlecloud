@@ -17,10 +17,12 @@ pub fn run<S: StorageClient>(
 ) -> Result<(), AppError> {
     cloud.login()?;
     cloud.set_project(project)?;
-    let files = storage.list_objects(bucket)?;
-    let plan = normalization_plan::build(&files)?;
-    let moves = plan_moves(plan)?;
-    process_moves(storage, interrupt, moves)
+    storage.with_bucket_locks(&[bucket], || {
+        let files = storage.list_objects(bucket)?;
+        let plan = normalization_plan::build(&files)?;
+        let moves = plan_moves(plan)?;
+        process_moves_unlocked(storage, interrupt, moves)
+    })
 }
 
 fn plan_moves(
@@ -49,6 +51,27 @@ fn validate_target_path(target: &ObjectPath) -> Result<(), AppError> {
 }
 
 pub fn process_moves<S: StorageClient>(
+    storage: &S,
+    interrupt: &InterruptFlag,
+    moves: Vec<(ObjectPath, ObjectPath, ObjectPath)>,
+) -> Result<(), AppError> {
+    let bucket_names = moves
+        .iter()
+        .flat_map(|(source, target, temporary)| {
+            [
+                source.bucket.clone(),
+                target.bucket.clone(),
+                temporary.bucket.clone(),
+            ]
+        })
+        .collect::<Vec<_>>();
+    let buckets = bucket_names.iter().map(String::as_str).collect::<Vec<_>>();
+    storage.with_bucket_locks(&buckets, || {
+        process_moves_unlocked(storage, interrupt, moves)
+    })
+}
+
+fn process_moves_unlocked<S: StorageClient>(
     storage: &S,
     interrupt: &InterruptFlag,
     moves: Vec<(ObjectPath, ObjectPath, ObjectPath)>,

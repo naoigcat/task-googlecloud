@@ -1,4 +1,4 @@
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::{BTreeMap, HashMap};
 use std::io::{Read, Write};
 use std::net::TcpListener;
@@ -69,6 +69,9 @@ fn lock_conflict_server() -> (
 
 struct FakeStorage {
     move_generations: RefCell<Vec<Option<String>>>,
+    lock_calls: Cell<usize>,
+    active_lock: Cell<bool>,
+    calls_outside_lock: Cell<usize>,
 }
 
 impl StorageClient for FakeStorage {
@@ -77,6 +80,7 @@ impl StorageClient for FakeStorage {
     }
 
     fn upload_file(&self, _source: &Path, _target: &ObjectPath) -> Result<String, AppError> {
+        self.record_remote_call();
         Ok("101".to_string())
     }
 
@@ -86,6 +90,7 @@ impl StorageClient for FakeStorage {
         _target: &ObjectPath,
         expected_source_generation: Option<&str>,
     ) -> Result<String, AppError> {
+        self.record_remote_call();
         self.move_generations
             .borrow_mut()
             .push(expected_source_generation.map(str::to_string));
@@ -98,6 +103,7 @@ impl StorageClient for FakeStorage {
         _target: &ObjectPath,
         _target_generation: &str,
     ) -> Result<String, AppError> {
+        self.record_remote_call();
         Ok("rollback".to_string())
     }
 
@@ -106,6 +112,7 @@ impl StorageClient for FakeStorage {
         _target: &ObjectPath,
         _target_generation: &str,
     ) -> Result<(), AppError> {
+        self.record_remote_call();
         Ok(())
     }
 
@@ -125,12 +132,35 @@ impl StorageClient for FakeStorage {
     ) -> Result<(), AppError> {
         Ok(())
     }
+
+    fn with_bucket_locks<T, F>(&self, _buckets: &[&str], operation: F) -> Result<T, AppError>
+    where
+        F: FnOnce() -> Result<T, AppError>,
+    {
+        self.lock_calls.set(self.lock_calls.get() + 1);
+        self.active_lock.set(true);
+        let result = operation();
+        self.active_lock.set(false);
+        result
+    }
+}
+
+impl FakeStorage {
+    fn record_remote_call(&self) {
+        if !self.active_lock.get() {
+            self.calls_outside_lock
+                .set(self.calls_outside_lock.get() + 1);
+        }
+    }
 }
 
 #[test]
 fn finalizes_uploaded_objects_using_their_uploaded_generation() {
     let storage = FakeStorage {
         move_generations: RefCell::new(Vec::new()),
+        lock_calls: Cell::new(0),
+        active_lock: Cell::new(false),
+        calls_outside_lock: Cell::new(0),
     };
     let interrupt = InterruptFlag::from_atomic(Arc::new(AtomicBool::new(false)));
     let staging = ObjectPath::parse("gs://bucket/.task-googlecloud-staging/file").unwrap();
@@ -150,6 +180,8 @@ fn finalizes_uploaded_objects_using_their_uploaded_generation() {
         *storage.move_generations.borrow(),
         vec![Some("101".to_string())]
     );
+    assert_eq!(storage.lock_calls.get(), 1);
+    assert_eq!(storage.calls_outside_lock.get(), 0);
 }
 
 #[test]

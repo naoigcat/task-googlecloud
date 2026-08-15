@@ -22,49 +22,65 @@ pub fn run<S: StorageClient>(
     let files_by_directory = discovery.files_by_directory;
     let expected_root = discovery.root_identity;
     storage.set_upload_root_identity(expected_root)?;
-    let files = files_by_directory
-        .values()
-        .flatten()
-        .cloned()
-        .collect::<Vec<_>>();
-    let names = files
-        .iter()
-        .map(|file| local::path_string(file))
+    let bucket_names = files_by_directory
+        .keys()
+        .map(|directory| {
+            directory
+                .file_name()
+                .and_then(|name| name.to_str())
+                .map(str::to_string)
+                .ok_or_else(|| {
+                    AppError::Message(format!("Directory is not valid UTF-8: {directory:?}"))
+                })
+        })
         .collect::<Result<Vec<_>, _>>()?;
-    let plan = normalization_plan::build(&names)?;
-    // Derive every object name while the run is still a no-op, so a name Cloud
-    // Storage cannot accept stops it before any file is renamed or uploaded.
-    let planned_names = plan
-        .iter()
-        .map(|entry| (PathBuf::from(&entry.source), PathBuf::from(&entry.target)))
-        .collect::<HashMap<_, _>>();
-    let uploads = plan_uploads(&files_by_directory, &planned_names, &staging_prefix())?;
+    let buckets = bucket_names.iter().map(String::as_str).collect::<Vec<_>>();
 
-    cloud.login()?;
-    cloud.set_project(project)?;
+    storage.with_bucket_locks(&buckets, || {
+        let files = files_by_directory
+            .values()
+            .flatten()
+            .cloned()
+            .collect::<Vec<_>>();
+        let names = files
+            .iter()
+            .map(|file| local::path_string(file))
+            .collect::<Result<Vec<_>, _>>()?;
+        let plan = normalization_plan::build(&names)?;
+        // Derive every object name while the run is still a no-op, so a name Cloud
+        // Storage cannot accept stops it before any file is renamed or uploaded.
+        let planned_names = plan
+            .iter()
+            .map(|entry| (PathBuf::from(&entry.source), PathBuf::from(&entry.target)))
+            .collect::<HashMap<_, _>>();
+        let uploads = plan_uploads(&files_by_directory, &planned_names, &staging_prefix())?;
 
-    let normalized_files = local::apply_normalization_with_identity(
-        Path::new(UPLOAD_ROOT),
-        &plan,
-        expected_root,
-        interrupt,
-    )?;
+        cloud.login()?;
+        cloud.set_project(project)?;
 
-    let result = upload_planned_files(storage, interrupt, &uploads);
-    match result {
-        Ok(()) => Ok(()),
-        Err(error) => {
-            let errors = local::rollback_normalization_with_identity(
-                Path::new(UPLOAD_ROOT),
-                expected_root,
-                &normalized_files
-                    .iter()
-                    .map(|(source, target)| (source.clone(), target.clone()))
-                    .collect::<Vec<_>>(),
-            );
-            Err(AppError::rollback(error, errors))
+        let normalized_files = local::apply_normalization_with_identity(
+            Path::new(UPLOAD_ROOT),
+            &plan,
+            expected_root,
+            interrupt,
+        )?;
+
+        let result = upload_planned_files_unlocked(storage, interrupt, &uploads);
+        match result {
+            Ok(()) => Ok(()),
+            Err(error) => {
+                let errors = local::rollback_normalization_with_identity(
+                    Path::new(UPLOAD_ROOT),
+                    expected_root,
+                    &normalized_files
+                        .iter()
+                        .map(|(source, target)| (source.clone(), target.clone()))
+                        .collect::<Vec<_>>(),
+                );
+                Err(AppError::rollback(error, errors))
+            }
         }
-    }
+    })
 }
 
 struct UploadDiscovery {
@@ -193,7 +209,23 @@ fn plan_uploads(
     Ok(planned)
 }
 
+#[cfg(test)]
 fn upload_planned_files<S: StorageClient>(
+    storage: &S,
+    interrupt: &InterruptFlag,
+    uploads: &[(PathBuf, Vec<PlannedUpload>)],
+) -> Result<(), AppError> {
+    let bucket_names = uploads
+        .iter()
+        .flat_map(|(_, uploads)| uploads.iter().map(|upload| upload.target.bucket.clone()))
+        .collect::<Vec<_>>();
+    let buckets = bucket_names.iter().map(String::as_str).collect::<Vec<_>>();
+    storage.with_bucket_locks(&buckets, || {
+        upload_planned_files_unlocked(storage, interrupt, uploads)
+    })
+}
+
+fn upload_planned_files_unlocked<S: StorageClient>(
     storage: &S,
     interrupt: &InterruptFlag,
     uploads: &[(PathBuf, Vec<PlannedUpload>)],

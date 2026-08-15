@@ -1,5 +1,7 @@
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
+use std::thread::{self, ThreadId};
 use std::time::Duration;
 
 use percent_encoding::{AsciiSet, CONTROLS, utf8_percent_encode};
@@ -98,6 +100,12 @@ struct BucketLock {
 
 pub trait StorageClient {
     fn list_objects(&self, bucket: &str) -> Result<Vec<String>, AppError>;
+    fn with_bucket_locks<T, F>(&self, _buckets: &[&str], operation: F) -> Result<T, AppError>
+    where
+        F: FnOnce() -> Result<T, AppError>,
+    {
+        operation()
+    }
     fn set_upload_root_identity(
         &self,
         _identity: Option<DirectoryIdentity>,
@@ -142,6 +150,7 @@ pub struct StorageApi {
     upload_base: String,
     upload_root: Option<PathBuf>,
     upload_root_identity: Mutex<Option<DirectoryIdentity>>,
+    active_bucket_locks: Mutex<HashMap<ThreadId, Vec<String>>>,
 }
 
 impl StorageApi {
@@ -202,6 +211,7 @@ impl StorageApi {
             upload_base: upload_base.into(),
             upload_root: None,
             upload_root_identity: Mutex::new(None),
+            active_bucket_locks: Mutex::new(HashMap::new()),
         }
     }
 
@@ -370,8 +380,25 @@ impl StorageApi {
         bucket_names.sort_unstable();
         bucket_names.dedup();
 
-        let mut locks = Vec::with_capacity(bucket_names.len());
-        for bucket in bucket_names {
+        let owner = thread::current().id();
+        let held_buckets = self
+            .active_bucket_locks
+            .lock()
+            .map_err(|_| AppError::Message("Active bucket lock state is poisoned".to_string()))?
+            .get(&owner)
+            .cloned()
+            .unwrap_or_default();
+        let buckets_to_acquire = bucket_names
+            .iter()
+            .copied()
+            .filter(|bucket| !held_buckets.iter().any(|held| held == bucket))
+            .collect::<Vec<_>>();
+        if buckets_to_acquire.is_empty() {
+            return operation();
+        }
+
+        let mut locks = Vec::with_capacity(buckets_to_acquire.len());
+        for bucket in &buckets_to_acquire {
             match self.acquire_bucket_lock(bucket) {
                 Ok(lock) => locks.push(lock),
                 Err(error) => {
@@ -381,9 +408,18 @@ impl StorageApi {
             }
         }
 
+        if let Err(error) = self.register_active_bucket_locks(owner, &buckets_to_acquire) {
+            self.clear_interrupt_for_rollback();
+            return Err(AppError::rollback(error, self.release_bucket_locks(&locks)));
+        }
+
         let result = operation();
+        let state_error = self.unregister_active_bucket_locks(owner, &buckets_to_acquire);
         let interrupted = self.clear_interrupt_for_rollback();
         let release_errors = self.release_bucket_locks(&locks);
+        if let Err(error) = state_error {
+            return Err(AppError::rollback(error, release_errors));
+        }
         match result {
             Ok(value) if release_errors.is_empty() && !interrupted => Ok(value),
             Ok(_) if release_errors.is_empty() => Err(AppError::Interrupted),
@@ -402,6 +438,44 @@ impl StorageApi {
             }),
             Err(error) => Err(AppError::rollback(error, release_errors)),
         }
+    }
+
+    fn register_active_bucket_locks(
+        &self,
+        owner: ThreadId,
+        buckets: &[&str],
+    ) -> Result<(), AppError> {
+        let mut active = self
+            .active_bucket_locks
+            .lock()
+            .map_err(|_| AppError::Message("Active bucket lock state is poisoned".to_string()))?;
+        active
+            .entry(owner)
+            .or_default()
+            .extend(buckets.iter().map(|bucket| (*bucket).to_string()));
+        Ok(())
+    }
+
+    fn unregister_active_bucket_locks(
+        &self,
+        owner: ThreadId,
+        buckets: &[&str],
+    ) -> Result<(), AppError> {
+        let mut active = self
+            .active_bucket_locks
+            .lock()
+            .map_err(|_| AppError::Message("Active bucket lock state is poisoned".to_string()))?;
+        if let Some(held) = active.get_mut(&owner) {
+            for bucket in buckets {
+                if let Some(index) = held.iter().position(|held| held == bucket) {
+                    held.remove(index);
+                }
+            }
+            if held.is_empty() {
+                active.remove(&owner);
+            }
+        }
+        Ok(())
     }
 
     fn object_metadata(
@@ -546,28 +620,14 @@ impl StorageApi {
 
 impl StorageClient for StorageApi {
     fn list_objects(&self, bucket: &str) -> Result<Vec<String>, AppError> {
-        let mut page_token: Option<String> = None;
-        let mut objects = Vec::new();
-        loop {
-            let mut query = vec![("maxResults", "1000")];
-            if let Some(page_token) = &page_token {
-                query.push(("pageToken", page_token.as_str()));
-            }
-            let url = with_query(format!("{}/b/{}/o", self.api_base, encode(bucket)), query);
-            let listing: ListResponse =
-                self.send_json(self.client.get(url), "Invalid Cloud Storage list response")?;
-            objects.extend(
-                listing
-                    .items
-                    .into_iter()
-                    .filter(|item| item.name != BUCKET_LOCK_OBJECT)
-                    .map(|item| format!("gs://{bucket}/{}", item.name)),
-            );
-            page_token = listing.next_page_token;
-            if page_token.is_none() {
-                return Ok(objects);
-            }
-        }
+        self.with_bucket_locks(&[bucket], || self.list_objects_unlocked(bucket))
+    }
+
+    fn with_bucket_locks<T, F>(&self, buckets: &[&str], operation: F) -> Result<T, AppError>
+    where
+        F: FnOnce() -> Result<T, AppError>,
+    {
+        StorageApi::with_bucket_locks(self, buckets, operation)
     }
 
     fn set_upload_root_identity(
@@ -708,6 +768,31 @@ impl Drop for StorageApi {
 }
 
 impl StorageApi {
+    fn list_objects_unlocked(&self, bucket: &str) -> Result<Vec<String>, AppError> {
+        let mut page_token: Option<String> = None;
+        let mut objects = Vec::new();
+        loop {
+            let mut query = vec![("maxResults", "1000")];
+            if let Some(page_token) = &page_token {
+                query.push(("pageToken", page_token.as_str()));
+            }
+            let url = with_query(format!("{}/b/{}/o", self.api_base, encode(bucket)), query);
+            let listing: ListResponse =
+                self.send_json(self.client.get(url), "Invalid Cloud Storage list response")?;
+            objects.extend(
+                listing
+                    .items
+                    .into_iter()
+                    .filter(|item| item.name != BUCKET_LOCK_OBJECT)
+                    .map(|item| format!("gs://{bucket}/{}", item.name)),
+            );
+            page_token = listing.next_page_token;
+            if page_token.is_none() {
+                return Ok(objects);
+            }
+        }
+    }
+
     fn move_object_unlocked(
         &self,
         source: &ObjectPath,
