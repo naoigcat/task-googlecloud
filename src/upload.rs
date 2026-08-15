@@ -3,7 +3,9 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use crate::InterruptFlag;
-use crate::atomic_rename::{DirectoryIdentity, directory_identity_from_metadata};
+use crate::atomic_rename::{
+    DirectoryIdentity, FileIdentity, directory_identity_from_metadata, file_identity_from_metadata,
+};
 use crate::cloud::Cloud;
 use crate::error::AppError;
 use crate::local;
@@ -11,6 +13,7 @@ use crate::normalization_plan;
 use crate::object_move;
 use crate::storage::{ObjectPath, StorageClient, UPLOAD_ROOT};
 use crate::transaction::RemoteChange;
+use crate::upload_source::UploadSourceIdentity;
 
 #[cfg(test)]
 pub(crate) use crate::object_path::MAX_OBJECT_NAME_BYTES;
@@ -24,6 +27,8 @@ pub fn run<S: StorageClient>(
     let discovery = discover_uploads(Path::new(UPLOAD_ROOT))?;
     let files_by_directory = discovery.files_by_directory;
     let expected_root = discovery.root_identity;
+    let directory_identities = discovery.directory_identities;
+    let file_identities = discovery.file_identities;
     storage.set_upload_root_identity(expected_root)?;
     let bucket_names = files_by_directory
         .keys()
@@ -56,15 +61,23 @@ pub fn run<S: StorageClient>(
             .iter()
             .map(|entry| (PathBuf::from(&entry.source), PathBuf::from(&entry.target)))
             .collect::<HashMap<_, _>>();
-        let uploads = plan_uploads(&files_by_directory, &planned_names, &staging_prefix())?;
+        let uploads = plan_uploads_with_identities(
+            &files_by_directory,
+            &planned_names,
+            &file_identities,
+            &directory_identities,
+            &staging_prefix(),
+        )?;
 
         cloud.login()?;
         cloud.set_project(project)?;
 
-        let normalized_files = local::apply_normalization_with_identity(
+        let normalized_files = local::apply_normalization_with_path_identities(
             Path::new(UPLOAD_ROOT),
             &plan,
             expected_root,
+            Some(&file_identities),
+            Some(&directory_identities),
             interrupt,
         )?;
 
@@ -72,9 +85,11 @@ pub fn run<S: StorageClient>(
         match result {
             Ok(()) => Ok(()),
             Err(error) => {
-                let errors = local::rollback_normalization_with_identity(
+                let errors = local::rollback_normalization_with_path_identities(
                     Path::new(UPLOAD_ROOT),
                     expected_root,
+                    Some(&file_identities),
+                    Some(&directory_identities),
                     &normalized_files
                         .iter()
                         .map(|(source, target)| (source.clone(), target.clone()))
@@ -90,6 +105,8 @@ struct UploadDiscovery {
     files_by_directory: BTreeMap<PathBuf, Vec<PathBuf>>,
     // Keep discovery tied to the same directory for every later filesystem access.
     root_identity: Option<DirectoryIdentity>,
+    directory_identities: HashMap<PathBuf, DirectoryIdentity>,
+    file_identities: HashMap<PathBuf, FileIdentity>,
 }
 
 pub fn upload_files_by_directory(root: &Path) -> Result<BTreeMap<PathBuf, Vec<PathBuf>>, AppError> {
@@ -104,6 +121,8 @@ fn discover_uploads(root: &Path) -> Result<UploadDiscovery, AppError> {
             return Ok(UploadDiscovery {
                 files_by_directory: directories,
                 root_identity: None,
+                directory_identities: HashMap::new(),
+                file_identities: HashMap::new(),
             });
         }
         Err(error) => return Err(error.into()),
@@ -112,6 +131,8 @@ fn discover_uploads(root: &Path) -> Result<UploadDiscovery, AppError> {
         return Ok(UploadDiscovery {
             files_by_directory: directories,
             root_identity: None,
+            directory_identities: HashMap::new(),
+            file_identities: HashMap::new(),
         });
     }
     if !root_metadata.file_type().is_dir() {
@@ -122,19 +143,28 @@ fn discover_uploads(root: &Path) -> Result<UploadDiscovery, AppError> {
         .into());
     }
     let root_identity = directory_identity_from_metadata(&root_metadata);
+    let mut directory_identities = HashMap::new();
+    let mut file_identities = HashMap::new();
     for directory in fs::read_dir(root)? {
         let directory = directory?.path();
-        if !is_real_directory(&directory)? {
+        let directory_metadata = fs::symlink_metadata(&directory)?;
+        if !directory_metadata.file_type().is_dir() {
             continue;
         }
+        directory_identities.insert(
+            directory.clone(),
+            directory_identity_from_metadata(&directory_metadata),
+        );
         let mut files = Vec::new();
         for entry in fs::read_dir(&directory)? {
             let file = entry?.path();
-            if is_regular_file(&file)?
+            let file_metadata = fs::symlink_metadata(&file)?;
+            if file_metadata.file_type().is_file()
                 && file
                     .file_name()
                     .is_some_and(|name| !name.to_string_lossy().starts_with('.'))
             {
+                file_identities.insert(file.clone(), file_identity_from_metadata(&file_metadata));
                 files.push(file);
             }
         }
@@ -152,13 +182,17 @@ fn discover_uploads(root: &Path) -> Result<UploadDiscovery, AppError> {
     Ok(UploadDiscovery {
         files_by_directory: directories,
         root_identity: Some(root_identity),
+        directory_identities,
+        file_identities,
     })
 }
 
+#[cfg(test)]
 fn is_real_directory(path: &Path) -> Result<bool, AppError> {
     Ok(fs::symlink_metadata(path)?.file_type().is_dir())
 }
 
+#[cfg(test)]
 fn is_regular_file(path: &Path) -> Result<bool, AppError> {
     Ok(fs::symlink_metadata(path)?.file_type().is_file())
 }
@@ -168,6 +202,7 @@ struct PlannedUpload {
     file: PathBuf,
     staging: ObjectPath,
     target: ObjectPath,
+    source_identity: Option<UploadSourceIdentity>,
 }
 
 #[derive(Clone, Debug)]
@@ -183,9 +218,26 @@ fn staging_prefix() -> String {
     )
 }
 
+#[cfg(test)]
 fn plan_uploads(
     files_by_directory: &BTreeMap<PathBuf, Vec<PathBuf>>,
     normalized_files: &HashMap<PathBuf, PathBuf>,
+    staging_prefix: &str,
+) -> Result<Vec<PlannedDirectoryUploads>, AppError> {
+    plan_uploads_with_identities(
+        files_by_directory,
+        normalized_files,
+        &HashMap::new(),
+        &HashMap::new(),
+        staging_prefix,
+    )
+}
+
+fn plan_uploads_with_identities(
+    files_by_directory: &BTreeMap<PathBuf, Vec<PathBuf>>,
+    normalized_files: &HashMap<PathBuf, PathBuf>,
+    file_identities: &HashMap<PathBuf, FileIdentity>,
+    directory_identities: &HashMap<PathBuf, DirectoryIdentity>,
     staging_prefix: &str,
 ) -> Result<Vec<PlannedDirectoryUploads>, AppError> {
     let mut planned = Vec::new();
@@ -207,10 +259,23 @@ fn plan_uploads(
                 .ok_or_else(|| {
                     AppError::Message(format!("File is not valid UTF-8: {normalized_file:?}"))
                 })?;
+            let source_identity = if file_identities.is_empty() && directory_identities.is_empty() {
+                None
+            } else {
+                Some(UploadSourceIdentity {
+                    file: *file_identities.get(file).ok_or_else(|| {
+                        AppError::Message(format!("Missing file identity for {file:?}"))
+                    })?,
+                    directory: *directory_identities.get(directory).ok_or_else(|| {
+                        AppError::Message(format!("Missing directory identity for {directory:?}"))
+                    })?,
+                })
+            };
             uploads.push(PlannedUpload {
                 file: normalized_file.clone(),
                 staging: staging_path(bucket, staging_prefix, object_name)?,
                 target: ObjectPath::parse(&format!("gs://{bucket}/{object_name}"))?,
+                source_identity,
             });
         }
         planned.push(PlannedDirectoryUploads {
@@ -254,8 +319,21 @@ fn upload_planned_files_unlocked<S: StorageClient>(
         for planned in uploads {
             println!("{}", planned.directory.display());
             for upload in &planned.uploads {
-                let generation =
-                    object_move::execute_upload(storage, interrupt, &upload.file, &upload.staging)?;
+                let generation = match upload.source_identity {
+                    Some(identity) => object_move::execute_upload_with_identity(
+                        storage,
+                        interrupt,
+                        &upload.file,
+                        &upload.staging,
+                        Some(identity),
+                    )?,
+                    None => object_move::execute_upload(
+                        storage,
+                        interrupt,
+                        &upload.file,
+                        &upload.staging,
+                    )?,
+                };
                 staged.push(RemoteChange {
                     source: upload.staging.clone(),
                     target: upload.target.clone(),

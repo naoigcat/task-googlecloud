@@ -26,11 +26,35 @@ pub struct DirectoryIdentity {
 pub struct DirectoryIdentity;
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct FileIdentity {
+    device: u64,
+    inode: u64,
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct FileIdentity;
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 pub(crate) fn directory_identity_from_metadata(metadata: &std::fs::Metadata) -> DirectoryIdentity {
     DirectoryIdentity {
         device: metadata.dev(),
         inode: metadata.ino(),
     }
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+pub(crate) fn file_identity_from_metadata(metadata: &std::fs::Metadata) -> FileIdentity {
+    FileIdentity {
+        device: metadata.dev(),
+        inode: metadata.ino(),
+    }
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+pub(crate) fn file_identity_from_metadata(_metadata: &std::fs::Metadata) -> FileIdentity {
+    FileIdentity
 }
 
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
@@ -44,18 +68,32 @@ pub(crate) fn directory_identity(file: &File) -> io::Result<DirectoryIdentity> {
     Ok(directory_identity_from_metadata(&metadata))
 }
 
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+pub(crate) fn file_identity(file: &File) -> io::Result<FileIdentity> {
+    let metadata = file.metadata()?;
+    Ok(file_identity_from_metadata(&metadata))
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+pub(crate) fn file_identity(_file: &File) -> io::Result<FileIdentity> {
+    Ok(FileIdentity)
+}
+
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
 pub(crate) fn directory_identity(_file: &File) -> io::Result<DirectoryIdentity> {
     Ok(DirectoryIdentity)
 }
 
 pub fn rename_without_overwrite(root: &Path, source: &Path, target: &Path) -> Result<(), AppError> {
-    rename_without_overwrite_with_identity(root, None, source, target)
+    rename_without_overwrite_with_identity(root, None, None, None, None, source, target)
 }
 
 pub(crate) fn rename_without_overwrite_with_identity(
     root: &Path,
     expected_root: Option<DirectoryIdentity>,
+    expected_source: Option<FileIdentity>,
+    expected_source_parent: Option<DirectoryIdentity>,
+    expected_target_parent: Option<DirectoryIdentity>,
     source: &Path,
     target: &Path,
 ) -> Result<(), AppError> {
@@ -74,44 +112,70 @@ pub(crate) fn rename_without_overwrite_with_identity(
             )));
         }
         let (source_parent, source_name) = relative_parent(&root_directory, root, source)?;
-        let (target_parent, target_name) = relative_parent(&root_directory, root, target)?;
+        let (target_parent, target_name_os) = relative_parent(&root_directory, root, target)?;
+        if let Some(expected_source_parent) = expected_source_parent
+            && directory_identity(&source_parent)? != expected_source_parent
+        {
+            return Err(AppError::Message(format!(
+                "Input source directory was replaced before renaming: {source:?}"
+            )));
+        }
+        if let Some(expected_target_parent) = expected_target_parent
+            && directory_identity(&target_parent)? != expected_target_parent
+        {
+            return Err(AppError::Message(format!(
+                "Input target directory was replaced before renaming: {target:?}"
+            )));
+        }
+        if let Some(expected_source) = expected_source
+            && file_identity_at(&source_parent, source_name)? != expected_source
+        {
+            return Err(AppError::Message(format!(
+                "Input file was replaced before renaming: {source:?}"
+            )));
+        }
 
         #[cfg(target_os = "macos")]
-        if same_path_entry(&source_parent, source_name, &target_parent, target_name)? {
+        if same_path_entry(&source_parent, source_name, &target_parent, target_name_os)? {
             return Ok(());
         }
 
         let source_name = c_string(source_name)?;
-        let target_name = c_string(target_name)?;
-        #[cfg(target_os = "linux")]
-        let status = unsafe {
-            libc::renameat2(
-                source_parent.as_raw_fd(),
-                source_name.as_ptr(),
-                target_parent.as_raw_fd(),
-                target_name.as_ptr(),
-                libc::RENAME_NOREPLACE,
-            )
-        };
-        #[cfg(target_os = "macos")]
-        let status = unsafe {
-            libc::renameatx_np(
-                source_parent.as_raw_fd(),
-                source_name.as_ptr(),
-                target_parent.as_raw_fd(),
-                target_name.as_ptr(),
-                libc::RENAME_EXCL,
-            )
-        };
-        if status == 0 {
-            return Ok(());
+        let target_name = c_string(target_name_os)?;
+        rename_noreplace(&source_parent, &source_name, &target_parent, &target_name)?;
+        if let Some(expected_source) = expected_source {
+            let actual = file_identity_at(&target_parent, target_name_os).map_err(|error| {
+                AppError::rollback(
+                    AppError::Message(format!(
+                        "Input file was replaced during renaming: {source:?}"
+                    )),
+                    vec![error],
+                )
+            })?;
+            if actual != expected_source {
+                return Err(AppError::Recovery {
+                    paths: format!("{:?} and {:?}", source, target),
+                    operation: "normalize upload source".to_string(),
+                    details: format!(
+                        "Input file was replaced during renaming: {source:?}; manual recovery is required"
+                    ),
+                });
+            }
         }
-        Err(std::io::Error::last_os_error().into())
+        Ok(())
     }
 
     #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     {
-        let _ = (root, source, target);
+        let _ = (
+            root,
+            expected_root,
+            expected_source,
+            expected_source_parent,
+            expected_target_parent,
+            source,
+            target,
+        );
         Err(AppError::UnsupportedPlatform(
             std::env::consts::OS.to_string(),
         ))
@@ -177,6 +241,57 @@ fn open_directory_at_fd(directory: i32, name: &CString) -> Result<File, AppError
         return Err(std::io::Error::last_os_error().into());
     }
     Ok(unsafe { File::from_raw_fd(fd) })
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn file_identity_at(directory: &File, name: &OsStr) -> Result<FileIdentity, AppError> {
+    let name = c_string(name)?;
+    let fd = unsafe {
+        libc::openat(
+            directory.as_raw_fd(),
+            name.as_ptr(),
+            libc::O_RDONLY | libc::O_CLOEXEC | libc::O_NOFOLLOW,
+        )
+    };
+    if fd < 0 {
+        return Err(std::io::Error::last_os_error().into());
+    }
+    let file = unsafe { File::from_raw_fd(fd) };
+    Ok(file_identity(&file)?)
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn rename_noreplace(
+    source_directory: &File,
+    source_name: &CString,
+    target_directory: &File,
+    target_name: &CString,
+) -> io::Result<()> {
+    #[cfg(target_os = "linux")]
+    let status = unsafe {
+        libc::renameat2(
+            source_directory.as_raw_fd(),
+            source_name.as_ptr(),
+            target_directory.as_raw_fd(),
+            target_name.as_ptr(),
+            libc::RENAME_NOREPLACE,
+        )
+    };
+    #[cfg(target_os = "macos")]
+    let status = unsafe {
+        libc::renameatx_np(
+            source_directory.as_raw_fd(),
+            source_name.as_ptr(),
+            target_directory.as_raw_fd(),
+            target_name.as_ptr(),
+            libc::RENAME_EXCL,
+        )
+    };
+    if status == 0 {
+        Ok(())
+    } else {
+        Err(std::io::Error::last_os_error())
+    }
 }
 
 #[cfg(target_os = "macos")]

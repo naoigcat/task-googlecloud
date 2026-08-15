@@ -12,7 +12,7 @@ mod transaction;
 mod upload;
 mod upload_source;
 
-pub use atomic_rename::DirectoryIdentity;
+pub use atomic_rename::{DirectoryIdentity, FileIdentity};
 pub use cloud::{Cloud, shell_quote};
 pub use error::AppError;
 pub use local::{apply_normalization, path_string, rollback_normalization};
@@ -23,6 +23,7 @@ pub use storage::StorageApi;
 pub use storage::StorageClient;
 pub use transaction::RemoteChange;
 pub use upload::{rollback_remote, upload_files_by_directory};
+pub use upload_source::UploadSourceIdentity;
 
 use std::sync::{
     Arc,

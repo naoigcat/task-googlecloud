@@ -424,3 +424,54 @@ fn refuses_upload_sources_after_upload_root_is_replaced() {
 
     assert!(matches!(error, super::AppError::UploadSource(_)), "{error}");
 }
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn refuses_upload_sources_after_a_file_or_bucket_is_replaced() {
+    use crate::atomic_rename::{directory_identity_from_metadata, file_identity_from_metadata};
+
+    for replace_bucket in [false, true] {
+        let parent = tempfile::tempdir().unwrap();
+        let root = parent.path().join("uploads");
+        let bucket = root.join("bucket");
+        let source = bucket.join("file.txt");
+        std::fs::create_dir_all(&bucket).unwrap();
+        std::fs::write(&source, "original").unwrap();
+        let expected_root =
+            directory_identity_from_metadata(&std::fs::symlink_metadata(&root).unwrap());
+        let expected_directory =
+            directory_identity_from_metadata(&std::fs::symlink_metadata(&bucket).unwrap());
+        let expected_file =
+            file_identity_from_metadata(&std::fs::symlink_metadata(&source).unwrap());
+
+        std::fs::remove_file(&source).unwrap();
+        if replace_bucket {
+            std::fs::remove_dir(&bucket).unwrap();
+            std::fs::create_dir(&bucket).unwrap();
+        }
+        std::fs::write(&source, "replacement").unwrap();
+
+        let target = ObjectPath::parse("gs://bucket/target").unwrap();
+        let mut storage = StorageApi::with_endpoint_options(
+            Cloud::new(),
+            "http://127.0.0.1:1/storage/v1",
+            "http://127.0.0.1:1/storage/v1",
+            Some("token".to_string()),
+            Duration::from_millis(10),
+        );
+        storage.upload_root = Some(root);
+        storage
+            .set_upload_root_identity(Some(expected_root))
+            .unwrap();
+        let identity = super::UploadSourceIdentity {
+            file: expected_file,
+            directory: expected_directory,
+        };
+
+        let error = storage
+            .upload_file_with_identity(&source, &target, Some(identity))
+            .unwrap_err();
+
+        assert!(matches!(error, super::AppError::UploadSource(_)), "{error}");
+    }
+}

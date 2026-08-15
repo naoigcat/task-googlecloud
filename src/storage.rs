@@ -18,7 +18,7 @@ use crate::cloud::Cloud;
 use crate::error::AppError;
 pub use crate::object_path::ObjectPath;
 use crate::storage_transport::{REQUEST_TIMEOUT, StorageTransport, UPLOAD_TIMEOUT};
-use crate::upload_source;
+use crate::upload_source::{self, UploadSourceIdentity};
 
 /// Uploads are confined to this directory, so file discovery and the confined
 /// open must agree on where it is.
@@ -79,6 +79,14 @@ pub trait StorageClient {
         _identity: Option<DirectoryIdentity>,
     ) -> Result<(), AppError> {
         Ok(())
+    }
+    fn upload_file_with_identity(
+        &self,
+        source: &Path,
+        target: &ObjectPath,
+        _identity: Option<UploadSourceIdentity>,
+    ) -> Result<String, AppError> {
+        self.upload_file(source, target)
     }
     fn upload_file(&self, source: &Path, target: &ObjectPath) -> Result<String, AppError>;
     fn move_object(
@@ -526,40 +534,16 @@ impl StorageClient for StorageApi {
     }
 
     fn upload_file(&self, source: &Path, target: &ObjectPath) -> Result<String, AppError> {
-        Self::reject_bucket_lock_object(target)?;
-        let expected_root = *self
-            .upload_root_identity
-            .lock()
-            .map_err(|_| AppError::Message("Upload root identity lock is poisoned".to_string()))?;
-        let file = upload_source::open(self.upload_root.as_deref(), source, expected_root)?;
-        let size = file.metadata().map_err(AppError::UploadSource)?.len();
-        self.with_bucket_locks(&[target.bucket.as_str()], || {
-            let url = with_query(
-                format!(
-                    "{}/b/{}/o",
-                    self.transport.upload_base(),
-                    encode(&target.bucket)
-                ),
-                [
-                    ("uploadType", "media"),
-                    ("name", target.object.as_str()),
-                    ("ifGenerationMatch", "0"),
-                ],
-            );
-            let request = self
-                .transport
-                .upload_client()
-                .post(url)
-                .header(CONTENT_TYPE, "application/octet-stream")
-                .header(CONTENT_LENGTH, size)
-                .body(Body::wrap_stream(ReaderStream::new(
-                    tokio::fs::File::from_std(file),
-                )));
-            let metadata: MetadataResponse = self
-                .transport
-                .send_json(request, "Invalid Cloud Storage upload response")?;
-            Ok(metadata.generation)
-        })
+        self.upload_file_checked(source, target, None)
+    }
+
+    fn upload_file_with_identity(
+        &self,
+        source: &Path,
+        target: &ObjectPath,
+        identity: Option<UploadSourceIdentity>,
+    ) -> Result<String, AppError> {
+        self.upload_file_checked(source, target, identity)
     }
 
     fn move_object(
@@ -645,6 +629,55 @@ impl StorageClient for StorageApi {
             paths: format!("{:?}", target.uri()),
             operation: operation.to_string(),
             details: state_details(target, details),
+        })
+    }
+}
+
+impl StorageApi {
+    fn upload_file_checked(
+        &self,
+        source: &Path,
+        target: &ObjectPath,
+        expected_source: Option<UploadSourceIdentity>,
+    ) -> Result<String, AppError> {
+        Self::reject_bucket_lock_object(target)?;
+        let expected_root = *self
+            .upload_root_identity
+            .lock()
+            .map_err(|_| AppError::Message("Upload root identity lock is poisoned".to_string()))?;
+        let file = upload_source::open(
+            self.upload_root.as_deref(),
+            source,
+            expected_root,
+            expected_source,
+        )?;
+        let size = file.metadata().map_err(AppError::UploadSource)?.len();
+        self.with_bucket_locks(&[target.bucket.as_str()], || {
+            let url = with_query(
+                format!(
+                    "{}/b/{}/o",
+                    self.transport.upload_base(),
+                    encode(&target.bucket)
+                ),
+                [
+                    ("uploadType", "media"),
+                    ("name", target.object.as_str()),
+                    ("ifGenerationMatch", "0"),
+                ],
+            );
+            let request = self
+                .transport
+                .upload_client()
+                .post(url)
+                .header(CONTENT_TYPE, "application/octet-stream")
+                .header(CONTENT_LENGTH, size)
+                .body(Body::wrap_stream(ReaderStream::new(
+                    tokio::fs::File::from_std(file),
+                )));
+            let metadata: MetadataResponse = self
+                .transport
+                .send_json(request, "Invalid Cloud Storage upload response")?;
+            Ok(metadata.generation)
         })
     }
 }

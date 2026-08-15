@@ -171,6 +171,7 @@ fn finalizes_uploaded_objects_using_their_uploaded_generation() {
             file: PathBuf::from("uploads/bucket/file"),
             staging,
             target,
+            source_identity: None,
         }],
     }];
 
@@ -197,6 +198,7 @@ fn returns_lock_conflicts_without_confirming_uploaded_objects() {
             file: source.path().to_path_buf(),
             staging: ObjectPath::parse("gs://bucket/staging").unwrap(),
             target: ObjectPath::parse("gs://bucket/target").unwrap(),
+            source_identity: None,
         }],
     }];
     let interrupt = InterruptFlag::from_atomic(Arc::new(AtomicBool::new(false)));
