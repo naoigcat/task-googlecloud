@@ -7,6 +7,8 @@ use std::os::unix::ffi::OsStrExt;
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 use std::os::unix::fs::OpenOptionsExt;
 #[cfg(any(target_os = "linux", target_os = "macos"))]
+use std::os::unix::io::AsRawFd;
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 use std::path::Path;
 use std::sync::{
     Arc,
@@ -72,7 +74,17 @@ fn accept_with_timeout(listener: &TcpListener) -> TcpStream {
     let deadline = Instant::now() + Duration::from_secs(5);
     loop {
         match listener.accept() {
-            Ok((stream, _)) => return stream,
+            Ok((stream, _)) => {
+                stream.set_nonblocking(false).unwrap();
+                // Bound the post-accept phase so a stalled test client cannot hang the suite.
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(5)))
+                    .unwrap();
+                stream
+                    .set_write_timeout(Some(Duration::from_secs(5)))
+                    .unwrap();
+                return stream;
+            }
             Err(error)
                 if error.kind() == std::io::ErrorKind::WouldBlock && Instant::now() < deadline =>
             {
@@ -81,6 +93,29 @@ fn accept_with_timeout(listener: &TcpListener) -> TcpStream {
             Err(error) => panic!("failed to accept test request: {error}"),
         }
     }
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn accepted_connections_are_blocking() {
+    let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let address = listener.local_addr().unwrap();
+    let (connected_sender, connected_receiver) = mpsc::channel();
+    let (release_sender, release_receiver) = mpsc::channel();
+    let client = thread::spawn(move || {
+        let _stream = TcpStream::connect(address).unwrap();
+        connected_sender.send(()).unwrap();
+        let _ = release_receiver.recv();
+    });
+
+    connected_receiver.recv().unwrap();
+    let stream = accept_with_timeout(&listener);
+    let flags = unsafe { libc::fcntl(stream.as_raw_fd(), libc::F_GETFL) };
+    assert!(flags >= 0);
+    assert_eq!(flags & libc::O_NONBLOCK, 0);
+    release_sender.send(()).unwrap();
+    client.join().unwrap();
 }
 
 fn interrupted_move_responses(after_request: usize) -> Vec<(u16, &'static str)> {
