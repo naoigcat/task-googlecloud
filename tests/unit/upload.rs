@@ -7,8 +7,8 @@ use std::sync::{Arc, atomic::AtomicBool};
 use std::thread;
 
 use super::{
-    MAX_OBJECT_NAME_BYTES, PlannedUpload, is_real_directory, is_regular_file, plan_uploads,
-    staging_path, upload_planned_files,
+    MAX_OBJECT_NAME_BYTES, PlannedDirectoryUploads, PlannedUpload, is_real_directory,
+    is_regular_file, plan_uploads, staging_path, upload_planned_files,
 };
 use crate::InterruptFlag;
 use crate::cloud::Cloud;
@@ -165,14 +165,14 @@ fn finalizes_uploaded_objects_using_their_uploaded_generation() {
     let interrupt = InterruptFlag::from_atomic(Arc::new(AtomicBool::new(false)));
     let staging = ObjectPath::parse("gs://bucket/.task-googlecloud-staging/file").unwrap();
     let target = ObjectPath::parse("gs://bucket/file").unwrap();
-    let uploads = vec![(
-        PathBuf::from("uploads/bucket"),
-        vec![PlannedUpload {
+    let uploads = vec![PlannedDirectoryUploads {
+        directory: PathBuf::from("uploads/bucket"),
+        uploads: vec![PlannedUpload {
             file: PathBuf::from("uploads/bucket/file"),
             staging,
             target,
         }],
-    )];
+    }];
 
     upload_planned_files(&storage, &interrupt, &uploads).unwrap();
 
@@ -191,14 +191,14 @@ fn returns_lock_conflicts_without_confirming_uploaded_objects() {
         StorageApi::with_endpoints(Cloud::new(), base.clone(), base, Some("token".to_string()));
     let source = tempfile::NamedTempFile::new().unwrap();
     std::fs::write(source.path(), b"contents").unwrap();
-    let uploads = vec![(
-        PathBuf::from("uploads/bucket"),
-        vec![PlannedUpload {
+    let uploads = vec![PlannedDirectoryUploads {
+        directory: PathBuf::from("uploads/bucket"),
+        uploads: vec![PlannedUpload {
             file: source.path().to_path_buf(),
             staging: ObjectPath::parse("gs://bucket/staging").unwrap(),
             target: ObjectPath::parse("gs://bucket/target").unwrap(),
         }],
-    )];
+    }];
     let interrupt = InterruptFlag::from_atomic(Arc::new(AtomicBool::new(false)));
 
     let error = upload_planned_files(&storage, &interrupt, &uploads).unwrap_err();
@@ -237,7 +237,7 @@ fn plans_uploads_from_discovery_alone() {
     let planned = plan_uploads(&files_by_directory, &normalized_files, STAGING_PREFIX).unwrap();
 
     assert_eq!(planned.len(), 1);
-    let uploads = &planned[0].1;
+    let uploads = &planned[0].uploads;
     assert_eq!(uploads.len(), 1);
     assert_eq!(uploads[0].target.uri(), "gs://bucket/\u{e9}.txt");
     assert_eq!(

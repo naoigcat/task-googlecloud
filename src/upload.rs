@@ -170,6 +170,12 @@ struct PlannedUpload {
     target: ObjectPath,
 }
 
+#[derive(Clone, Debug)]
+struct PlannedDirectoryUploads {
+    directory: PathBuf,
+    uploads: Vec<PlannedUpload>,
+}
+
 fn staging_prefix() -> String {
     format!(
         ".task-googlecloud-staging/{}",
@@ -181,7 +187,7 @@ fn plan_uploads(
     files_by_directory: &BTreeMap<PathBuf, Vec<PathBuf>>,
     normalized_files: &HashMap<PathBuf, PathBuf>,
     staging_prefix: &str,
-) -> Result<Vec<(PathBuf, Vec<PlannedUpload>)>, AppError> {
+) -> Result<Vec<PlannedDirectoryUploads>, AppError> {
     let mut planned = Vec::new();
     for (directory, files) in files_by_directory {
         let bucket = directory
@@ -207,7 +213,10 @@ fn plan_uploads(
                 target: ObjectPath::parse(&format!("gs://{bucket}/{object_name}"))?,
             });
         }
-        planned.push((directory.clone(), uploads));
+        planned.push(PlannedDirectoryUploads {
+            directory: directory.clone(),
+            uploads,
+        });
     }
     Ok(planned)
 }
@@ -216,11 +225,16 @@ fn plan_uploads(
 fn upload_planned_files<S: StorageClient>(
     storage: &S,
     interrupt: &InterruptFlag,
-    uploads: &[(PathBuf, Vec<PlannedUpload>)],
+    uploads: &[PlannedDirectoryUploads],
 ) -> Result<(), AppError> {
     let bucket_names = uploads
         .iter()
-        .flat_map(|(_, uploads)| uploads.iter().map(|upload| upload.target.bucket.clone()))
+        .flat_map(|planned| {
+            planned
+                .uploads
+                .iter()
+                .map(|upload| upload.target.bucket.clone())
+        })
         .collect::<Vec<_>>();
     let buckets = bucket_names.iter().map(String::as_str).collect::<Vec<_>>();
     storage.with_bucket_locks(&buckets, || {
@@ -231,15 +245,15 @@ fn upload_planned_files<S: StorageClient>(
 fn upload_planned_files_unlocked<S: StorageClient>(
     storage: &S,
     interrupt: &InterruptFlag,
-    uploads: &[(PathBuf, Vec<PlannedUpload>)],
+    uploads: &[PlannedDirectoryUploads],
 ) -> Result<(), AppError> {
     let mut staged = Vec::new();
     let mut finalized = Vec::new();
 
     let operation = (|| {
-        for (directory, uploads) in uploads {
-            println!("{}", directory.display());
-            for upload in uploads {
+        for planned in uploads {
+            println!("{}", planned.directory.display());
+            for upload in &planned.uploads {
                 let generation =
                     object_move::execute_upload(storage, interrupt, &upload.file, &upload.staging)?;
                 staged.push(RemoteChange {
