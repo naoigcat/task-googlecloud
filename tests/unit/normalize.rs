@@ -1,4 +1,4 @@
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 #[cfg(unix)]
 use std::ffi::OsString;
 use std::fs;
@@ -7,7 +7,7 @@ use std::sync::{Arc, atomic::AtomicBool};
 #[cfg(unix)]
 use std::sync::{Mutex, MutexGuard};
 
-use super::{MAX_OBJECT_NAME_BYTES, run, temporary_path, temporary_suffix};
+use super::{MAX_OBJECT_NAME_BYTES, process_moves, run, temporary_path, temporary_suffix};
 use crate::cloud::Cloud;
 use crate::error::AppError;
 use crate::normalization_plan::normalized;
@@ -54,6 +54,74 @@ impl Drop for PathGuard {
 struct CountingStorage {
     objects: Vec<String>,
     move_calls: Cell<usize>,
+}
+
+struct InterruptedFinalizationStorage {
+    move_calls: Cell<usize>,
+    rollback_generations: RefCell<Vec<String>>,
+}
+
+impl StorageClient for InterruptedFinalizationStorage {
+    fn list_objects(&self, _bucket: &str) -> Result<Vec<String>, AppError> {
+        Ok(Vec::new())
+    }
+
+    fn upload_file(&self, _source: &Path, _target: &ObjectPath) -> Result<String, AppError> {
+        unreachable!()
+    }
+
+    fn move_object(
+        &self,
+        _source: &ObjectPath,
+        _target: &ObjectPath,
+        _expected_source_generation: Option<&str>,
+    ) -> Result<String, AppError> {
+        let call = self.move_calls.get() + 1;
+        self.move_calls.set(call);
+        if call == 2 {
+            return Err(AppError::interrupted_after_move_rollback(
+                "restored".to_string(),
+            ));
+        }
+        Ok("staged".to_string())
+    }
+
+    fn rollback_object(
+        &self,
+        _source: &ObjectPath,
+        _target: &ObjectPath,
+        target_generation: &str,
+    ) -> Result<String, AppError> {
+        self.rollback_generations
+            .borrow_mut()
+            .push(target_generation.to_string());
+        Ok("rollback".to_string())
+    }
+
+    fn cleanup_object(
+        &self,
+        _target: &ObjectPath,
+        _target_generation: &str,
+    ) -> Result<(), AppError> {
+        Ok(())
+    }
+
+    fn confirm_move_after_failure(
+        &self,
+        _source: &ObjectPath,
+        _target: &ObjectPath,
+        _operation: &AppError,
+    ) -> Result<(), AppError> {
+        Ok(())
+    }
+
+    fn confirm_write_after_failure(
+        &self,
+        _target: &ObjectPath,
+        _operation: &AppError,
+    ) -> Result<(), AppError> {
+        Ok(())
+    }
 }
 
 impl StorageClient for CountingStorage {
@@ -142,6 +210,29 @@ fn accepts_object_names_at_the_temporary_staging_limit() {
     let temporary = temporary_path(&source).unwrap();
 
     assert_eq!(temporary.object.len(), MAX_OBJECT_NAME_BYTES);
+}
+
+#[test]
+fn rolls_back_an_interrupted_finalization_with_the_restored_generation() {
+    let storage = InterruptedFinalizationStorage {
+        move_calls: Cell::new(0),
+        rollback_generations: RefCell::new(Vec::new()),
+    };
+    let interrupt = crate::InterruptFlag::from_atomic(Arc::new(AtomicBool::new(false)));
+    let source = ObjectPath::parse("gs://bucket/source").unwrap();
+    let target = ObjectPath::parse("gs://bucket/target").unwrap();
+    let temporary = ObjectPath::parse("gs://bucket/temporary").unwrap();
+
+    let result = process_moves(&storage, &interrupt, vec![(source, target, temporary)]);
+
+    assert!(matches!(
+        result,
+        Err(error) if error.restored_move_generation() == Some("restored")
+    ));
+    assert_eq!(
+        *storage.rollback_generations.borrow(),
+        vec!["restored".to_string()]
+    );
 }
 
 #[cfg(unix)]

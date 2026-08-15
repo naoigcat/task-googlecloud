@@ -364,14 +364,22 @@ fn upload_planned_files_unlocked<S: StorageClient>(
             }
         }
 
-        for change in &staged {
-            let generation = object_move::execute(
+        for change in &mut staged {
+            let generation = match object_move::execute(
                 storage,
                 interrupt,
                 &change.source,
                 &change.target,
                 Some(&change.generation),
-            )?;
+            ) {
+                Ok(generation) => generation,
+                Err(error) => {
+                    if let Some(restored_generation) = error.restored_move_generation() {
+                        change.generation = restored_generation.to_string();
+                    }
+                    return Err(error);
+                }
+            };
             finalized.push(RemoteChange {
                 source: change.source.clone(),
                 target: change.target.clone(),

@@ -74,6 +74,64 @@ struct FakeStorage {
     calls_outside_lock: Cell<usize>,
 }
 
+struct InterruptedFinalizationStorage {
+    cleanup_paths_and_generations: RefCell<Vec<(String, String)>>,
+}
+
+impl StorageClient for InterruptedFinalizationStorage {
+    fn list_objects(&self, _bucket: &str) -> Result<Vec<String>, AppError> {
+        Ok(Vec::new())
+    }
+
+    fn upload_file(&self, _source: &Path, _target: &ObjectPath) -> Result<String, AppError> {
+        Ok("staged".to_string())
+    }
+
+    fn move_object(
+        &self,
+        _source: &ObjectPath,
+        _target: &ObjectPath,
+        _expected_source_generation: Option<&str>,
+    ) -> Result<String, AppError> {
+        Err(AppError::interrupted_after_move_rollback(
+            "restored".to_string(),
+        ))
+    }
+
+    fn rollback_object(
+        &self,
+        _source: &ObjectPath,
+        _target: &ObjectPath,
+        _target_generation: &str,
+    ) -> Result<String, AppError> {
+        Ok("rollback".to_string())
+    }
+
+    fn cleanup_object(&self, target: &ObjectPath, target_generation: &str) -> Result<(), AppError> {
+        self.cleanup_paths_and_generations
+            .borrow_mut()
+            .push((target.uri(), target_generation.to_string()));
+        Ok(())
+    }
+
+    fn confirm_move_after_failure(
+        &self,
+        _source: &ObjectPath,
+        _target: &ObjectPath,
+        _operation: &AppError,
+    ) -> Result<(), AppError> {
+        Ok(())
+    }
+
+    fn confirm_write_after_failure(
+        &self,
+        _target: &ObjectPath,
+        _operation: &AppError,
+    ) -> Result<(), AppError> {
+        Ok(())
+    }
+}
+
 impl StorageClient for FakeStorage {
     fn list_objects(&self, _bucket: &str) -> Result<Vec<String>, AppError> {
         Ok(Vec::new())
@@ -183,6 +241,36 @@ fn finalizes_uploaded_objects_using_their_uploaded_generation() {
     );
     assert_eq!(storage.lock_calls.get(), 1);
     assert_eq!(storage.calls_outside_lock.get(), 0);
+}
+
+#[test]
+fn removes_staging_after_an_interrupted_finalization_with_the_restored_generation() {
+    let storage = InterruptedFinalizationStorage {
+        cleanup_paths_and_generations: RefCell::new(Vec::new()),
+    };
+    let interrupt = InterruptFlag::from_atomic(Arc::new(AtomicBool::new(false)));
+    let staging = ObjectPath::parse("gs://bucket/.task-googlecloud-staging/file").unwrap();
+    let target = ObjectPath::parse("gs://bucket/file").unwrap();
+    let uploads = vec![PlannedDirectoryUploads {
+        directory: PathBuf::from("uploads/bucket"),
+        uploads: vec![PlannedUpload {
+            file: PathBuf::from("uploads/bucket/file"),
+            staging: staging.clone(),
+            target,
+            source_identity: None,
+        }],
+    }];
+
+    let result = upload_planned_files(&storage, &interrupt, &uploads);
+
+    assert!(matches!(
+        result,
+        Err(error) if error.restored_move_generation() == Some("restored")
+    ));
+    assert_eq!(
+        *storage.cleanup_paths_and_generations.borrow(),
+        vec![(staging.uri(), "restored".to_string())]
+    );
 }
 
 #[test]

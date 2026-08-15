@@ -18,6 +18,11 @@ pub fn execute<S: StorageClient>(
     match storage.move_object(source, target, expected_source_generation) {
         Ok(generation) => Ok(generation),
         Err(error) => {
+            // Storage already restored this move and carries the new source
+            // generation; another confirmation would hide that state.
+            if error.restored_move_generation().is_some() {
+                return Err(error);
+            }
             if error.is_bucket_lock_conflict() {
                 return Err(error);
             }

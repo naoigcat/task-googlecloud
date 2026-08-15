@@ -114,14 +114,22 @@ fn process_moves_unlocked<S: StorageClient>(
             interrupt.check()?;
         }
 
-        for (change, planned) in staged.iter().zip(moves) {
-            let generation = object_move::execute(
+        for (change, planned) in staged.iter_mut().zip(moves) {
+            let generation = match object_move::execute(
                 storage,
                 interrupt,
                 &change.target,
                 &planned.target,
                 Some(&change.generation),
-            )?;
+            ) {
+                Ok(generation) => generation,
+                Err(error) => {
+                    if let Some(restored_generation) = error.restored_move_generation() {
+                        change.generation = restored_generation.to_string();
+                    }
+                    return Err(error);
+                }
+            };
             finalized.push(RemoteChange {
                 source: change.source.clone(),
                 target: planned.target.clone(),

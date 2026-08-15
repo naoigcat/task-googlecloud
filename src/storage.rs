@@ -809,12 +809,14 @@ impl StorageApi {
         match result {
             Ok(()) => Ok(target_generation),
             Err(error) if error.is_interrupted() => {
-                // The transaction cannot record a generation when this move
-                // exits before returning. Restore the state created by rewrite
-                // here so normalize and upload never leave an untracked copy.
+                // Restore the rewrite before returning, then expose its new
+                // generation so the transaction can roll back the owned copy.
                 self.transport.clear_interrupt_for_rollback();
                 match self.rollback_interrupted_move_unlocked(source, target, &target_generation) {
-                    Ok(()) => Err(AppError::Interrupted),
+                    Ok(Some(restored_generation)) => Err(
+                        AppError::interrupted_after_move_rollback(restored_generation),
+                    ),
+                    Ok(None) => Err(AppError::Interrupted),
                     Err(recovery) => Err(AppError::rollback(error, vec![recovery])),
                 }
             }
@@ -827,14 +829,17 @@ impl StorageApi {
         source: &ObjectPath,
         target: &ObjectPath,
         target_generation: &str,
-    ) -> Result<(), AppError> {
+    ) -> Result<Option<String>, AppError> {
         // Source presence distinguishes a copy that was not followed by delete
         // from a move whose source deletion already succeeded.
         match self.object_state(source, None)? {
-            ObjectState::Present => self.cleanup_object_unlocked(target, target_generation),
+            ObjectState::Present => {
+                self.cleanup_object_unlocked(target, target_generation)?;
+                Ok(None)
+            }
             ObjectState::Missing => self
                 .rollback_object_unlocked(source, target, target_generation)
-                .map(|_| ()),
+                .map(Some),
         }
     }
 

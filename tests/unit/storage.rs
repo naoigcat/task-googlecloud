@@ -358,7 +358,16 @@ fn rolls_back_a_move_interrupted_before_each_post_copy_request() {
             .unwrap_err();
 
         server.join().unwrap();
-        assert!(matches!(error, super::AppError::Interrupted), "{error}");
+        assert!(
+            matches!(
+                error,
+                super::AppError::Interrupted | super::AppError::InterruptedAfterMoveRollback { .. }
+            ),
+            "{error}"
+        );
+        if after_request == 5 {
+            assert_eq!(error.restored_move_generation(), Some("33"));
+        }
         assert!(!interrupted.load(Ordering::Relaxed));
     }
 }

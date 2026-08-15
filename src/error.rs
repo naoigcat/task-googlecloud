@@ -63,6 +63,11 @@ pub enum AppError {
     #[error("Operation interrupted")]
     Interrupted,
 
+    /// A move was interrupted after source deletion, but rollback restored the
+    /// source under a new generation that the transaction must record.
+    #[error("Operation interrupted after restoring a moved object")]
+    InterruptedAfterMoveRollback { restored_generation: String },
+
     /// The request may have reached Cloud Storage before the interruption was observed.
     #[error("Operation interrupted during a Cloud Storage request")]
     InterruptedAfterRequest,
@@ -105,9 +110,27 @@ impl AppError {
 
     pub(crate) fn is_interrupted(&self) -> bool {
         match self {
-            Self::Interrupted | Self::InterruptedAfterRequest => true,
+            Self::Interrupted
+            | Self::InterruptedAfterMoveRollback { .. }
+            | Self::InterruptedAfterRequest => true,
             Self::Token(error, _) => error.is_interrupted(),
             _ => false,
+        }
+    }
+
+    pub(crate) fn interrupted_after_move_rollback(restored_generation: String) -> Self {
+        Self::InterruptedAfterMoveRollback {
+            restored_generation,
+        }
+    }
+
+    pub(crate) fn restored_move_generation(&self) -> Option<&str> {
+        match self {
+            Self::InterruptedAfterMoveRollback {
+                restored_generation,
+            } => Some(restored_generation),
+            Self::Rollback { original, .. } => original.restored_move_generation(),
+            _ => None,
         }
     }
 
