@@ -299,8 +299,11 @@ impl StorageApi {
             "Invalid Cloud Storage bucket lock response",
         );
         let metadata = match metadata {
+            Err(error) if error.status() == Some(412) => {
+                return Err(AppError::BucketLockConflict(Box::new(error)));
+            }
             Ok(metadata) => metadata,
-            Err(error) if error.status() != Some(412) && error.reached_storage() => {
+            Err(error) if error.reached_storage() => {
                 self.clear_interrupt_for_rollback();
                 match self.recover_unacknowledged_bucket_lock(&object, &token) {
                     Ok(()) => return Err(error),

@@ -1,14 +1,18 @@
 use std::cell::RefCell;
 use std::collections::{BTreeMap, HashMap};
+use std::io::{Read, Write};
+use std::net::TcpListener;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, atomic::AtomicBool};
+use std::thread;
 
 use super::{
     MAX_OBJECT_NAME_BYTES, PlannedUpload, plan_uploads, staging_path, upload_planned_files,
 };
 use crate::InterruptFlag;
+use crate::cloud::Cloud;
 use crate::error::AppError;
-use crate::storage::{ObjectPath, StorageClient};
+use crate::storage::{ObjectPath, StorageApi, StorageClient};
 
 const STAGING_PREFIX: &str = ".task-googlecloud-staging/0123456789abcdef0123456789abcdef";
 
@@ -18,6 +22,48 @@ fn object_name_with_bytes(length: usize) -> String {
         object.push('a');
     }
     object
+}
+
+fn lock_conflict_server() -> (
+    String,
+    Arc<std::sync::Mutex<Vec<String>>>,
+    thread::JoinHandle<()>,
+) {
+    let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+    let address = format!("http://{}/storage/v1", listener.local_addr().unwrap());
+    let requests = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let recorded_requests = Arc::clone(&requests);
+    let server = thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        let mut request = Vec::new();
+        let mut buffer = [0_u8; 1];
+        while !request.ends_with(b"\r\n\r\n") {
+            stream.read_exact(&mut buffer).unwrap();
+            request.push(buffer[0]);
+        }
+        let content_length = String::from_utf8_lossy(&request)
+            .lines()
+            .find_map(|line| {
+                let (name, value) = line.split_once(':')?;
+                name.eq_ignore_ascii_case("content-length")
+                    .then(|| value.trim().parse::<usize>().unwrap())
+            })
+            .unwrap_or(0);
+        let mut body = vec![0; content_length];
+        stream.read_exact(&mut body).unwrap();
+        request.extend(body);
+        recorded_requests
+            .lock()
+            .unwrap()
+            .push(String::from_utf8(request).unwrap());
+        let body = r#"{"error":{"message":"bucket is locked"}}"#;
+        let response = format!(
+            "HTTP/1.1 412 Error\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        );
+        stream.write_all(response.as_bytes()).unwrap();
+    });
+    (address, requests, server)
 }
 
 struct FakeStorage {
@@ -103,6 +149,30 @@ fn finalizes_uploaded_objects_using_their_uploaded_generation() {
         *storage.move_generations.borrow(),
         vec![Some("101".to_string())]
     );
+}
+
+#[test]
+fn returns_lock_conflicts_without_confirming_uploaded_objects() {
+    let (base, requests, server) = lock_conflict_server();
+    let storage =
+        StorageApi::with_endpoints(Cloud::new(), base.clone(), base, Some("token".to_string()));
+    let source = tempfile::NamedTempFile::new().unwrap();
+    std::fs::write(source.path(), b"contents").unwrap();
+    let uploads = vec![(
+        PathBuf::from("uploads/bucket"),
+        vec![PlannedUpload {
+            file: source.path().to_path_buf(),
+            staging: ObjectPath::parse("gs://bucket/staging").unwrap(),
+            target: ObjectPath::parse("gs://bucket/target").unwrap(),
+        }],
+    )];
+    let interrupt = InterruptFlag::from_atomic(Arc::new(AtomicBool::new(false)));
+
+    let error = upload_planned_files(&storage, &interrupt, &uploads).unwrap_err();
+    server.join().unwrap();
+
+    assert!(!matches!(error, AppError::Recovery { .. }), "{error}");
+    assert_eq!(requests.lock().unwrap().len(), 1);
 }
 
 #[test]

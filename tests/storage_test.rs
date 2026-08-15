@@ -6,7 +6,9 @@ use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
-use task_googlecloud::{AppError, Cloud, ObjectPath, StorageApi, StorageClient};
+use task_googlecloud::{
+    AppError, Cloud, InterruptFlag, ObjectPath, StorageApi, StorageClient, process_moves,
+};
 use tempfile::{NamedTempFile, TempDir, tempdir};
 
 const SERVER_TIMEOUT: Duration = Duration::from_secs(5);
@@ -819,7 +821,7 @@ fn does_not_move_when_the_bucket_lock_cannot_be_acquired() {
         .unwrap_err();
     server.join().unwrap();
 
-    assert!(matches!(error, AppError::Storage { status: 412, .. }));
+    assert!(matches!(error, AppError::BucketLockConflict(_)));
     let requests = requests.lock().unwrap();
     assert_eq!(requests.len(), 1);
     assert_eq!(
@@ -846,7 +848,7 @@ fn releases_earlier_bucket_locks_when_a_later_lock_cannot_be_acquired() {
         .unwrap_err();
     server.join().unwrap();
 
-    assert!(matches!(error, AppError::Storage { status: 412, .. }));
+    assert!(matches!(error, AppError::BucketLockConflict(_)));
     let requests = requests.lock().unwrap();
     assert_eq!(requests.len(), 3);
     assert_eq!(
@@ -861,6 +863,25 @@ fn releases_earlier_bucket_locks_when_a_later_lock_cannot_be_acquired() {
         request_line(&requests[2]),
         "DELETE /storage/v1/b/bucket-a/o/.task-googlecloud-lock?generation=lock HTTP/1.1"
     );
+}
+
+#[test]
+fn process_moves_returns_lock_conflicts_without_confirming_objects() {
+    let (base, requests, server) = test_server(vec![(
+        412,
+        r#"{"error":{"message":"bucket is locked"}}"#.to_string(),
+    )]);
+    let storage = storage(&base);
+    let interrupt = InterruptFlag::from_atomic(Arc::new(std::sync::atomic::AtomicBool::new(false)));
+    let source = ObjectPath::parse("gs://bucket/source").unwrap();
+    let target = ObjectPath::parse("gs://bucket/target").unwrap();
+    let temporary = ObjectPath::parse("gs://bucket/temporary").unwrap();
+
+    let error = process_moves(&storage, &interrupt, vec![(source, target, temporary)]).unwrap_err();
+    server.join().unwrap();
+
+    assert!(!matches!(error, AppError::Recovery { .. }), "{error}");
+    assert_eq!(requests.lock().unwrap().len(), 1);
 }
 
 #[test]
@@ -1072,7 +1093,7 @@ fn does_not_rollback_when_the_bucket_lock_cannot_be_acquired() {
         .unwrap_err();
     server.join().unwrap();
 
-    assert!(matches!(error, AppError::Storage { status: 412, .. }));
+    assert!(matches!(error, AppError::BucketLockConflict(_)));
     let requests = requests.lock().unwrap();
     assert_eq!(requests.len(), 1);
     assert_eq!(

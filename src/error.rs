@@ -21,6 +21,9 @@ pub enum AppError {
     #[error("Cloud Storage API request failed ({status}): {message}")]
     Storage { status: u16, message: String },
 
+    #[error("Cloud Storage bucket lock conflict: {0}")]
+    BucketLockConflict(Box<AppError>),
+
     #[error("Cloud command failed: {operation} (exit status: {status}){details}")]
     Command {
         operation: String,
@@ -89,6 +92,14 @@ impl AppError {
         match self {
             Self::Interrupted => true,
             Self::Token(error, _) => error.is_interrupted(),
+            _ => false,
+        }
+    }
+
+    pub(crate) fn is_bucket_lock_conflict(&self) -> bool {
+        match self {
+            Self::BucketLockConflict(_) => true,
+            Self::Rollback { original, .. } => original.is_bucket_lock_conflict(),
             _ => false,
         }
     }
