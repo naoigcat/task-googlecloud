@@ -213,6 +213,7 @@ fn distinguishes_interrupts_before_and_after_a_storage_request() {
         .unwrap_err();
 
     assert!(matches!(&before_request, super::AppError::Interrupted));
+    assert!(!before_request.reached_storage());
     assert!(!before_request.may_have_sent_storage_request());
 
     let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
@@ -261,7 +262,23 @@ fn distinguishes_interrupts_before_and_after_a_storage_request() {
         &after_request,
         super::AppError::InterruptedAfterRequest
     ));
+    assert!(after_request.reached_storage());
     assert!(after_request.may_have_sent_storage_request());
+}
+
+#[test]
+fn does_not_recover_an_unacknowledged_lock_for_an_unsent_interrupt() {
+    let interrupted = Arc::new(AtomicBool::new(true));
+    let storage = StorageApi::with_endpoints(
+        Cloud::with_interrupt(super::InterruptFlag::from_atomic(interrupted)),
+        "http://127.0.0.1:1/storage/v1",
+        "http://127.0.0.1:1/storage/v1",
+        Some("token".to_string()),
+    );
+
+    let error = storage.acquire_bucket_lock("bucket").unwrap_err();
+
+    assert!(matches!(error, super::AppError::Interrupted), "{error}");
 }
 
 #[test]
