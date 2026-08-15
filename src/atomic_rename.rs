@@ -83,7 +83,7 @@ pub(crate) fn directory_identity_from_path(
 pub(crate) fn file_identity_from_path(path: &std::path::Path) -> io::Result<FileIdentity> {
     let file = std::fs::OpenOptions::new()
         .read(true)
-        .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW)
+        .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_NONBLOCK)
         .open(path)?;
     if !file.metadata()?.file_type().is_file() {
         return Err(io::Error::new(
@@ -315,13 +315,20 @@ fn file_identity_at(directory: &File, name: &OsStr) -> Result<FileIdentity, AppE
         libc::openat(
             directory.as_raw_fd(),
             name.as_ptr(),
-            libc::O_RDONLY | libc::O_CLOEXEC | libc::O_NOFOLLOW,
+            libc::O_RDONLY | libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_NONBLOCK,
         )
     };
     if fd < 0 {
         return Err(std::io::Error::last_os_error().into());
     }
     let file = unsafe { File::from_raw_fd(fd) };
+    if !file.metadata()?.file_type().is_file() {
+        return Err(std::io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "identity source is not a regular file",
+        )
+        .into());
+    }
     Ok(file_identity(&file)?)
 }
 

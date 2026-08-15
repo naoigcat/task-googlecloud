@@ -1,5 +1,13 @@
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+use std::ffi::CString;
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+use std::os::unix::ffi::OsStrExt;
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+use std::os::unix::fs::OpenOptionsExt;
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+use std::path::Path;
 use std::sync::{
     Arc,
     atomic::{AtomicBool, Ordering},
@@ -11,6 +19,12 @@ use std::time::Instant;
 use tempfile::NamedTempFile;
 
 use super::{Cloud, Duration, ObjectPath, StorageApi, StorageClient};
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn create_fifo(path: &Path) {
+    let path = CString::new(path.as_os_str().as_bytes()).unwrap();
+    assert_eq!(unsafe { libc::mkfifo(path.as_ptr(), 0o600) }, 0);
+}
 
 fn read_headers(stream: &mut TcpStream) {
     let mut request = Vec::new();
@@ -386,6 +400,67 @@ fn refuses_upload_sources_through_parent_symlinks() {
         .upload_file(&source_through_link, &target)
         .unwrap_err();
 
+    assert!(matches!(error, super::AppError::UploadSource(_)), "{error}");
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn refuses_to_block_on_a_fifo_upload_source() {
+    let parent = tempfile::tempdir().unwrap();
+    let root = parent.path().join("uploads");
+    let bucket = root.join("bucket");
+    let source = bucket.join("file.txt");
+    std::fs::create_dir_all(&bucket).unwrap();
+    create_fifo(&source);
+
+    let target = ObjectPath::parse("gs://bucket/target").unwrap();
+    let mut storage = StorageApi::with_endpoint_options(
+        Cloud::new(),
+        "http://127.0.0.1:1/storage/v1",
+        "http://127.0.0.1:1/storage/v1",
+        Some("token".to_string()),
+        Duration::from_millis(10),
+    );
+    storage.upload_root = Some(root);
+    let (started_sender, started_receiver) = mpsc::channel();
+    let (result_sender, result_receiver) = mpsc::channel();
+    let source_for_thread = source.clone();
+    let target_for_thread = target.clone();
+    let worker = thread::spawn(move || {
+        started_sender.send(()).unwrap();
+        result_sender
+            .send(storage.upload_file(&source_for_thread, &target_for_thread))
+            .unwrap();
+    });
+    started_receiver
+        .recv_timeout(std::time::Duration::from_secs(1))
+        .unwrap();
+
+    let first_result = result_receiver.recv_timeout(std::time::Duration::from_millis(250));
+    let blocked = first_result.is_err();
+    let writer = if blocked {
+        Some(
+            std::fs::OpenOptions::new()
+                .write(true)
+                .custom_flags(libc::O_NONBLOCK)
+                .open(&source)
+                .unwrap(),
+        )
+    } else {
+        None
+    };
+    let result = if blocked {
+        result_receiver
+            .recv_timeout(std::time::Duration::from_secs(1))
+            .unwrap()
+    } else {
+        first_result.unwrap()
+    };
+    drop(writer);
+    worker.join().unwrap();
+
+    assert!(!blocked, "FIFO upload source blocked while opening");
+    let error = result.unwrap_err();
     assert!(matches!(error, super::AppError::UploadSource(_)), "{error}");
 }
 

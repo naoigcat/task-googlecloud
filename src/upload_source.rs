@@ -122,15 +122,19 @@ fn open_without_upload_root(
     source: &Path,
     expected_source: Option<UploadSourceIdentity>,
 ) -> Result<File, AppError> {
-    let metadata = fs::symlink_metadata(source).map_err(AppError::UploadSource)?;
-    if !metadata.file_type().is_file() {
-        return Err(rejected_source(format!("not a regular file: {source:?}")));
-    }
     let file = fs::OpenOptions::new()
         .read(true)
-        .custom_flags(libc::O_NOFOLLOW)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
         .open(source)
         .map_err(AppError::UploadSource)?;
+    if !file
+        .metadata()
+        .map_err(AppError::UploadSource)?
+        .file_type()
+        .is_file()
+    {
+        return Err(rejected_source(format!("not a regular file: {source:?}")));
+    }
     if let Some(expected_source) = expected_source {
         let parent = source
             .parent()
@@ -241,5 +245,5 @@ fn directory_flags() -> i32 {
 
 #[cfg(unix)]
 fn file_flags() -> i32 {
-    libc::O_RDONLY | libc::O_CLOEXEC | libc::O_NOFOLLOW
+    libc::O_RDONLY | libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_NONBLOCK
 }
