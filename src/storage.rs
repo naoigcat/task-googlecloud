@@ -450,12 +450,14 @@ impl StorageApi {
             request_sent = true;
             if rewrite.done {
                 let resource = rewrite.resource.ok_or_else(|| {
-                    AppError::Message("Cloud Storage rewrite omitted its resource".to_string())
+                    AppError::StorageResponse(
+                        "Cloud Storage rewrite omitted its resource".to_string(),
+                    )
                 })?;
                 return Ok(resource.generation);
             }
             rewrite_token = Some(rewrite.rewrite_token.ok_or_else(|| {
-                AppError::Message(
+                AppError::StorageResponse(
                     "Cloud Storage rewrite omitted its continuation token".to_string(),
                 )
             })?);
