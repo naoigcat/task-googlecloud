@@ -1,3 +1,5 @@
+#[cfg(test)]
+use std::sync::atomic::AtomicUsize;
 use std::sync::{
     Arc,
     atomic::{AtomicBool, Ordering},
@@ -27,6 +29,10 @@ pub(crate) struct StorageTransport {
     token_override: Option<String>,
     api_base: String,
     upload_base: String,
+    #[cfg(test)]
+    interrupt_after_request: Option<(usize, Arc<AtomicBool>)>,
+    #[cfg(test)]
+    request_count: AtomicUsize,
 }
 
 impl StorageTransport {
@@ -53,6 +59,10 @@ impl StorageTransport {
             token_override: token,
             api_base: api_base.into(),
             upload_base: upload_base.into(),
+            #[cfg(test)]
+            interrupt_after_request: None,
+            #[cfg(test)]
+            request_count: AtomicUsize::new(0),
         }
     }
 
@@ -117,18 +127,44 @@ impl StorageTransport {
                     },
                 }
             });
-        if self
+        let result = if self
             .interrupt
             .as_ref()
             .is_some_and(InterruptFlag::is_interrupted)
         {
-            return if request_started.load(Ordering::Relaxed) {
+            if request_started.load(Ordering::Relaxed) {
                 Err(AppError::InterruptedAfterRequest)
             } else {
                 result
-            };
-        }
+            }
+        } else {
+            result
+        };
+        #[cfg(test)]
+        self.interrupt_after_request();
         result
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_interrupt_after_request(
+        &mut self,
+        request_number: usize,
+        interrupt: Arc<AtomicBool>,
+    ) {
+        self.interrupt_after_request = Some((request_number, interrupt));
+    }
+
+    #[cfg(test)]
+    fn interrupt_after_request(&self) {
+        let Some((request_number, interrupt)) = &self.interrupt_after_request else {
+            return;
+        };
+        let current_request = self.request_count.fetch_add(1, Ordering::Relaxed) + 1;
+        if current_request == *request_number {
+            // Trigger only after the response has been classified so the next
+            // storage request observes a pre-request interruption.
+            interrupt.store(true, Ordering::Relaxed);
+        }
     }
 
     pub(crate) fn send_json<T>(

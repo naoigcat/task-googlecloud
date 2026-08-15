@@ -510,11 +510,47 @@ impl StorageApi {
         expected_generation: &str,
         operation: &str,
     ) -> Result<(), AppError> {
+        self.confirm_object_generation_with_interrupt_policy(
+            object,
+            expected_generation,
+            operation,
+            false,
+        )
+    }
+
+    fn confirm_move_generation(
+        &self,
+        object: &ObjectPath,
+        expected_generation: &str,
+        operation: &str,
+    ) -> Result<(), AppError> {
+        // Move rollback needs to distinguish an interrupted lookup from an
+        // unknown state so it can restore the copy before returning to callers.
+        self.confirm_object_generation_with_interrupt_policy(
+            object,
+            expected_generation,
+            operation,
+            true,
+        )
+    }
+
+    fn confirm_object_generation_with_interrupt_policy(
+        &self,
+        object: &ObjectPath,
+        expected_generation: &str,
+        operation: &str,
+        propagate_interrupt: bool,
+    ) -> Result<(), AppError> {
         // A copied object already changed remote state, so verification token
         // failures must remain recoverable.
-        let details = self
+        let details = match self
             .object_details(object)
-            .map_err(AppError::mark_reached_storage);
+            .map_err(AppError::mark_reached_storage)
+        {
+            Ok(details) => Ok(details),
+            Err(error) if propagate_interrupt && error.is_interrupted() => return Err(error),
+            Err(error) => Err(error),
+        };
         if matches!(
             &details,
             Ok((ObjectState::Present, Some(generation)))
@@ -754,20 +790,52 @@ impl StorageApi {
         };
         let target_generation =
             self.copy_object_unlocked(source, target, Some(&source_generation), Some("0"))?;
-        self.confirm_object_generation(target, &target_generation, "move object")?;
-        self.delete_object(source, &source_generation)
-            .map_err(AppError::mark_reached_storage)?;
-        let source_state = self
-            .object_state(source, None)
-            .map_err(AppError::mark_reached_storage)?;
-        self.confirm_object_generation(target, &target_generation, "move object")?;
-        if source_state != ObjectState::Missing {
-            return Err(AppError::Message(format!(
-                "Source object remains after moving {}",
-                source.uri()
-            )));
+        let result = (|| {
+            self.confirm_move_generation(target, &target_generation, "move object")?;
+            self.delete_object(source, &source_generation)
+                .map_err(AppError::mark_reached_storage)?;
+            let source_state = self
+                .object_state(source, None)
+                .map_err(AppError::mark_reached_storage)?;
+            self.confirm_move_generation(target, &target_generation, "move object")?;
+            if source_state != ObjectState::Missing {
+                return Err(AppError::Message(format!(
+                    "Source object remains after moving {}",
+                    source.uri()
+                )));
+            }
+            Ok(())
+        })();
+        match result {
+            Ok(()) => Ok(target_generation),
+            Err(error) if error.is_interrupted() => {
+                // The transaction cannot record a generation when this move
+                // exits before returning. Restore the state created by rewrite
+                // here so normalize and upload never leave an untracked copy.
+                self.transport.clear_interrupt_for_rollback();
+                match self.rollback_interrupted_move_unlocked(source, target, &target_generation) {
+                    Ok(()) => Err(AppError::Interrupted),
+                    Err(recovery) => Err(AppError::rollback(error, vec![recovery])),
+                }
+            }
+            Err(error) => Err(error),
         }
-        Ok(target_generation)
+    }
+
+    fn rollback_interrupted_move_unlocked(
+        &self,
+        source: &ObjectPath,
+        target: &ObjectPath,
+        target_generation: &str,
+    ) -> Result<(), AppError> {
+        // Source presence distinguishes a copy that was not followed by delete
+        // from a move whose source deletion already succeeded.
+        match self.object_state(source, None)? {
+            ObjectState::Present => self.cleanup_object_unlocked(target, target_generation),
+            ObjectState::Missing => self
+                .rollback_object_unlocked(source, target, target_generation)
+                .map(|_| ()),
+        }
     }
 
     fn rollback_object_unlocked(

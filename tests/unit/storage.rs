@@ -14,11 +14,11 @@ use std::sync::{
     mpsc,
 };
 use std::thread;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use tempfile::NamedTempFile;
 
-use super::{Cloud, Duration, ObjectPath, StorageApi, StorageClient};
+use super::{Cloud, ObjectPath, StorageApi, StorageClient};
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 fn create_fifo(path: &Path) {
@@ -57,11 +57,68 @@ fn read_request(stream: &mut TcpStream) -> String {
 }
 
 fn write_json(stream: &mut TcpStream, body: &str) {
+    write_response(stream, 200, "OK", body);
+}
+
+fn write_response(stream: &mut TcpStream, status: u16, reason: &str, body: &str) {
     let response = format!(
-        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        "HTTP/1.1 {status} {reason}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
         body.len()
     );
     stream.write_all(response.as_bytes()).unwrap();
+}
+
+fn accept_with_timeout(listener: &TcpListener) -> TcpStream {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        match listener.accept() {
+            Ok((stream, _)) => return stream,
+            Err(error)
+                if error.kind() == std::io::ErrorKind::WouldBlock && Instant::now() < deadline =>
+            {
+                thread::sleep(Duration::from_millis(10));
+            }
+            Err(error) => panic!("failed to accept test request: {error}"),
+        }
+    }
+}
+
+fn interrupted_move_responses(after_request: usize) -> Vec<(u16, &'static str)> {
+    let mut responses = vec![
+        (200, r#"{"generation":"lock"}"#),
+        (200, r#"{"done":true,"resource":{"generation":"22"}}"#),
+    ];
+    if after_request >= 3 {
+        responses.push((200, r#"{"generation":"22"}"#));
+    }
+    if after_request >= 4 {
+        responses.push((200, "{}"));
+    }
+    if after_request >= 5 {
+        responses.push((404, "{}"));
+    }
+    // The recovery path first determines whether source deletion succeeded,
+    // then either removes the copied target or restores the completed move.
+    responses.push(if after_request >= 5 {
+        (404, "{}")
+    } else {
+        (200, r#"{"generation":"11"}"#)
+    });
+    if after_request >= 5 {
+        responses.extend([
+            (404, "{}"),
+            (200, r#"{"generation":"22"}"#),
+            (200, r#"{"done":true,"resource":{"generation":"33"}}"#),
+            (200, r#"{"generation":"33"}"#),
+            (200, "{}"),
+            (404, "{}"),
+            (200, r#"{"generation":"33"}"#),
+        ]);
+    } else {
+        responses.extend([(200, r#"{"generation":"22"}"#), (200, "{}"), (404, "{}")]);
+    }
+    responses.push((200, "{}"));
+    responses
 }
 
 #[test]
@@ -264,6 +321,46 @@ fn distinguishes_interrupts_before_and_after_a_storage_request() {
     ));
     assert!(after_request.reached_storage());
     assert!(after_request.may_have_sent_storage_request());
+}
+
+#[test]
+fn rolls_back_a_move_interrupted_before_each_post_copy_request() {
+    for after_request in 2..=5 {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let base = format!("http://{}/storage/v1", listener.local_addr().unwrap());
+        let responses = interrupted_move_responses(after_request);
+        let server = thread::spawn(move || {
+            for (status, body) in responses {
+                let mut stream = accept_with_timeout(&listener);
+                read_headers(&mut stream);
+                let reason = if status == 404 { "Not Found" } else { "OK" };
+                write_response(&mut stream, status, reason, body);
+            }
+        });
+        let interrupted = Arc::new(AtomicBool::new(false));
+        let interrupt = super::InterruptFlag::from_atomic(Arc::clone(&interrupted));
+        let mut storage = StorageApi::with_endpoint_options(
+            Cloud::with_interrupt(interrupt),
+            base.clone(),
+            base,
+            Some("token".to_string()),
+            Duration::from_secs(30),
+        );
+        storage
+            .transport
+            .set_interrupt_after_request(after_request, Arc::clone(&interrupted));
+        let source = ObjectPath::parse("gs://bucket/source").unwrap();
+        let target = ObjectPath::parse("gs://bucket/target").unwrap();
+
+        let error = storage
+            .move_object(&source, &target, Some("11"))
+            .unwrap_err();
+
+        server.join().unwrap();
+        assert!(matches!(error, super::AppError::Interrupted), "{error}");
+        assert!(!interrupted.load(Ordering::Relaxed));
+    }
 }
 
 #[test]
