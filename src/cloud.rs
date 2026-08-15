@@ -10,15 +10,19 @@ const SSH_COMMAND_TIMEOUT: Duration = Duration::from_secs(5 * 60);
 const SSH_POLL_INTERVAL: Duration = Duration::from_millis(25);
 
 #[derive(Clone, Debug, Default)]
+/// Runs Cloud SDK commands inside the dedicated, host-verified SSH container.
 pub struct Cloud {
     interrupt: Option<InterruptFlag>,
 }
 
 impl Cloud {
+    /// Creates a cloud command runner without signal handling.
     pub fn new() -> Self {
         Self::default()
     }
 
+    /// Creates a cloud command runner that can terminate child processes when
+    /// the workflow receives SIGINT or SIGTERM.
     pub fn with_interrupt(interrupt: InterruptFlag) -> Self {
         Self {
             interrupt: Some(interrupt),
@@ -29,6 +33,10 @@ impl Cloud {
         self.interrupt.clone()
     }
 
+    /// Ensures that the remote Cloud SDK has an authenticated account.
+    ///
+    /// If no account is configured, this starts the interactive login flow in
+    /// the container that owns the temporary credentials.
     pub fn login(&self) -> Result<(), AppError> {
         let account = self.run_capture("gcloud config get account")?;
         if account.trim().is_empty() || account.trim() == "(unset)" {
@@ -37,6 +45,7 @@ impl Cloud {
         Ok(())
     }
 
+    /// Selects the Google Cloud project used by subsequent SDK commands.
     pub fn set_project(&self, project: &str) -> Result<(), AppError> {
         self.run_script(
             "set -eu\ngcloud config set project \"$1\"\n",
@@ -45,6 +54,7 @@ impl Cloud {
         Ok(())
     }
 
+    /// Returns a fresh access token from the remote Cloud SDK.
     pub fn access_token(&self) -> Result<String, AppError> {
         Ok(self
             .run_capture("gcloud auth print-access-token")?
@@ -124,6 +134,8 @@ impl Cloud {
 
     fn ssh(&self, remote_command: &str) -> Command {
         let mut command = Command::new("ssh");
+        // The container is ephemeral, so use its mounted key and known-hosts
+        // files rather than accepting SSH identity data at runtime.
         command.args([
             "-i",
             "/run/googlecloud-ssh/client_key",
@@ -191,6 +203,8 @@ fn wait_for_child_with_input(
     operation: &str,
     input: Option<Vec<u8>>,
 ) -> Result<Output, AppError> {
+    // Drain both output pipes and write stdin on separate threads so a child
+    // blocked on a full pipe cannot deadlock the polling loop.
     let mut stdout = spawn_reader(child.stdout.take());
     let mut stderr = spawn_reader(child.stderr.take());
     let mut stdin_writer = spawn_writer(child.stdin.take(), input);
@@ -287,6 +301,8 @@ fn discard_writer(writer: Option<JoinHandle<io::Result<()>>>) {
 }
 
 fn terminate_child(child: &mut Child) -> Result<(), AppError> {
+    // Reap the process after killing it; otherwise a timed-out or interrupted
+    // Cloud SDK command can remain as a zombie while rollback is running.
     if let Err(error) = child.kill()
         && child.try_wait()?.is_none()
     {

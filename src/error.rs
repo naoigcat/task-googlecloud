@@ -3,6 +3,8 @@ use std::io;
 use thiserror::Error;
 
 #[derive(Debug, Error)]
+/// Errors are classified by whether a request may have changed remote state so
+/// callers can choose confirmation, rollback, or immediate failure safely.
 pub enum AppError {
     #[error("{0}")]
     Message(String),
@@ -24,6 +26,7 @@ pub enum AppError {
     #[error("{0}")]
     StorageResponse(String),
 
+    /// The bucket lock already belongs to another compliant writer.
     #[error("Cloud Storage bucket lock conflict: {0}")]
     BucketLockConflict(Box<AppError>),
 
@@ -34,6 +37,8 @@ pub enum AppError {
         details: String,
     },
 
+    /// Access-token retrieval failed. The boolean records whether an earlier
+    /// request in the same operation may already have reached Cloud Storage.
     #[error("Cloud Storage token retrieval failed: {0}")]
     Token(Box<AppError>, bool),
 
@@ -47,6 +52,8 @@ pub enum AppError {
     #[error("Normalized names collide: {0}")]
     Collision(String),
 
+    /// Combines an operation failure with failures encountered while restoring
+    /// local or remote state.
     #[error("{original}; rollback failed: {details}")]
     Rollback {
         original: Box<AppError>,

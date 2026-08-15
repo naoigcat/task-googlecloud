@@ -82,6 +82,8 @@ impl StorageTransport {
             return Err(AppError::Interrupted);
         }
         let interrupt = self.interrupt.clone();
+        // Record whether the HTTP future started before an interrupt won the
+        // race; only requests that may have been sent require state recovery.
         let request_started = Arc::new(AtomicBool::new(false));
         let request_started_for_request = Arc::clone(&request_started);
         let request_started_for_select = Arc::clone(&request_started);

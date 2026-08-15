@@ -50,11 +50,13 @@ const PATH_SEGMENT: &AsciiSet = &CONTROLS
     .add(b'}');
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+/// Metadata needed to identify one immutable Cloud Storage object version.
 pub struct ObjectMetadata {
     pub generation: String,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// Result of an object lookup, including generation-constrained lookups.
 pub enum ObjectState {
     Present,
     Missing,
@@ -66,6 +68,10 @@ struct BucketLock {
     generation: String,
 }
 
+/// Storage operations used by the workflows.
+///
+/// Implementations must preserve generation preconditions and report whether a
+/// failed request may have reached Cloud Storage so callers can recover safely.
 pub trait StorageClient {
     fn list_objects(&self, bucket: &str) -> Result<Vec<String>, AppError>;
     fn with_bucket_locks<T, F>(&self, _buckets: &[&str], operation: F) -> Result<T, AppError>
@@ -115,6 +121,7 @@ pub trait StorageClient {
     ) -> Result<(), AppError>;
 }
 
+/// Cloud Storage JSON API client with bucket locking and generation checks.
 pub struct StorageApi {
     transport: StorageTransport,
     upload_root: Option<PathBuf>,
@@ -123,12 +130,18 @@ pub struct StorageApi {
 }
 
 impl StorageApi {
+    /// Creates a client for the production Cloud Storage endpoints and the
+    /// repository's `uploads/` input directory.
     pub fn new(cloud: Cloud) -> Self {
         let mut storage = Self::with_endpoints(cloud, API_BASE, UPLOAD_BASE, None);
         storage.upload_root = Some(PathBuf::from(UPLOAD_ROOT));
         storage
     }
 
+    /// Creates a client with injectable endpoints and an optional token.
+    ///
+    /// The endpoint and token parameters are primarily useful for deterministic
+    /// tests; production callers should use [`StorageApi::new`].
     pub fn with_endpoints(
         cloud: Cloud,
         api_base: impl Into<String>,
@@ -198,6 +211,8 @@ impl StorageApi {
                 .body(token.as_bytes().to_vec()),
             "Invalid Cloud Storage bucket lock response",
         );
+        // A timeout can occur after the create request succeeded. Delete the
+        // lock only when its token still proves that this run created it.
         let metadata = match metadata {
             Err(error) if error.status() == Some(412) => {
                 return Err(AppError::BucketLockConflict(Box::new(error)));
@@ -263,6 +278,8 @@ impl StorageApi {
         F: FnOnce() -> Result<T, AppError>,
     {
         let mut bucket_names = buckets.to_vec();
+        // A stable acquisition order prevents two cross-bucket moves from
+        // deadlocking while each waits for the other bucket's lock.
         bucket_names.sort_unstable();
         bucket_names.dedup();
 
@@ -394,6 +411,8 @@ impl StorageApi {
         }
     }
 
+    /// Copies an object while applying optional source and destination
+    /// generation preconditions, returning the new destination generation.
     pub fn copy_object(
         &self,
         source: &ObjectPath,
@@ -442,6 +461,8 @@ impl StorageApi {
                 url.push_str(&query_with_token);
             }
 
+            // Rewrite can be paginated for large objects; retain the token and
+            // classify later failures as post-request failures for recovery.
             let rewrite: RewriteResponse = self
                 .transport
                 .send_json(
@@ -488,7 +509,8 @@ impl StorageApi {
         expected_generation: &str,
         operation: &str,
     ) -> Result<(), AppError> {
-        // A copied object already changed remote state, so verification token failures must remain recoverable.
+        // A copied object already changed remote state, so verification token
+        // failures must remain recoverable.
         let details = self
             .object_details(object)
             .map_err(AppError::mark_reached_storage);
@@ -703,6 +725,8 @@ impl StorageApi {
                 listing
                     .items
                     .into_iter()
+                    // The lock object is an internal coordination record, not
+                    // an input object that should be normalized.
                     .filter(|item| item.name != BUCKET_LOCK_OBJECT)
                     .map(|item| format!("gs://{bucket}/{}", item.name)),
             );
@@ -719,6 +743,9 @@ impl StorageApi {
         target: &ObjectPath,
         expected_source_generation: Option<&str>,
     ) -> Result<String, AppError> {
+        // Cloud Storage exposes copy/rewrite and delete separately. The
+        // generation checks and confirmations below make that pair safe to
+        // treat as a move even when a response is lost between requests.
         let source_generation = match expected_source_generation {
             Some(generation) => generation.to_string(),
             None => self.object_metadata(source, None)?.generation,
@@ -747,6 +774,8 @@ impl StorageApi {
         target: &ObjectPath,
         target_generation: &str,
     ) -> Result<String, AppError> {
+        // Confirm ownership before restoring so a rollback cannot delete or
+        // overwrite an object created by another writer after the failure.
         if self.object_state(source, None)? != ObjectState::Missing
             || self.object_state(target, Some(target_generation))? != ObjectState::Present
         {
@@ -779,6 +808,8 @@ impl StorageApi {
         target: &ObjectPath,
         target_generation: &str,
     ) -> Result<(), AppError> {
+        // Delete only the generation recorded by this run; an object at the
+        // same path with a newer generation belongs to someone else.
         match self.object_state(target, Some(target_generation))? {
             ObjectState::Present => self
                 .delete_object(target, target_generation)

@@ -33,11 +33,16 @@ use std::sync::{
 use signal_hook::consts::{SIGINT, SIGTERM};
 
 #[derive(Clone, Debug)]
+/// Shared signal state used to stop the current operation and then permit rollback.
 pub struct InterruptFlag {
     interrupted: Arc<AtomicBool>,
 }
 
 impl InterruptFlag {
+    /// Registers the signal handlers used by the CLI.
+    ///
+    /// The handlers only set an atomic flag; the operation checks that flag at
+    /// safe boundaries so cleanup can run in ordinary Rust code.
     pub fn install() -> Result<Self, AppError> {
         let interrupted = Arc::new(AtomicBool::new(false));
         signal_hook::flag::register(SIGINT, Arc::clone(&interrupted))?;
@@ -55,7 +60,8 @@ impl InterruptFlag {
     }
 
     pub(crate) fn clear_for_rollback(&self) -> bool {
-        // The signal aborts the in-flight command, but rollback must still be able to reach Cloud Storage.
+        // The signal aborts the in-flight command, but rollback must still be
+        // able to reach Cloud Storage.
         self.interrupted.swap(false, Ordering::Relaxed)
     }
 
@@ -68,6 +74,7 @@ impl InterruptFlag {
 }
 
 #[derive(Debug, Clone)]
+/// A top-level workflow accepted by the command-line application.
 pub enum Command {
     Normalize { project: String, bucket: String },
     Upload { project: String },
@@ -79,6 +86,8 @@ pub fn run(
     storage: StorageApi,
     interrupt: InterruptFlag,
 ) -> Result<(), AppError> {
+    // Keep command dispatch here so both the CLI and tests use the same
+    // authentication, locking, and rollback paths.
     match command {
         Command::Normalize { project, bucket } => {
             normalize::run(&cloud, &storage, &interrupt, &project, &bucket)

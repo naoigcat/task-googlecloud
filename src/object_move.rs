@@ -3,6 +3,10 @@ use crate::error::AppError;
 use crate::storage::{ObjectPath, StorageClient};
 use crate::upload_source::UploadSourceIdentity;
 
+/// Executes one remote move and confirms object state when the request fails.
+///
+/// A failed HTTP response is not enough to prove that copy/delete did not run,
+/// so the confirmation path distinguishes a safe retry from manual recovery.
 pub fn execute<S: StorageClient>(
     storage: &S,
     interrupt: &InterruptFlag,
@@ -28,6 +32,8 @@ pub fn execute<S: StorageClient>(
     }
 }
 
+/// Uploads one local file and applies the same post-failure confirmation rules
+/// as a remote move.
 pub fn execute_upload<S: StorageClient>(
     storage: &S,
     interrupt: &InterruptFlag,

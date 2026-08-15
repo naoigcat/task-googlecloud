@@ -16,6 +16,9 @@ struct RenameRecord {
     target: PathBuf,
 }
 
+/// Applies the planned local renames without overwriting a target.
+///
+/// On failure, already completed renames are rolled back in reverse order.
 pub fn apply_normalization(
     root: &Path,
     entries: &[Entry],
@@ -41,6 +44,8 @@ pub(crate) fn apply_normalization_with_path_identities(
     expected_directories: Option<&HashMap<PathBuf, DirectoryIdentity>>,
     interrupt: &InterruptFlag,
 ) -> Result<HashMap<PathBuf, PathBuf>, AppError> {
+    // Preserve the planned identities so rollback can refuse to overwrite a
+    // path that another process replaced while this transaction was running.
     let mut renamed = Vec::new();
     let operation = (|| {
         for entry in entries {
@@ -91,6 +96,7 @@ pub(crate) fn apply_normalization_with_path_identities(
         .collect())
 }
 
+/// Attempts to restore each `(source, target)` pair produced by normalization.
 pub fn rollback_normalization(root: &Path, entries: &[(PathBuf, PathBuf)]) -> Vec<AppError> {
     rollback_normalization_with_identity(root, None, entries)
 }
@@ -134,6 +140,8 @@ fn rollback(
     entries: &[RenameRecord],
 ) -> Vec<AppError> {
     let mut errors = Vec::new();
+    // Reverse order restores chained renames without making an earlier source
+    // name collide with a later rename that has not been undone yet.
     for entry in entries.iter().rev() {
         if entry.source == entry.target {
             continue;
@@ -175,6 +183,7 @@ fn rollback(
     errors
 }
 
+/// Converts a local path to the UTF-8 object name expected by the API.
 pub fn path_string(path: &Path) -> Result<String, AppError> {
     path.to_str()
         .map(str::to_string)

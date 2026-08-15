@@ -18,6 +18,8 @@ use crate::upload_source::UploadSourceIdentity;
 #[cfg(test)]
 pub(crate) use crate::object_path::MAX_OBJECT_NAME_BYTES;
 
+/// Normalizes discovered local filenames, uploads them to per-directory
+/// buckets, and rolls back local and remote changes if the transaction fails.
 pub fn run<S: StorageClient>(
     cloud: &Cloud,
     storage: &S,
@@ -145,6 +147,8 @@ fn discover_uploads(root: &Path) -> Result<UploadDiscovery, AppError> {
     let root_identity = directory_identity_from_metadata(&root_metadata);
     let mut directory_identities = HashMap::new();
     let mut file_identities = HashMap::new();
+    // Discovery records identities as well as paths because a later open by
+    // pathname must not silently accept a replacement file or directory.
     for directory in fs::read_dir(root)? {
         let directory = directory?.path();
         let directory_metadata = fs::symlink_metadata(&directory)?;
@@ -212,6 +216,8 @@ struct PlannedDirectoryUploads {
 }
 
 fn staging_prefix() -> String {
+    // A run-specific prefix keeps abandoned uploads distinguishable during
+    // manual recovery after a forced termination.
     format!(
         ".task-googlecloud-staging/{}",
         uuid::Uuid::new_v4().simple()
@@ -250,6 +256,8 @@ fn plan_uploads_with_identities(
             })?;
         let mut uploads = Vec::new();
         for file in files {
+            // Keep the original discovered identity attached to the normalized
+            // path so a replacement cannot be uploaded under the old name.
             let normalized_file = normalized_files.get(file).ok_or_else(|| {
                 AppError::Message(format!("Missing normalized path for {file:?}"))
             })?;
@@ -316,6 +324,9 @@ fn upload_planned_files_unlocked<S: StorageClient>(
     let mut finalized = Vec::new();
 
     let operation = (|| {
+        // Upload everything to private staging names first. Finalization is
+        // then generation-guarded, so partial runs can be identified and
+        // rolled back without touching another writer's object.
         for planned in uploads {
             println!("{}", planned.directory.display());
             for upload in &planned.uploads {
@@ -386,6 +397,10 @@ fn staging_path(
     Ok(staging)
 }
 
+/// Restores finalized remote objects and removes uploads that never finalized.
+///
+/// Finalized changes are rolled back first because their staging objects have
+/// been consumed by the move; remaining staged changes can then be deleted.
 pub fn rollback_remote<S: StorageClient>(
     storage: &S,
     staged: &[RemoteChange],

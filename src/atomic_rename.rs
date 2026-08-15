@@ -16,6 +16,7 @@ use std::os::unix::io::{AsRawFd, FromRawFd};
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// Device/inode identity used to detect replacement of a directory.
 pub struct DirectoryIdentity {
     device: u64,
     inode: u64,
@@ -27,6 +28,7 @@ pub struct DirectoryIdentity;
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// Device/inode identity used to detect replacement of a file.
 pub struct FileIdentity {
     device: u64,
     inode: u64,
@@ -84,6 +86,10 @@ pub(crate) fn directory_identity(_file: &File) -> io::Result<DirectoryIdentity> 
     Ok(DirectoryIdentity)
 }
 
+/// Atomically renames a path without replacing an existing target.
+///
+/// Linux and macOS provide the required no-replace primitive; other platforms
+/// return [`AppError::UnsupportedPlatform`].
 pub fn rename_without_overwrite(root: &Path, source: &Path, target: &Path) -> Result<(), AppError> {
     rename_without_overwrite_with_identity(root, None, None, None, None, source, target)
 }
@@ -103,6 +109,8 @@ pub(crate) fn rename_without_overwrite_with_identity(
 
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     {
+        // Resolve both parents from an open root descriptor so a concurrent
+        // replacement of the root or an intermediate directory is detected.
         let root_directory = open_directory(root)?;
         if let Some(expected_root) = expected_root
             && directory_identity(&root_directory)? != expected_root
@@ -267,6 +275,8 @@ fn rename_noreplace(
     target_directory: &File,
     target_name: &CString,
 ) -> io::Result<()> {
+    // Use the platform's atomic exclusive rename rather than a check-then-rename
+    // sequence, which would allow another process to create the target in between.
     #[cfg(target_os = "linux")]
     let status = unsafe {
         libc::renameat2(

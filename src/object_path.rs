@@ -5,12 +5,15 @@ use crate::error::AppError;
 pub(crate) const MAX_OBJECT_NAME_BYTES: usize = 1024;
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
+/// A parsed `gs://bucket/object` URI that keeps bucket and object encoding
+/// separate when constructing Cloud Storage API requests.
 pub struct ObjectPath {
     pub bucket: String,
     pub object: String,
 }
 
 impl ObjectPath {
+    /// Parses a non-empty Cloud Storage URI into its bucket and object parts.
     pub fn parse(value: &str) -> Result<Self, AppError> {
         let Some(value) = value.strip_prefix("gs://") else {
             return Err(AppError::InvalidStorageUri(value.to_string()));
@@ -41,6 +44,7 @@ impl ObjectPath {
         Ok(())
     }
 
+    /// Returns the canonical URI form used in diagnostics and recovery steps.
     pub fn uri(&self) -> String {
         format!("gs://{}/{}", self.bucket, self.object)
     }

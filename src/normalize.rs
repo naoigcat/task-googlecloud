@@ -28,6 +28,8 @@ pub fn run<S: StorageClient>(
     cloud.login()?;
     cloud.set_project(project)?;
     storage.with_bucket_locks(&[bucket], || {
+        // Hold the lock while listing and applying the plan so the snapshot
+        // cannot be invalidated by another compliant writer.
         let files = storage.list_objects(bucket)?;
         let plan = normalization_plan::build(&files)?;
         let moves = plan_moves(plan)?;
@@ -42,6 +44,8 @@ fn plan_moves(plan: Vec<normalization_plan::Entry>) -> Result<Vec<PlannedMove>, 
             let source = ObjectPath::parse(&entry.source)?;
             let target = ObjectPath::parse(&entry.target)?;
             target.validate_name_length("normalized target")?;
+            // Staging gives each move a unique temporary name, so finalization
+            // does not depend on a source path that another move already changed.
             let temporary = temporary_path(&source)?;
             Ok(PlannedMove {
                 source,
@@ -52,6 +56,8 @@ fn plan_moves(plan: Vec<normalization_plan::Entry>) -> Result<Vec<PlannedMove>, 
         .collect()
 }
 
+/// Processes remote moves in a staging phase followed by a finalization
+/// phase, rolling back every change if either phase fails.
 pub fn process_moves<S: StorageClient>(
     storage: &S,
     interrupt: &InterruptFlag,
@@ -90,6 +96,8 @@ fn process_moves_unlocked<S: StorageClient>(
     let mut finalized = Vec::new();
 
     let operation = (|| {
+        // Separate staging from finalization so no finalization depends on a
+        // source path that an earlier item has already moved.
         for planned in moves {
             let generation = object_move::execute(
                 storage,

@@ -2,6 +2,7 @@ use crate::error::AppError;
 use crate::storage::{ObjectPath, StorageClient};
 
 #[derive(Clone, Debug)]
+/// One remote change and the generation that this run owns at its target.
 pub struct RemoteChange {
     pub source: ObjectPath,
     pub target: ObjectPath,
@@ -14,6 +15,8 @@ pub(crate) fn rollback_moves<S: StorageClient>(
     finalized: &[RemoteChange],
 ) -> Vec<AppError> {
     let mut errors = Vec::new();
+    // Undo finalized moves first, then the still-staged moves. Reverse order
+    // preserves the same dependency ordering used while applying the plan.
     for change in finalized.iter().rev() {
         if let Err(error) =
             storage.rollback_object(&change.source, &change.target, &change.generation)

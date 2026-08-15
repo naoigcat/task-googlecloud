@@ -19,12 +19,15 @@ use crate::atomic_rename::{
 use crate::error::AppError;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// Filesystem identities captured during discovery and checked again at upload.
 pub struct UploadSourceIdentity {
     pub(crate) file: FileIdentity,
     pub(crate) directory: DirectoryIdentity,
 }
 
 #[cfg(unix)]
+/// Opens an upload source without following links and, when supplied, verifies
+/// that the discovered root, directory, and file are still the same entries.
 pub(crate) fn open(
     root: Option<&Path>,
     source: &Path,
@@ -89,6 +92,8 @@ fn open_relative_without_following_links(
     expected_root: Option<DirectoryIdentity>,
     expected_source: Option<UploadSourceIdentity>,
 ) -> Result<File, AppError> {
+    // Keep the root directory open and resolve every component relative to its
+    // descriptor so a path replacement cannot redirect the upload elsewhere.
     let directory = open_directory(root)?;
     if let Some(expected_root) = expected_root {
         let actual_root = directory_identity(&directory).map_err(AppError::UploadSource)?;
@@ -150,6 +155,8 @@ fn open_path_components(
 ) -> Result<File, AppError> {
     let mut components = source.components().peekable();
 
+    // O_NOFOLLOW is applied to every directory and the final file, not just
+    // the path's last component, to prevent parent symlink traversal.
     while let Some(component) = components.next() {
         match component {
             Component::CurDir => {}
@@ -221,6 +228,8 @@ fn open_at(directory: RawFd, name: &std::ffi::OsStr, flags: i32) -> Result<RawFd
 
 #[cfg(unix)]
 fn directory_flags() -> i32 {
+    // Descriptor-relative traversal and O_NOFOLLOW keep uploads inside the
+    // directory tree captured during discovery.
     libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC | libc::O_NOFOLLOW
 }
 
