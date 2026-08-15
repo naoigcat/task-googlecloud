@@ -364,6 +364,26 @@ fn refuses_to_modify_the_reserved_bucket_lock_object() {
 }
 
 #[test]
+fn rejects_a_reserved_upload_target_before_opening_the_source() {
+    let storage = StorageApi::with_endpoints(
+        Cloud::new(),
+        "http://127.0.0.1:1/storage/v1",
+        "http://127.0.0.1:1/storage/v1",
+        Some("token".to_string()),
+    );
+    let lock = ObjectPath::parse("gs://bucket/.task-googlecloud-lock").unwrap();
+
+    let error = storage
+        .upload_file(std::path::Path::new("/path/that/does/not/exist"), &lock)
+        .unwrap_err();
+
+    assert!(
+        matches!(error, AppError::Message(ref message) if message.contains("reserved bucket lock")),
+        "{error}"
+    );
+}
+
+#[test]
 fn lists_empty_and_paginated_responses() {
     let (base, requests, server) = test_server(vec![
         bucket_lock_created(),

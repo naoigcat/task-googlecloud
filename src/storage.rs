@@ -261,6 +261,20 @@ impl StorageApi {
         Ok(())
     }
 
+    fn with_object_locks<T, F>(&self, objects: &[&ObjectPath], operation: F) -> Result<T, AppError>
+    where
+        F: FnOnce() -> Result<T, AppError>,
+    {
+        for object in objects {
+            Self::reject_bucket_lock_object(object)?;
+        }
+        let buckets = objects
+            .iter()
+            .map(|object| object.bucket.as_str())
+            .collect::<Vec<_>>();
+        self.with_bucket_locks(&buckets, operation)
+    }
+
     fn release_bucket_locks(&self, locks: &[BucketLock]) -> Vec<AppError> {
         locks
             .iter()
@@ -421,9 +435,7 @@ impl StorageApi {
         source_generation: Option<&str>,
         destination_generation: Option<&str>,
     ) -> Result<String, AppError> {
-        Self::reject_bucket_lock_object(source)?;
-        Self::reject_bucket_lock_object(target)?;
-        self.with_bucket_locks(&[source.bucket.as_str(), target.bucket.as_str()], || {
+        self.with_object_locks(&[source, target], || {
             self.copy_object_unlocked(source, target, source_generation, destination_generation)
         })
     }
@@ -611,9 +623,7 @@ impl StorageClient for StorageApi {
         target: &ObjectPath,
         expected_source_generation: Option<&str>,
     ) -> Result<String, AppError> {
-        Self::reject_bucket_lock_object(source)?;
-        Self::reject_bucket_lock_object(target)?;
-        self.with_bucket_locks(&[source.bucket.as_str(), target.bucket.as_str()], || {
+        self.with_object_locks(&[source, target], || {
             self.move_object_unlocked(source, target, expected_source_generation)
         })
     }
@@ -624,16 +634,13 @@ impl StorageClient for StorageApi {
         target: &ObjectPath,
         target_generation: &str,
     ) -> Result<String, AppError> {
-        Self::reject_bucket_lock_object(source)?;
-        Self::reject_bucket_lock_object(target)?;
-        self.with_bucket_locks(&[source.bucket.as_str(), target.bucket.as_str()], || {
+        self.with_object_locks(&[source, target], || {
             self.rollback_object_unlocked(source, target, target_generation)
         })
     }
 
     fn cleanup_object(&self, target: &ObjectPath, target_generation: &str) -> Result<(), AppError> {
-        Self::reject_bucket_lock_object(target)?;
-        self.with_bucket_locks(&[target.bucket.as_str()], || {
+        self.with_object_locks(&[target], || {
             self.cleanup_object_unlocked(target, target_generation)
         })
     }
@@ -712,7 +719,7 @@ impl StorageApi {
             expected_source,
         )?;
         let size = file.metadata().map_err(AppError::UploadSource)?.len();
-        self.with_bucket_locks(&[target.bucket.as_str()], || {
+        self.with_object_locks(&[target], || {
             let url = with_query(
                 format!(
                     "{}/b/{}/o",
