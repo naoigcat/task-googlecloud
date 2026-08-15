@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::thread::{self, ThreadId};
@@ -151,7 +151,7 @@ pub struct StorageApi {
     transport: StorageTransport,
     upload_root: Option<PathBuf>,
     upload_root_identity: Mutex<Option<DirectoryIdentity>>,
-    active_bucket_locks: Mutex<HashMap<ThreadId, Vec<String>>>,
+    active_bucket_locks: Mutex<HashMap<ThreadId, HashSet<String>>>,
 }
 
 impl StorageApi {
@@ -333,7 +333,7 @@ impl StorageApi {
         let buckets_to_acquire = bucket_names
             .iter()
             .copied()
-            .filter(|bucket| !held_buckets.iter().any(|held| held == bucket))
+            .filter(|bucket| !held_buckets.contains(*bucket))
             .collect::<Vec<_>>();
         if buckets_to_acquire.is_empty() {
             return operation();
@@ -410,9 +410,7 @@ impl StorageApi {
             .map_err(|_| AppError::Message("Active bucket lock state is poisoned".to_string()))?;
         if let Some(held) = active.get_mut(&owner) {
             for bucket in buckets {
-                if let Some(index) = held.iter().position(|held| held == bucket) {
-                    held.remove(index);
-                }
+                held.remove(*bucket);
             }
             if held.is_empty() {
                 active.remove(&owner);
