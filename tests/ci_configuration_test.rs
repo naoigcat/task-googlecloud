@@ -34,3 +34,15 @@ fn shellcheck_covers_the_cloud_entrypoint_in_ci() {
     assert!(mise.contains("docker compose run --rm -T --no-deps app shellcheck -"));
     assert!(workflow.contains("run: mise run shellcheck"));
 }
+
+#[test]
+fn actionlint_image_is_pinned_by_digest() {
+    let root = env!("CARGO_MANIFEST_DIR");
+    let workflow = fs::read_to_string(format!("{root}/.github/workflows/actionlint.yml"))
+        .expect("GitHub Actions Actionlint workflow should be readable");
+
+    assert!(workflow.contains(
+        "uses: docker://rhysd/actionlint@sha256:b1934ee5f1c509618f2508e6eb47ee0d3520686341fec936f3b79331f9315667 # v1.7.12"
+    ));
+    assert!(!workflow.contains("uses: docker://rhysd/actionlint:1.7.12"));
+}
