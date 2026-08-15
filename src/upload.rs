@@ -9,8 +9,11 @@ use crate::error::AppError;
 use crate::local;
 use crate::normalization_plan;
 use crate::object_move;
-use crate::storage::{MAX_OBJECT_NAME_BYTES, ObjectPath, StorageClient, UPLOAD_ROOT};
+use crate::storage::{ObjectPath, StorageClient, UPLOAD_ROOT};
 use crate::transaction::RemoteChange;
+
+#[cfg(test)]
+pub(crate) use crate::object_path::MAX_OBJECT_NAME_BYTES;
 
 pub fn run<S: StorageClient>(
     cloud: &Cloud,
@@ -286,12 +289,9 @@ fn staging_path(
     object_name: &str,
 ) -> Result<ObjectPath, AppError> {
     let staging_name = format!("{staging_prefix}/{object_name}");
-    if staging_name.len() > MAX_OBJECT_NAME_BYTES {
-        return Err(AppError::Message(format!(
-            "Object name is too long for temporary staging: gs://{bucket}/{object_name}"
-        )));
-    }
-    ObjectPath::parse(&format!("gs://{bucket}/{staging_name}"))
+    let staging = ObjectPath::from_parts(bucket, &staging_name);
+    staging.validate_name_length("temporary staging")?;
+    Ok(staging)
 }
 
 pub fn rollback_remote<S: StorageClient>(

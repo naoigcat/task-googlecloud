@@ -5,6 +5,7 @@ mod local;
 mod normalization_plan;
 mod normalize;
 mod object_move;
+mod object_path;
 mod storage;
 mod storage_transport;
 mod transaction;
@@ -17,8 +18,9 @@ pub use error::AppError;
 pub use local::{apply_normalization, path_string, rollback_normalization};
 pub use normalization_plan::{Entry, build as build_normalization_plan, normalized};
 pub use normalize::process_moves;
+pub use object_path::ObjectPath;
 pub use storage::StorageApi;
-pub use storage::{ObjectPath, StorageClient};
+pub use storage::StorageClient;
 pub use transaction::RemoteChange;
 pub use upload::{rollback_remote, upload_files_by_directory};
 

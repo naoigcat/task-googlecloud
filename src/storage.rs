@@ -16,15 +16,13 @@ pub(crate) use crate::InterruptFlag;
 use crate::atomic_rename::DirectoryIdentity;
 use crate::cloud::Cloud;
 use crate::error::AppError;
+pub use crate::object_path::ObjectPath;
 use crate::storage_transport::{REQUEST_TIMEOUT, StorageTransport, UPLOAD_TIMEOUT};
 use crate::upload_source;
 
 /// Uploads are confined to this directory, so file discovery and the confined
 /// open must agree on where it is.
 pub(crate) const UPLOAD_ROOT: &str = "uploads";
-/// Cloud Storage rejects object names longer than this, so reject them before
-/// any request is sent and the transaction is half applied.
-pub(crate) const MAX_OBJECT_NAME_BYTES: usize = 1024;
 const API_BASE: &str = "https://storage.googleapis.com/storage/v1";
 const UPLOAD_BASE: &str = "https://storage.googleapis.com/upload/storage/v1";
 /// A generation-guarded marker serializes mutations through this client, so a
@@ -50,34 +48,6 @@ const PATH_SEGMENT: &AsciiSet = &CONTROLS
     .add(b'{')
     .add(b'|')
     .add(b'}');
-
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
-pub struct ObjectPath {
-    pub bucket: String,
-    pub object: String,
-}
-
-impl ObjectPath {
-    pub fn parse(value: &str) -> Result<Self, AppError> {
-        let Some(value) = value.strip_prefix("gs://") else {
-            return Err(AppError::InvalidStorageUri(value.to_string()));
-        };
-        let Some((bucket, object)) = value.split_once('/') else {
-            return Err(AppError::InvalidStorageUri(format!("gs://{value}")));
-        };
-        if bucket.is_empty() || object.is_empty() {
-            return Err(AppError::InvalidStorageUri(format!("gs://{value}")));
-        }
-        Ok(Self {
-            bucket: bucket.to_string(),
-            object: object.to_string(),
-        })
-    }
-
-    pub fn uri(&self) -> String {
-        format!("gs://{}/{}", self.bucket, self.object)
-    }
-}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ObjectMetadata {
@@ -201,10 +171,7 @@ impl StorageApi {
     }
 
     fn acquire_bucket_lock(&self, bucket: &str) -> Result<BucketLock, AppError> {
-        let object = ObjectPath {
-            bucket: bucket.to_string(),
-            object: BUCKET_LOCK_OBJECT.to_string(),
-        };
+        let object = ObjectPath::from_parts(bucket, BUCKET_LOCK_OBJECT);
         let token = uuid::Uuid::new_v4().simple().to_string();
         let url = with_query(
             format!("{}/b/{}/o", self.transport.upload_base(), encode(bucket)),

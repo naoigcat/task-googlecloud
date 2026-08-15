@@ -3,8 +3,11 @@ use crate::cloud::Cloud;
 use crate::error::AppError;
 use crate::normalization_plan;
 use crate::object_move;
-use crate::storage::{MAX_OBJECT_NAME_BYTES, ObjectPath, StorageClient};
+use crate::storage::{ObjectPath, StorageClient};
 use crate::transaction::{RemoteChange, rollback_moves};
+
+#[cfg(test)]
+pub(crate) use crate::object_path::MAX_OBJECT_NAME_BYTES;
 
 const TEMPORARY_SUFFIX_PREFIX: &str = ".task-googlecloud-";
 
@@ -33,21 +36,11 @@ fn plan_moves(
         .map(|entry| {
             let source = ObjectPath::parse(&entry.source)?;
             let target = ObjectPath::parse(&entry.target)?;
-            validate_target_path(&target)?;
+            target.validate_name_length("normalized target")?;
             let temporary = temporary_path(&source)?;
             Ok((source, target, temporary))
         })
         .collect()
-}
-
-fn validate_target_path(target: &ObjectPath) -> Result<(), AppError> {
-    if target.object.len() > MAX_OBJECT_NAME_BYTES {
-        return Err(AppError::Message(format!(
-            "Object name is too long for normalized target: {}",
-            target.uri()
-        )));
-    }
-    Ok(())
 }
 
 pub fn process_moves<S: StorageClient>(
@@ -122,17 +115,9 @@ fn process_moves_unlocked<S: StorageClient>(
 
 fn temporary_path(source: &ObjectPath) -> Result<ObjectPath, AppError> {
     let suffix = temporary_suffix();
-    if source.object.len() + suffix.len() > MAX_OBJECT_NAME_BYTES {
-        return Err(AppError::Message(format!(
-            "Object name is too long for temporary staging: {}",
-            source.uri()
-        )));
-    }
-
-    Ok(ObjectPath {
-        bucket: source.bucket.clone(),
-        object: format!("{}{}", source.object, suffix),
-    })
+    let temporary = ObjectPath::from_parts(&source.bucket, &format!("{}{}", source.object, suffix));
+    temporary.validate_name_length("temporary staging")?;
+    Ok(temporary)
 }
 
 fn temporary_suffix() -> String {
