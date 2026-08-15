@@ -175,9 +175,79 @@ fn interrupts_a_blocking_cloud_storage_request() {
         .unwrap();
 
     assert!(started.elapsed() < Duration::from_millis(500));
-    assert!(matches!(result, Err(super::AppError::Interrupted)));
+    assert!(matches!(
+        result,
+        Err(super::AppError::InterruptedAfterRequest)
+    ));
     request.join().unwrap();
     server.join().unwrap();
+}
+
+#[test]
+fn distinguishes_interrupts_before_and_after_a_storage_request() {
+    let interrupted = Arc::new(AtomicBool::new(true));
+    let storage = StorageApi::with_endpoint_options(
+        Cloud::with_interrupt(super::InterruptFlag::from_atomic(interrupted)),
+        "http://127.0.0.1:1/storage/v1",
+        "http://127.0.0.1:1/storage/v1",
+        Some("token".to_string()),
+        Duration::from_secs(30),
+    );
+    let before_request = storage
+        .transport
+        .send_body(storage.transport.client().get("http://127.0.0.1:1"))
+        .unwrap_err();
+
+    assert!(matches!(&before_request, super::AppError::Interrupted));
+    assert!(!before_request.may_have_sent_storage_request());
+
+    let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+    let base = format!("http://{}/storage/v1", listener.local_addr().unwrap());
+    let request_url = format!("{base}/b/bucket/o/object");
+    let (request_sender, request_received) = mpsc::channel();
+    let (release_sender, release_receiver) = mpsc::channel();
+    let server = thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        read_headers(&mut stream);
+        request_sender.send(()).unwrap();
+        release_receiver.recv().unwrap();
+    });
+    let interrupted = Arc::new(AtomicBool::new(false));
+    let storage = StorageApi::with_endpoint_options(
+        Cloud::with_interrupt(super::InterruptFlag::from_atomic(Arc::clone(&interrupted))),
+        base.clone(),
+        base,
+        Some("token".to_string()),
+        Duration::from_secs(30),
+    );
+    let (result_sender, result_receiver) = mpsc::channel();
+    let request = thread::spawn(move || {
+        result_sender
+            .send(
+                storage
+                    .transport
+                    .send_body(storage.transport.client().get(request_url)),
+            )
+            .unwrap();
+    });
+
+    request_received
+        .recv_timeout(Duration::from_secs(1))
+        .unwrap();
+    interrupted.store(true, Ordering::Relaxed);
+    let after_request = result_receiver
+        .recv_timeout(Duration::from_millis(500))
+        .unwrap()
+        .unwrap_err();
+    release_sender.send(()).unwrap();
+    request.join().unwrap();
+    server.join().unwrap();
+
+    assert!(matches!(
+        &after_request,
+        super::AppError::InterruptedAfterRequest
+    ));
+    assert!(after_request.may_have_sent_storage_request());
 }
 
 #[test]
@@ -221,7 +291,7 @@ fn releases_a_bucket_lock_after_an_interrupted_upload() {
         .unwrap()
         .expect_err("interrupted upload should fail");
 
-    assert!(matches!(error, super::AppError::Interrupted));
+    assert!(matches!(error, super::AppError::InterruptedAfterRequest));
     server.join().unwrap();
 }
 

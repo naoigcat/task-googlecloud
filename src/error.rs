@@ -56,6 +56,10 @@ pub enum AppError {
     #[error("Operation interrupted")]
     Interrupted,
 
+    /// The request may have reached Cloud Storage before the interruption was observed.
+    #[error("Operation interrupted during a Cloud Storage request")]
+    InterruptedAfterRequest,
+
     #[error("Atomic no-replace rename is not supported on {0}")]
     UnsupportedPlatform(String),
 
@@ -93,7 +97,7 @@ impl AppError {
 
     pub(crate) fn is_interrupted(&self) -> bool {
         match self {
-            Self::Interrupted => true,
+            Self::Interrupted | Self::InterruptedAfterRequest => true,
             Self::Token(error, _) => error.is_interrupted(),
             _ => false,
         }
@@ -120,7 +124,10 @@ impl AppError {
 
     pub(crate) fn may_have_sent_storage_request(&self) -> bool {
         match self {
-            Self::Http(_) | Self::Storage { .. } | Self::StorageResponse(_) => true,
+            Self::Http(_)
+            | Self::Storage { .. }
+            | Self::StorageResponse(_)
+            | Self::InterruptedAfterRequest => true,
             Self::Token(_, true) => true,
             Self::Rollback { original, .. } => original.may_have_sent_storage_request(),
             _ => false,

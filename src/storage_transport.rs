@@ -1,3 +1,7 @@
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, Ordering},
+};
 use std::time::Duration;
 
 use reqwest::{Client, RequestBuilder, Response};
@@ -78,6 +82,10 @@ impl StorageTransport {
             return Err(AppError::Interrupted);
         }
         let interrupt = self.interrupt.clone();
+        let request_started = Arc::new(AtomicBool::new(false));
+        let request_started_for_request = Arc::clone(&request_started);
+        let request_started_for_select = Arc::clone(&request_started);
+        let interrupt_for_request = interrupt.clone();
         // Dropping the async request closes the connection, so rollback never
         // races with a blocking request that was left running in the background.
         let result = self
@@ -86,11 +94,25 @@ impl StorageTransport {
             .expect("the HTTP runtime remains available while StorageTransport is alive")
             .block_on(async move {
                 tokio::select! {
-                    response = async {
+                    biased;
+                    response = async move {
+                        if interrupt_for_request
+                            .as_ref()
+                            .is_some_and(InterruptFlag::is_interrupted)
+                        {
+                            return Err(AppError::Interrupted);
+                        }
+                        request_started_for_request.store(true, Ordering::Relaxed);
                         let response = request.bearer_auth(token).send().await?;
                         Self::response_body(response).await
                     } => response,
-                    _ = wait_for_interrupt(interrupt) => Err(AppError::Interrupted),
+                    _ = wait_for_interrupt(interrupt) => {
+                        if request_started_for_select.load(Ordering::Relaxed) {
+                            Err(AppError::InterruptedAfterRequest)
+                        } else {
+                            Err(AppError::Interrupted)
+                        }
+                    },
                 }
             });
         if self
@@ -98,7 +120,11 @@ impl StorageTransport {
             .as_ref()
             .is_some_and(InterruptFlag::is_interrupted)
         {
-            return Err(AppError::Interrupted);
+            return if request_started.load(Ordering::Relaxed) {
+                Err(AppError::InterruptedAfterRequest)
+            } else {
+                result
+            };
         }
         result
     }
