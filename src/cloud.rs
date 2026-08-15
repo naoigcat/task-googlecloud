@@ -1,5 +1,5 @@
 use std::io::{self, Read, Write};
-use std::process::{Child, Command, Output, Stdio};
+use std::process::{Child, Command, ExitStatus, Output, Stdio};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
@@ -205,37 +205,23 @@ fn wait_for_child_with_input(
 ) -> Result<Output, AppError> {
     // Drain both output pipes and write stdin on separate threads so a child
     // blocked on a full pipe cannot deadlock the polling loop.
-    let mut stdout = spawn_reader(child.stdout.take());
-    let mut stderr = spawn_reader(child.stderr.take());
-    let mut stdin_writer = spawn_writer(child.stdin.take(), input);
+    let pipes = ChildPipes::new(&mut child, input);
     let started = Instant::now();
 
     loop {
         if let Some(status) = child.try_wait()? {
-            let writer_result = join_writer(stdin_writer.take());
-            let stdout = join_reader(stdout.take());
-            let stderr = join_reader(stderr.take());
-            writer_result?;
-            return Ok(Output {
-                status,
-                stdout: stdout?,
-                stderr: stderr?,
-            });
+            return pipes.finish(status);
         }
 
         if interrupt.is_some_and(InterruptFlag::is_interrupted) {
             terminate_child(&mut child)?;
-            discard_writer(stdin_writer.take());
-            discard_reader(stdout.take());
-            discard_reader(stderr.take());
+            pipes.discard();
             return Err(AppError::Interrupted);
         }
 
         if started.elapsed() >= timeout {
             terminate_child(&mut child)?;
-            discard_writer(stdin_writer.take());
-            discard_reader(stdout.take());
-            discard_reader(stderr.take());
+            pipes.discard();
             return Err(AppError::Message(format!(
                 "{operation} timed out after {} seconds",
                 timeout.as_secs()
@@ -243,6 +229,50 @@ fn wait_for_child_with_input(
         }
 
         thread::sleep(SSH_POLL_INTERVAL);
+    }
+}
+
+struct ChildPipes {
+    stdout: Option<JoinHandle<io::Result<Vec<u8>>>>,
+    stderr: Option<JoinHandle<io::Result<Vec<u8>>>>,
+    stdin: Option<JoinHandle<io::Result<()>>>,
+}
+
+impl ChildPipes {
+    fn new(child: &mut Child, input: Option<Vec<u8>>) -> Self {
+        Self {
+            stdout: spawn_reader(child.stdout.take()),
+            stderr: spawn_reader(child.stderr.take()),
+            stdin: spawn_writer(child.stdin.take(), input),
+        }
+    }
+
+    fn finish(self, status: ExitStatus) -> Result<Output, AppError> {
+        let Self {
+            stdout,
+            stderr,
+            stdin,
+        } = self;
+        let writer_result = join_writer(stdin);
+        let stdout = join_reader(stdout);
+        let stderr = join_reader(stderr);
+        writer_result?;
+        Ok(Output {
+            status,
+            stdout: stdout?,
+            stderr: stderr?,
+        })
+    }
+
+    fn discard(self) {
+        let Self {
+            stdout,
+            stderr,
+            stdin,
+        } = self;
+        discard_writer(stdin);
+        discard_reader(stdout);
+        discard_reader(stderr);
     }
 }
 
