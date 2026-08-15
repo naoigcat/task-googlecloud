@@ -95,6 +95,44 @@ struct UploadDiscovery {
     file_identities: HashMap<PathBuf, FileIdentity>,
 }
 
+impl UploadDiscovery {
+    fn empty() -> Self {
+        Self {
+            files_by_directory: BTreeMap::new(),
+            root_identity: None,
+            directory_identities: HashMap::new(),
+            file_identities: HashMap::new(),
+        }
+    }
+
+    /// Returns the identity captured for an upload source, keeping the
+    /// relationship between a file and its containing directory in discovery.
+    fn source_identity(
+        &self,
+        file: &Path,
+        directory: &Path,
+    ) -> Result<Option<UploadSourceIdentity>, AppError> {
+        if self.file_identities.is_empty() && self.directory_identities.is_empty() {
+            return Ok(None);
+        }
+
+        Ok(Some(UploadSourceIdentity {
+            file: self
+                .file_identities
+                .get(file)
+                .cloned()
+                .ok_or_else(|| AppError::Message(format!("Missing file identity for {file:?}")))?,
+            directory: self
+                .directory_identities
+                .get(directory)
+                .cloned()
+                .ok_or_else(|| {
+                    AppError::Message(format!("Missing directory identity for {directory:?}"))
+                })?,
+        }))
+    }
+}
+
 pub fn upload_files_by_directory(root: &Path) -> Result<BTreeMap<PathBuf, Vec<PathBuf>>, AppError> {
     Ok(discover_uploads(root)?.files_by_directory)
 }
@@ -104,22 +142,12 @@ fn discover_uploads(root: &Path) -> Result<UploadDiscovery, AppError> {
     let root_metadata = match fs::symlink_metadata(root) {
         Ok(metadata) => metadata,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            return Ok(UploadDiscovery {
-                files_by_directory: directories,
-                root_identity: None,
-                directory_identities: HashMap::new(),
-                file_identities: HashMap::new(),
-            });
+            return Ok(UploadDiscovery::empty());
         }
         Err(error) => return Err(error.into()),
     };
     if root_metadata.file_type().is_symlink() {
-        return Ok(UploadDiscovery {
-            files_by_directory: directories,
-            root_identity: None,
-            directory_identities: HashMap::new(),
-            file_identities: HashMap::new(),
-        });
+        return Ok(UploadDiscovery::empty());
     }
     if !root_metadata.file_type().is_dir() {
         return Err(std::io::Error::new(
@@ -242,30 +270,7 @@ fn plan_uploads(
                 .ok_or_else(|| {
                     AppError::Message(format!("File is not valid UTF-8: {normalized_file:?}"))
                 })?;
-            let source_identity = if discovery.file_identities.is_empty()
-                && discovery.directory_identities.is_empty()
-            {
-                None
-            } else {
-                Some(UploadSourceIdentity {
-                    file: discovery
-                        .file_identities
-                        .get(file)
-                        .cloned()
-                        .ok_or_else(|| {
-                            AppError::Message(format!("Missing file identity for {file:?}"))
-                        })?,
-                    directory: discovery
-                        .directory_identities
-                        .get(directory)
-                        .cloned()
-                        .ok_or_else(|| {
-                            AppError::Message(format!(
-                                "Missing directory identity for {directory:?}"
-                            ))
-                        })?,
-                })
-            };
+            let source_identity = discovery.source_identity(file, directory)?;
             uploads.push(PlannedUpload {
                 file: normalized_file.clone(),
                 staging: staging_path(bucket, staging_prefix, object_name)?,

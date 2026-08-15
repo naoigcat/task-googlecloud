@@ -8,7 +8,8 @@ use std::thread;
 
 use super::{
     MAX_OBJECT_NAME_BYTES, PlannedDirectoryUploads, PlannedUpload, UploadDiscovery,
-    is_real_directory, is_regular_file, plan_uploads, staging_path, upload_planned_files,
+    discover_uploads, is_real_directory, is_regular_file, plan_uploads, staging_path,
+    upload_planned_files,
 };
 use crate::InterruptFlag;
 use crate::cloud::Cloud;
@@ -340,6 +341,22 @@ fn plans_uploads_from_discovery_alone() {
         uploads[0].staging.uri(),
         format!("gs://bucket/{STAGING_PREFIX}/\u{e9}.txt")
     );
+}
+
+#[test]
+fn keeps_discovered_source_identities_in_upload_plans() {
+    let root = tempfile::tempdir().unwrap();
+    let bucket = root.path().join("bucket");
+    std::fs::create_dir(&bucket).unwrap();
+    let source = bucket.join("source.txt");
+    std::fs::write(&source, "contents").unwrap();
+    let target = bucket.join("target.txt");
+    let discovery = discover_uploads(root.path()).unwrap();
+    let normalized_files = HashMap::from([(source, target)]);
+
+    let planned = plan_uploads(&discovery, &normalized_files, STAGING_PREFIX).unwrap();
+
+    assert!(planned[0].uploads[0].source_identity.is_some());
 }
 
 #[test]
