@@ -5,17 +5,18 @@ use std::thread::{self, ThreadId};
 use std::time::Duration;
 
 use percent_encoding::{AsciiSet, CONTROLS, utf8_percent_encode};
+use reqwest::Body;
 use reqwest::header::{CONTENT_LENGTH, CONTENT_TYPE};
-use reqwest::{Body, Client, RequestBuilder, Response};
 use serde::Deserialize;
-use serde::de::DeserializeOwned;
 use tokio_util::io::ReaderStream;
 use url::form_urlencoded::Serializer;
 
-use crate::InterruptFlag;
+#[cfg(test)]
+pub(crate) use crate::InterruptFlag;
 use crate::atomic_rename::DirectoryIdentity;
 use crate::cloud::Cloud;
 use crate::error::AppError;
+use crate::storage_transport::{REQUEST_TIMEOUT, StorageTransport, UPLOAD_TIMEOUT};
 use crate::upload_source;
 
 /// Uploads are confined to this directory, so file discovery and the confined
@@ -26,9 +27,6 @@ pub(crate) const UPLOAD_ROOT: &str = "uploads";
 pub(crate) const MAX_OBJECT_NAME_BYTES: usize = 1024;
 const API_BASE: &str = "https://storage.googleapis.com/storage/v1";
 const UPLOAD_BASE: &str = "https://storage.googleapis.com/upload/storage/v1";
-const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
-const UPLOAD_TIMEOUT: Duration = Duration::from_secs(60 * 60);
-const INTERRUPT_POLL_INTERVAL: Duration = Duration::from_millis(25);
 /// A generation-guarded marker serializes mutations through this client, so a
 /// move cannot delete its source while another compliant writer replaces its
 /// destination.
@@ -140,14 +138,7 @@ pub trait StorageClient {
 }
 
 pub struct StorageApi {
-    cloud: Cloud,
-    interrupt: Option<InterruptFlag>,
-    runtime: Option<tokio::runtime::Runtime>,
-    client: Client,
-    upload_client: Client,
-    token_override: Option<String>,
-    api_base: String,
-    upload_base: String,
+    transport: StorageTransport,
     upload_root: Option<PathBuf>,
     upload_root_identity: Mutex<Option<DirectoryIdentity>>,
     active_bucket_locks: Mutex<HashMap<ThreadId, Vec<String>>>,
@@ -194,96 +185,19 @@ impl StorageApi {
         request_timeout: Duration,
         upload_timeout: Duration,
     ) -> Self {
-        let interrupt = cloud.interrupt();
         Self {
-            cloud,
-            interrupt,
-            runtime: Some(
-                tokio::runtime::Builder::new_current_thread()
-                    .enable_all()
-                    .build()
-                    .expect("the HTTP runtime configuration is valid"),
+            transport: StorageTransport::new(
+                cloud,
+                api_base,
+                upload_base,
+                token,
+                request_timeout,
+                upload_timeout,
             ),
-            client: Self::build_client(request_timeout),
-            upload_client: Self::build_client(upload_timeout),
-            token_override: token,
-            api_base: api_base.into(),
-            upload_base: upload_base.into(),
             upload_root: None,
             upload_root_identity: Mutex::new(None),
             active_bucket_locks: Mutex::new(HashMap::new()),
         }
-    }
-
-    fn build_client(total_timeout: Duration) -> Client {
-        Client::builder()
-            .timeout(total_timeout)
-            .connect_timeout(REQUEST_TIMEOUT)
-            .build()
-            .expect("the static HTTP client configuration is valid")
-    }
-
-    fn token(&self) -> Result<String, AppError> {
-        self.token_override
-            .clone()
-            .map_or_else(|| self.cloud.access_token().map_err(AppError::token), Ok)
-    }
-
-    fn send_body(&self, request: RequestBuilder) -> Result<Vec<u8>, AppError> {
-        let token = self.token()?;
-        if self
-            .interrupt
-            .as_ref()
-            .is_some_and(InterruptFlag::is_interrupted)
-        {
-            return Err(AppError::Interrupted);
-        }
-        let interrupt = self.interrupt.clone();
-        // Dropping the async request closes the connection, so rollback never
-        // races with a blocking request that was left running in the background.
-        let result = self
-            .runtime
-            .as_ref()
-            .expect("the HTTP runtime remains available while StorageApi is alive")
-            .block_on(async move {
-                tokio::select! {
-                    response = async {
-                        let response = request.bearer_auth(token).send().await?;
-                        Self::response_body(response).await
-                    } => response,
-                    _ = wait_for_interrupt(interrupt) => Err(AppError::Interrupted),
-                }
-            });
-        if self
-            .interrupt
-            .as_ref()
-            .is_some_and(InterruptFlag::is_interrupted)
-        {
-            return Err(AppError::Interrupted);
-        }
-        result
-    }
-
-    fn send_json<T>(&self, request: RequestBuilder, description: &str) -> Result<T, AppError>
-    where
-        T: DeserializeOwned,
-    {
-        let body = self.send_body(request)?;
-        serde_json::from_slice(&body)
-            .map_err(|error| AppError::StorageResponse(format!("{description}: {error}")))
-    }
-
-    async fn response_body(response: Response) -> Result<Vec<u8>, AppError> {
-        let status = response.status();
-        let body = response.bytes().await?.to_vec();
-        if status.is_success() {
-            return Ok(body);
-        }
-
-        Err(AppError::Storage {
-            status: status.as_u16(),
-            message: response_message(&body),
-        })
     }
 
     fn acquire_bucket_lock(&self, bucket: &str) -> Result<BucketLock, AppError> {
@@ -293,15 +207,16 @@ impl StorageApi {
         };
         let token = uuid::Uuid::new_v4().simple().to_string();
         let url = with_query(
-            format!("{}/b/{}/o", self.upload_base, encode(bucket)),
+            format!("{}/b/{}/o", self.transport.upload_base(), encode(bucket)),
             [
                 ("uploadType", "media"),
                 ("name", BUCKET_LOCK_OBJECT),
                 ("ifGenerationMatch", "0"),
             ],
         );
-        let metadata: Result<MetadataResponse, AppError> = self.send_json(
-            self.client
+        let metadata: Result<MetadataResponse, AppError> = self.transport.send_json(
+            self.transport
+                .client()
                 .post(url)
                 .header(CONTENT_TYPE, "application/octet-stream")
                 .header(CONTENT_LENGTH, token.len() as u64)
@@ -314,7 +229,7 @@ impl StorageApi {
             }
             Ok(metadata) => metadata,
             Err(error) if error.reached_storage() => {
-                self.clear_interrupt_for_rollback();
+                self.transport.clear_interrupt_for_rollback();
                 match self.recover_unacknowledged_bucket_lock(&object, &token) {
                     Ok(()) => return Err(error),
                     Err(recovery) => return Err(AppError::rollback(error, vec![recovery])),
@@ -333,10 +248,12 @@ impl StorageApi {
         object: &ObjectPath,
         token: &str,
     ) -> Result<(), AppError> {
-        let body = self.send_body(self.client.get(with_query(
-            object_url(&self.api_base, object),
-            [("alt", "media")],
-        )))?;
+        let body = self
+            .transport
+            .send_body(self.transport.client().get(with_query(
+                object_url(self.transport.api_base(), object),
+                [("alt", "media")],
+            )))?;
         if body != token.as_bytes() {
             return Ok(());
         }
@@ -354,19 +271,13 @@ impl StorageApi {
         Ok(())
     }
 
-    fn clear_interrupt_for_rollback(&self) -> bool {
-        self.interrupt
-            .as_ref()
-            .is_some_and(InterruptFlag::clear_for_rollback)
-    }
-
     fn release_bucket_locks(&self, locks: &[BucketLock]) -> Vec<AppError> {
         locks
             .iter()
             .rev()
             .filter_map(|lock| {
                 // Lock release is rollback work, so a new signal must not abort cleanup.
-                self.clear_interrupt_for_rollback();
+                self.transport.clear_interrupt_for_rollback();
                 self.delete_object(&lock.object, &lock.generation).err()
             })
             .collect()
@@ -402,20 +313,20 @@ impl StorageApi {
             match self.acquire_bucket_lock(bucket) {
                 Ok(lock) => locks.push(lock),
                 Err(error) => {
-                    self.clear_interrupt_for_rollback();
+                    self.transport.clear_interrupt_for_rollback();
                     return Err(AppError::rollback(error, self.release_bucket_locks(&locks)));
                 }
             }
         }
 
         if let Err(error) = self.register_active_bucket_locks(owner, &buckets_to_acquire) {
-            self.clear_interrupt_for_rollback();
+            self.transport.clear_interrupt_for_rollback();
             return Err(AppError::rollback(error, self.release_bucket_locks(&locks)));
         }
 
         let result = operation();
         let state_error = self.unregister_active_bucket_locks(owner, &buckets_to_acquire);
-        let interrupted = self.clear_interrupt_for_rollback();
+        let interrupted = self.transport.clear_interrupt_for_rollback();
         let release_errors = self.release_bucket_locks(&locks);
         if let Err(error) = state_error {
             return Err(AppError::rollback(error, release_errors));
@@ -483,12 +394,14 @@ impl StorageApi {
         object: &ObjectPath,
         generation: Option<&str>,
     ) -> Result<ObjectMetadata, AppError> {
-        let mut url = object_url(&self.api_base, object);
+        let mut url = object_url(self.transport.api_base(), object);
         if let Some(generation) = generation {
             url = with_query(url, [("generation", generation)]);
         }
-        let metadata: MetadataResponse =
-            self.send_json(self.client.get(url), "Invalid Cloud Storage metadata")?;
+        let metadata: MetadataResponse = self.transport.send_json(
+            self.transport.client().get(url),
+            "Invalid Cloud Storage metadata",
+        )?;
         Ok(ObjectMetadata {
             generation: metadata.generation,
         })
@@ -536,7 +449,7 @@ impl StorageApi {
             query.append_pair("ifGenerationMatch", generation);
         }
         let query = query.finish();
-        let base_url = rewrite_url(&self.api_base, source, target);
+        let base_url = rewrite_url(self.transport.api_base(), source, target);
         let mut rewrite_token: Option<String> = None;
         let mut request_sent = false;
 
@@ -555,8 +468,9 @@ impl StorageApi {
             }
 
             let rewrite: RewriteResponse = self
+                .transport
                 .send_json(
-                    self.client.post(url),
+                    self.transport.client().post(url),
                     "Invalid Cloud Storage rewrite response",
                 )
                 .map_err(|error| {
@@ -583,10 +497,12 @@ impl StorageApi {
 
     fn delete_object(&self, object: &ObjectPath, generation: &str) -> Result<(), AppError> {
         let url = with_query(
-            object_url(&self.api_base, object),
+            object_url(self.transport.api_base(), object),
             [("generation", generation)],
         );
-        self.send_body(self.client.delete(url)).map(|_| ())
+        self.transport
+            .send_body(self.transport.client().delete(url))
+            .map(|_| ())
     }
 
     fn confirm_object_generation(
@@ -650,7 +566,11 @@ impl StorageClient for StorageApi {
         let size = file.metadata().map_err(AppError::UploadSource)?.len();
         self.with_bucket_locks(&[target.bucket.as_str()], || {
             let url = with_query(
-                format!("{}/b/{}/o", self.upload_base, encode(&target.bucket)),
+                format!(
+                    "{}/b/{}/o",
+                    self.transport.upload_base(),
+                    encode(&target.bucket)
+                ),
                 [
                     ("uploadType", "media"),
                     ("name", target.object.as_str()),
@@ -658,15 +578,17 @@ impl StorageClient for StorageApi {
                 ],
             );
             let request = self
-                .upload_client
+                .transport
+                .upload_client()
                 .post(url)
                 .header(CONTENT_TYPE, "application/octet-stream")
                 .header(CONTENT_LENGTH, size)
                 .body(Body::wrap_stream(ReaderStream::new(
                     tokio::fs::File::from_std(file),
                 )));
-            let metadata: MetadataResponse =
-                self.send_json(request, "Invalid Cloud Storage upload response")?;
+            let metadata: MetadataResponse = self
+                .transport
+                .send_json(request, "Invalid Cloud Storage upload response")?;
             Ok(metadata.generation)
         })
     }
@@ -758,15 +680,6 @@ impl StorageClient for StorageApi {
     }
 }
 
-impl Drop for StorageApi {
-    fn drop(&mut self) {
-        // A stalled local read must not make process shutdown wait forever after SIGINT.
-        if let Some(runtime) = self.runtime.take() {
-            runtime.shutdown_timeout(Duration::ZERO);
-        }
-    }
-}
-
 impl StorageApi {
     fn list_objects_unlocked(&self, bucket: &str) -> Result<Vec<String>, AppError> {
         let mut page_token: Option<String> = None;
@@ -776,9 +689,14 @@ impl StorageApi {
             if let Some(page_token) = &page_token {
                 query.push(("pageToken", page_token.as_str()));
             }
-            let url = with_query(format!("{}/b/{}/o", self.api_base, encode(bucket)), query);
-            let listing: ListResponse =
-                self.send_json(self.client.get(url), "Invalid Cloud Storage list response")?;
+            let url = with_query(
+                format!("{}/b/{}/o", self.transport.api_base(), encode(bucket)),
+                query,
+            );
+            let listing: ListResponse = self.transport.send_json(
+                self.transport.client().get(url),
+                "Invalid Cloud Storage list response",
+            )?;
             objects.extend(
                 listing
                     .items
@@ -930,37 +848,6 @@ struct RewriteResponse {
     #[serde(rename = "rewriteToken")]
     rewrite_token: Option<String>,
     resource: Option<MetadataResponse>,
-}
-
-#[derive(Debug, Deserialize)]
-struct ErrorResponse {
-    error: Option<ErrorDetails>,
-}
-
-#[derive(Debug, Deserialize)]
-struct ErrorDetails {
-    message: Option<String>,
-}
-
-async fn wait_for_interrupt(interrupt: Option<InterruptFlag>) {
-    let Some(interrupt) = interrupt else {
-        std::future::pending::<()>().await;
-        return;
-    };
-    loop {
-        if interrupt.is_interrupted() {
-            return;
-        }
-        tokio::time::sleep(INTERRUPT_POLL_INTERVAL).await;
-    }
-}
-
-fn response_message(body: &[u8]) -> String {
-    serde_json::from_slice::<ErrorResponse>(body)
-        .ok()
-        .and_then(|response| response.error)
-        .and_then(|error| error.message)
-        .unwrap_or_else(|| String::from_utf8_lossy(body).to_string())
 }
 
 fn encode(value: &str) -> String {

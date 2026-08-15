@@ -6,6 +6,7 @@ mod normalization_plan;
 mod normalize;
 mod object_move;
 mod storage;
+mod storage_transport;
 mod transaction;
 mod upload;
 mod upload_source;
