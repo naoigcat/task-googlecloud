@@ -392,13 +392,12 @@ fn refuses_upload_sources_through_parent_symlinks() {
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 #[test]
 fn refuses_upload_sources_after_upload_root_is_replaced() {
-    use crate::atomic_rename::directory_identity_from_metadata;
+    use crate::atomic_rename::directory_identity_from_path;
 
     let parent = tempfile::tempdir().unwrap();
     let root = parent.path().join("uploads");
     std::fs::create_dir(&root).unwrap();
-    let expected_root =
-        directory_identity_from_metadata(&std::fs::symlink_metadata(&root).unwrap());
+    let expected_root = directory_identity_from_path(&root).unwrap();
     let replacement = parent.path().join("replacement");
     std::fs::create_dir(&replacement).unwrap();
     std::fs::remove_dir(&root).unwrap();
@@ -428,7 +427,7 @@ fn refuses_upload_sources_after_upload_root_is_replaced() {
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 #[test]
 fn refuses_upload_sources_after_a_file_or_bucket_is_replaced() {
-    use crate::atomic_rename::{directory_identity_from_metadata, file_identity_from_metadata};
+    use crate::atomic_rename::{directory_identity_from_path, file_identity_from_path};
 
     for replace_bucket in [false, true] {
         let parent = tempfile::tempdir().unwrap();
@@ -437,12 +436,9 @@ fn refuses_upload_sources_after_a_file_or_bucket_is_replaced() {
         let source = bucket.join("file.txt");
         std::fs::create_dir_all(&bucket).unwrap();
         std::fs::write(&source, "original").unwrap();
-        let expected_root =
-            directory_identity_from_metadata(&std::fs::symlink_metadata(&root).unwrap());
-        let expected_directory =
-            directory_identity_from_metadata(&std::fs::symlink_metadata(&bucket).unwrap());
-        let expected_file =
-            file_identity_from_metadata(&std::fs::symlink_metadata(&source).unwrap());
+        let expected_root = directory_identity_from_path(&root).unwrap();
+        let expected_directory = directory_identity_from_path(&bucket).unwrap();
+        let expected_file = file_identity_from_path(&source).unwrap();
 
         std::fs::remove_file(&source).unwrap();
         if replace_bucket {

@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 
 use crate::InterruptFlag;
 use crate::atomic_rename::{
-    DirectoryIdentity, FileIdentity, directory_identity_from_metadata, file_identity_from_metadata,
+    DirectoryIdentity, FileIdentity, directory_identity_from_path, file_identity_from_path,
 };
 use crate::cloud::Cloud;
 use crate::error::AppError;
@@ -28,10 +28,10 @@ pub fn run<S: StorageClient>(
 ) -> Result<(), AppError> {
     let discovery = discover_uploads(Path::new(UPLOAD_ROOT))?;
     let files_by_directory = discovery.files_by_directory;
-    let expected_root = discovery.root_identity;
+    let expected_root = discovery.root_identity.clone();
     let directory_identities = discovery.directory_identities;
     let file_identities = discovery.file_identities;
-    storage.set_upload_root_identity(expected_root)?;
+    storage.set_upload_root_identity(expected_root.clone())?;
     let bucket_names = files_by_directory
         .keys()
         .map(|directory| {
@@ -77,7 +77,7 @@ pub fn run<S: StorageClient>(
         let normalized_files = local::apply_normalization_with_path_identities(
             Path::new(UPLOAD_ROOT),
             &plan,
-            expected_root,
+            expected_root.clone(),
             Some(&file_identities),
             Some(&directory_identities),
             interrupt,
@@ -89,7 +89,7 @@ pub fn run<S: StorageClient>(
             Err(error) => {
                 let errors = local::rollback_normalization_with_path_identities(
                     Path::new(UPLOAD_ROOT),
-                    expected_root,
+                    expected_root.clone(),
                     Some(&file_identities),
                     Some(&directory_identities),
                     &normalized_files
@@ -144,7 +144,7 @@ fn discover_uploads(root: &Path) -> Result<UploadDiscovery, AppError> {
         )
         .into());
     }
-    let root_identity = directory_identity_from_metadata(&root_metadata);
+    let root_identity = directory_identity_from_path(root).map_err(AppError::from)?;
     let mut directory_identities = HashMap::new();
     let mut file_identities = HashMap::new();
     // Discovery records identities as well as paths because a later open by
@@ -157,7 +157,7 @@ fn discover_uploads(root: &Path) -> Result<UploadDiscovery, AppError> {
         }
         directory_identities.insert(
             directory.clone(),
-            directory_identity_from_metadata(&directory_metadata),
+            directory_identity_from_path(&directory).map_err(AppError::from)?,
         );
         let mut files = Vec::new();
         for entry in fs::read_dir(&directory)? {
@@ -168,7 +168,10 @@ fn discover_uploads(root: &Path) -> Result<UploadDiscovery, AppError> {
                     .file_name()
                     .is_some_and(|name| !name.to_string_lossy().starts_with('.'))
             {
-                file_identities.insert(file.clone(), file_identity_from_metadata(&file_metadata));
+                file_identities.insert(
+                    file.clone(),
+                    file_identity_from_path(&file).map_err(AppError::from)?,
+                );
                 files.push(file);
             }
         }
@@ -177,7 +180,9 @@ fn discover_uploads(root: &Path) -> Result<UploadDiscovery, AppError> {
     }
     let current_metadata = fs::symlink_metadata(root)?;
     if !current_metadata.file_type().is_dir()
-        || directory_identity_from_metadata(&current_metadata) != root_identity
+        || !directory_identity_from_path(root)
+            .map_err(AppError::from)?
+            .eq(&root_identity)
     {
         return Err(AppError::Message(format!(
             "Upload root changed during discovery: {root:?}"
@@ -271,12 +276,17 @@ fn plan_uploads_with_identities(
                 None
             } else {
                 Some(UploadSourceIdentity {
-                    file: *file_identities.get(file).ok_or_else(|| {
+                    file: file_identities.get(file).cloned().ok_or_else(|| {
                         AppError::Message(format!("Missing file identity for {file:?}"))
                     })?,
-                    directory: *directory_identities.get(directory).ok_or_else(|| {
-                        AppError::Message(format!("Missing directory identity for {directory:?}"))
-                    })?,
+                    directory: directory_identities
+                        .get(directory)
+                        .cloned()
+                        .ok_or_else(|| {
+                            AppError::Message(format!(
+                                "Missing directory identity for {directory:?}"
+                            ))
+                        })?,
                 })
             };
             uploads.push(PlannedUpload {
@@ -330,13 +340,13 @@ fn upload_planned_files_unlocked<S: StorageClient>(
         for planned in uploads {
             println!("{}", planned.directory.display());
             for upload in &planned.uploads {
-                let generation = match upload.source_identity {
+                let generation = match upload.source_identity.as_ref() {
                     Some(identity) => object_move::execute_upload_with_identity(
                         storage,
                         interrupt,
                         &upload.file,
                         &upload.staging,
-                        Some(identity),
+                        Some(identity.clone()),
                     )?,
                     None => object_move::execute_upload(
                         storage,

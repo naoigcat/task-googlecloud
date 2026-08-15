@@ -56,17 +56,17 @@ pub(crate) fn apply_normalization_with_path_identities(
             }
             rename(
                 root,
-                expected_root,
-                expected_files.and_then(|files| files.get(&source).copied()),
+                expected_root.clone(),
+                expected_files.and_then(|files| files.get(&source).cloned()),
                 expected_directories.and_then(|directories| {
                     source
                         .parent()
-                        .and_then(|parent| directories.get(parent).copied())
+                        .and_then(|parent| directories.get(parent).cloned())
                 }),
                 expected_directories.and_then(|directories| {
                     target
                         .parent()
-                        .and_then(|parent| directories.get(parent).copied())
+                        .and_then(|parent| directories.get(parent).cloned())
                 }),
                 &source,
                 &target,
@@ -82,7 +82,7 @@ pub(crate) fn apply_normalization_with_path_identities(
             error,
             rollback(
                 root,
-                expected_root,
+                expected_root.clone(),
                 expected_files,
                 expected_directories,
                 &renamed,
@@ -125,7 +125,7 @@ pub(crate) fn rollback_normalization_with_path_identities(
         .collect::<Vec<_>>();
     rollback(
         root,
-        expected_root,
+        expected_root.clone(),
         expected_files,
         expected_directories,
         &records,
@@ -148,19 +148,19 @@ fn rollback(
         }
         if let Err(error) = rename(
             root,
-            expected_root,
-            expected_files.and_then(|files| files.get(&entry.source).copied()),
+            expected_root.clone(),
+            expected_files.and_then(|files| files.get(&entry.source).cloned()),
             expected_directories.and_then(|directories| {
                 entry
                     .target
                     .parent()
-                    .and_then(|parent| directories.get(parent).copied())
+                    .and_then(|parent| directories.get(parent).cloned())
             }),
             expected_directories.and_then(|directories| {
                 entry
                     .source
                     .parent()
-                    .and_then(|parent| directories.get(parent).copied())
+                    .and_then(|parent| directories.get(parent).cloned())
             }),
             &entry.target,
             &entry.source,

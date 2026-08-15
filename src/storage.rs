@@ -663,10 +663,11 @@ impl StorageApi {
         expected_source: Option<UploadSourceIdentity>,
     ) -> Result<String, AppError> {
         Self::reject_bucket_lock_object(target)?;
-        let expected_root = *self
+        let expected_root = self
             .upload_root_identity
             .lock()
-            .map_err(|_| AppError::Message("Upload root identity lock is poisoned".to_string()))?;
+            .map_err(|_| AppError::Message("Upload root identity lock is poisoned".to_string()))?
+            .clone();
         let file = upload_source::open(
             self.upload_root.as_deref(),
             source,

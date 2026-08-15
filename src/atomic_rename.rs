@@ -12,68 +12,125 @@ use std::os::unix::ffi::OsStrExt;
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 use std::os::unix::fs::MetadataExt;
 #[cfg(any(target_os = "linux", target_os = "macos"))]
+use std::os::unix::fs::OpenOptionsExt;
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 use std::os::unix::io::{AsRawFd, FromRawFd};
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+use std::sync::Arc;
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-/// Device/inode identity used to detect replacement of a directory.
+#[derive(Clone, Debug)]
+/// Identity of a directory captured while its descriptor is kept open.
 pub struct DirectoryIdentity {
     device: u64,
     inode: u64,
+    // Keeping the descriptor open prevents Linux from recycling this inode
+    // while a planned operation still relies on the captured identity.
+    _descriptor: Arc<File>,
 }
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+impl PartialEq for DirectoryIdentity {
+    fn eq(&self, other: &Self) -> bool {
+        self.device == other.device && self.inode == other.inode
+    }
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+impl Eq for DirectoryIdentity {}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[derive(Clone, Debug)]
+/// Identity of a file captured while its descriptor is kept open.
+pub struct FileIdentity {
+    device: u64,
+    inode: u64,
+    // Keeping the descriptor open prevents Linux from recycling this inode
+    // while a planned operation still relies on the captured identity.
+    _descriptor: Arc<File>,
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+impl PartialEq for FileIdentity {
+    fn eq(&self, other: &Self) -> bool {
+        self.device == other.device && self.inode == other.inode
+    }
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+impl Eq for FileIdentity {}
 
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct DirectoryIdentity;
-
-#[cfg(any(target_os = "linux", target_os = "macos"))]
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-/// Device/inode identity used to detect replacement of a file.
-pub struct FileIdentity {
-    device: u64,
-    inode: u64,
-}
 
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct FileIdentity;
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
-pub(crate) fn directory_identity_from_metadata(metadata: &std::fs::Metadata) -> DirectoryIdentity {
-    DirectoryIdentity {
-        device: metadata.dev(),
-        inode: metadata.ino(),
-    }
+pub(crate) fn directory_identity_from_path(
+    path: &std::path::Path,
+) -> io::Result<DirectoryIdentity> {
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_DIRECTORY | libc::O_CLOEXEC | libc::O_NOFOLLOW)
+        .open(path)?;
+    directory_identity(&file)
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
-pub(crate) fn file_identity_from_metadata(metadata: &std::fs::Metadata) -> FileIdentity {
-    FileIdentity {
-        device: metadata.dev(),
-        inode: metadata.ino(),
+pub(crate) fn file_identity_from_path(path: &std::path::Path) -> io::Result<FileIdentity> {
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW)
+        .open(path)?;
+    if !file.metadata()?.file_type().is_file() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "identity source is not a regular file",
+        ));
     }
+    file_identity(&file)
 }
 
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
-pub(crate) fn file_identity_from_metadata(_metadata: &std::fs::Metadata) -> FileIdentity {
-    FileIdentity
+pub(crate) fn directory_identity_from_path(
+    path: &std::path::Path,
+) -> io::Result<DirectoryIdentity> {
+    let file = File::open(path)?;
+    directory_identity(&file)
 }
 
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
-pub(crate) fn directory_identity_from_metadata(_metadata: &std::fs::Metadata) -> DirectoryIdentity {
-    DirectoryIdentity
+pub(crate) fn file_identity_from_path(path: &std::path::Path) -> io::Result<FileIdentity> {
+    let file = File::open(path)?;
+    file_identity(&file)
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 pub(crate) fn directory_identity(file: &File) -> io::Result<DirectoryIdentity> {
     let metadata = file.metadata()?;
-    Ok(directory_identity_from_metadata(&metadata))
+    Ok(DirectoryIdentity {
+        device: metadata.dev(),
+        inode: metadata.ino(),
+        _descriptor: Arc::new(file.try_clone()?),
+    })
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 pub(crate) fn file_identity(file: &File) -> io::Result<FileIdentity> {
     let metadata = file.metadata()?;
-    Ok(file_identity_from_metadata(&metadata))
+    Ok(FileIdentity {
+        device: metadata.dev(),
+        inode: metadata.ino(),
+        _descriptor: Arc::new(file.try_clone()?),
+    })
+}
+
+#[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
+pub(crate) fn identity_descriptor_is_unlinked(identity: &FileIdentity) -> io::Result<bool> {
+    Ok(identity._descriptor.metadata()?.nlink() == 0)
 }
 
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
@@ -112,8 +169,8 @@ pub(crate) fn rename_without_overwrite_with_identity(
         // Resolve both parents from an open root descriptor so a concurrent
         // replacement of the root or an intermediate directory is detected.
         let root_directory = open_directory(root)?;
-        if let Some(expected_root) = expected_root
-            && directory_identity(&root_directory)? != expected_root
+        if let Some(expected_root) = expected_root.as_ref()
+            && !directory_identity(&root_directory)?.eq(expected_root)
         {
             return Err(AppError::Message(format!(
                 "Input root was replaced before renaming: {root:?}"
@@ -121,22 +178,22 @@ pub(crate) fn rename_without_overwrite_with_identity(
         }
         let (source_parent, source_name) = relative_parent(&root_directory, root, source)?;
         let (target_parent, target_name_os) = relative_parent(&root_directory, root, target)?;
-        if let Some(expected_source_parent) = expected_source_parent
-            && directory_identity(&source_parent)? != expected_source_parent
+        if let Some(expected_source_parent) = expected_source_parent.as_ref()
+            && !directory_identity(&source_parent)?.eq(expected_source_parent)
         {
             return Err(AppError::Message(format!(
                 "Input source directory was replaced before renaming: {source:?}"
             )));
         }
-        if let Some(expected_target_parent) = expected_target_parent
-            && directory_identity(&target_parent)? != expected_target_parent
+        if let Some(expected_target_parent) = expected_target_parent.as_ref()
+            && !directory_identity(&target_parent)?.eq(expected_target_parent)
         {
             return Err(AppError::Message(format!(
                 "Input target directory was replaced before renaming: {target:?}"
             )));
         }
-        if let Some(expected_source) = expected_source
-            && file_identity_at(&source_parent, source_name)? != expected_source
+        if let Some(expected_source) = expected_source.as_ref()
+            && !file_identity_at(&source_parent, source_name)?.eq(expected_source)
         {
             return Err(AppError::Message(format!(
                 "Input file was replaced before renaming: {source:?}"
@@ -151,7 +208,7 @@ pub(crate) fn rename_without_overwrite_with_identity(
         let source_name = c_string(source_name)?;
         let target_name = c_string(target_name_os)?;
         rename_noreplace(&source_parent, &source_name, &target_parent, &target_name)?;
-        if let Some(expected_source) = expected_source {
+        if let Some(expected_source) = expected_source.as_ref() {
             let actual = file_identity_at(&target_parent, target_name_os).map_err(|error| {
                 AppError::rollback(
                     AppError::Message(format!(
@@ -160,7 +217,7 @@ pub(crate) fn rename_without_overwrite_with_identity(
                     vec![error],
                 )
             })?;
-            if actual != expected_source {
+            if !actual.eq(expected_source) {
                 return Err(AppError::Recovery {
                     paths: format!("{:?} and {:?}", source, target),
                     operation: "normalize upload source".to_string(),

@@ -13,12 +13,12 @@ use std::path::Component;
 use std::path::Path;
 
 use crate::atomic_rename::{
-    DirectoryIdentity, FileIdentity, directory_identity, directory_identity_from_metadata,
+    DirectoryIdentity, FileIdentity, directory_identity, directory_identity_from_path,
     file_identity,
 };
 use crate::error::AppError;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 /// Filesystem identities captured during discovery and checked again at upload.
 pub struct UploadSourceIdentity {
     pub(crate) file: FileIdentity,
@@ -34,7 +34,7 @@ pub(crate) fn open(
     expected_root: Option<DirectoryIdentity>,
     expected_source: Option<UploadSourceIdentity>,
 ) -> Result<File, AppError> {
-    ensure_upload_root_identity_supported(expected_root, expected_source)?;
+    ensure_upload_root_identity_supported(expected_root.as_ref(), expected_source.as_ref())?;
     if let Some(root) = root {
         let relative = source
             .strip_prefix(root)
@@ -56,14 +56,16 @@ pub(crate) fn open(
     expected_root: Option<DirectoryIdentity>,
     expected_source: Option<UploadSourceIdentity>,
 ) -> Result<File, AppError> {
-    ensure_upload_root_identity_supported(expected_root, expected_source)?;
+    ensure_upload_root_identity_supported(expected_root.as_ref(), expected_source.as_ref())?;
     let metadata = fs::symlink_metadata(source).map_err(AppError::UploadSource)?;
     if !metadata.file_type().is_file() {
         return Err(rejected_source(format!("not a regular file: {source:?}")));
     }
     let file = File::open(source).map_err(AppError::UploadSource)?;
     if let Some(expected_source) = expected_source
-        && file_identity(&file).map_err(AppError::UploadSource)? != expected_source.file
+        && !file_identity(&file)
+            .map_err(AppError::UploadSource)?
+            .eq(&expected_source.file)
     {
         return Err(rejected_source(format!(
             "upload source was replaced before opening: {source:?}"
@@ -73,8 +75,8 @@ pub(crate) fn open(
 }
 
 fn ensure_upload_root_identity_supported(
-    expected_root: Option<DirectoryIdentity>,
-    expected_source: Option<UploadSourceIdentity>,
+    expected_root: Option<&DirectoryIdentity>,
+    expected_source: Option<&UploadSourceIdentity>,
 ) -> Result<(), AppError> {
     if expected_root.is_some() || expected_source.is_some() {
         #[cfg(not(any(target_os = "linux", target_os = "macos")))]
@@ -97,7 +99,7 @@ fn open_relative_without_following_links(
     let directory = open_directory(root)?;
     if let Some(expected_root) = expected_root {
         let actual_root = directory_identity(&directory).map_err(AppError::UploadSource)?;
-        if actual_root != expected_root {
+        if !actual_root.eq(&expected_root) {
             return Err(rejected_source(format!(
                 "upload root was replaced before opening: {root:?}"
             )));
@@ -133,11 +135,12 @@ fn open_without_upload_root(
         let parent = source
             .parent()
             .ok_or_else(|| rejected_source(format!("source has no parent: {source:?}")))?;
-        let actual_directory = directory_identity_from_metadata(
-            &fs::symlink_metadata(parent).map_err(AppError::UploadSource)?,
-        );
-        if actual_directory != expected_source.directory
-            || file_identity(&file).map_err(AppError::UploadSource)? != expected_source.file
+        let actual_directory =
+            directory_identity_from_path(parent).map_err(AppError::UploadSource)?;
+        if !actual_directory.eq(&expected_source.directory)
+            || !file_identity(&file)
+                .map_err(AppError::UploadSource)?
+                .eq(&expected_source.file)
         {
             return Err(rejected_source(format!(
                 "upload source was replaced before opening: {source:?}"
@@ -173,9 +176,10 @@ fn open_path_components(
                 directory = unsafe { File::from_raw_fd(fd) };
             }
             Component::Normal(name) => {
-                if let Some(expected_source) = expected_source
-                    && directory_identity(&directory).map_err(AppError::UploadSource)?
-                        != expected_source.directory
+                if let Some(expected_source) = expected_source.as_ref()
+                    && !directory_identity(&directory)
+                        .map_err(AppError::UploadSource)?
+                        .eq(&expected_source.directory)
                 {
                     return Err(rejected_source(format!(
                         "upload source directory was replaced before opening: {source:?}"
@@ -191,8 +195,10 @@ fn open_path_components(
                 {
                     return Err(rejected_source(format!("not a regular file: {source:?}")));
                 }
-                if let Some(expected_source) = expected_source
-                    && file_identity(&file).map_err(AppError::UploadSource)? != expected_source.file
+                if let Some(expected_source) = expected_source.as_ref()
+                    && !file_identity(&file)
+                        .map_err(AppError::UploadSource)?
+                        .eq(&expected_source.file)
                 {
                     return Err(rejected_source(format!(
                         "upload source was replaced before opening: {source:?}"
