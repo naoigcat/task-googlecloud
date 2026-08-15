@@ -310,6 +310,37 @@ fn releases_a_bucket_lock_after_an_interrupted_upload() {
 }
 
 #[test]
+fn keeps_a_successful_operation_successful_after_a_late_interrupt() {
+    let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+    let base = format!("http://{}/storage/v1", listener.local_addr().unwrap());
+    let server = thread::spawn(move || {
+        let (mut lock_stream, _) = listener.accept().unwrap();
+        read_headers(&mut lock_stream);
+        write_json(&mut lock_stream, r#"{"generation":"lock"}"#);
+
+        let (mut release_stream, _) = listener.accept().unwrap();
+        read_headers(&mut release_stream);
+        write_json(&mut release_stream, "{}");
+    });
+    let interrupted = Arc::new(AtomicBool::new(false));
+    let storage = StorageApi::with_endpoint_options(
+        Cloud::with_interrupt(super::InterruptFlag::from_atomic(Arc::clone(&interrupted))),
+        base.clone(),
+        base,
+        Some("token".to_string()),
+        Duration::from_secs(30),
+    );
+
+    let result = storage.with_bucket_locks(&["bucket"], || {
+        interrupted.store(true, Ordering::Relaxed);
+        Ok::<_, super::AppError>("committed")
+    });
+
+    server.join().unwrap();
+    assert_eq!(result.unwrap(), "committed");
+}
+
+#[test]
 fn removes_a_bucket_lock_after_an_unacknowledged_response() {
     let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
     let base = format!("http://{}/storage/v1", listener.local_addr().unwrap());

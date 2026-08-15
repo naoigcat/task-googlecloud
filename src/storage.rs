@@ -318,14 +318,15 @@ impl StorageApi {
 
         let result = operation();
         let state_error = self.unregister_active_bucket_locks(owner, &buckets_to_acquire);
-        let interrupted = self.transport.clear_interrupt_for_rollback();
+        // Once the operation reports success, its changes are committed; a
+        // signal observed while releasing the lock must not make callers retry it.
+        self.transport.clear_interrupt_for_rollback();
         let release_errors = self.release_bucket_locks(&locks);
         if let Err(error) = state_error {
             return Err(AppError::rollback(error, release_errors));
         }
         match result {
-            Ok(value) if release_errors.is_empty() && !interrupted => Ok(value),
-            Ok(_) if release_errors.is_empty() => Err(AppError::Interrupted),
+            Ok(value) if release_errors.is_empty() => Ok(value),
             Ok(_) => Err(AppError::Recovery {
                 paths: locks
                     .iter()
