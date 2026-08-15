@@ -518,7 +518,10 @@ impl StorageApi {
         expected_generation: &str,
         operation: &str,
     ) -> Result<(), AppError> {
-        let details = self.object_details(object);
+        // A copied object already changed remote state, so verification token failures must remain recoverable.
+        let details = self
+            .object_details(object)
+            .map_err(AppError::mark_reached_storage);
         if matches!(
             &details,
             Ok((ObjectState::Present, Some(generation)))
@@ -1170,6 +1173,36 @@ mod tests {
 
         assert!(
             matches!(error, super::AppError::Message(message) if message.contains("bucket lock"))
+        );
+    }
+
+    #[test]
+    fn preserves_recovery_details_for_generation_confirmation_token_failures() {
+        let interrupted = Arc::new(AtomicBool::new(true));
+        let storage = StorageApi::with_endpoints(
+            Cloud::with_interrupt(super::InterruptFlag::from_atomic(interrupted)),
+            "http://127.0.0.1:1/storage/v1",
+            "http://127.0.0.1:1/storage/v1",
+            None,
+        );
+        let object = ObjectPath::parse("gs://bucket/object").unwrap();
+
+        let error = storage
+            .confirm_object_generation(&object, "22", "move object")
+            .unwrap_err();
+
+        assert!(
+            matches!(
+                &error,
+                super::AppError::Recovery {
+                    operation,
+                    details,
+                    ..
+                } if operation == "move object"
+                    && details.contains("Expected generation 22")
+                    && details.contains("Cloud Storage token retrieval failed")
+            ),
+            "{error}"
         );
     }
 

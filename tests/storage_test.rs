@@ -1,3 +1,5 @@
+use std::env;
+use std::ffi::OsString;
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::sync::{Arc, Mutex};
@@ -5,7 +7,7 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 use task_googlecloud::{AppError, Cloud, ObjectPath, StorageApi, StorageClient};
-use tempfile::{NamedTempFile, tempdir};
+use tempfile::{NamedTempFile, TempDir, tempdir};
 
 const SERVER_TIMEOUT: Duration = Duration::from_secs(5);
 const EARLY_CLOSE_TIMEOUT: Duration = Duration::from_millis(100);
@@ -128,6 +130,123 @@ fn bucket_lock_created() -> (u16, String) {
 
 fn bucket_lock_deleted() -> (u16, String) {
     (200, "{}".to_string())
+}
+
+#[cfg(unix)]
+static TOKEN_ENVIRONMENT_LOCK: Mutex<()> = Mutex::new(());
+
+#[cfg(unix)]
+struct TokenEnvironment {
+    _directory: TempDir,
+    old_path: Option<OsString>,
+    old_counter: Option<OsString>,
+    old_failure: Option<OsString>,
+}
+
+#[cfg(unix)]
+impl TokenEnvironment {
+    fn new(failure_attempt: usize) -> Self {
+        use std::os::unix::fs::PermissionsExt;
+
+        const COUNTER: &str = "TASK_GOOGLECLOUD_TEST_TOKEN_COUNTER";
+        const FAILURE: &str = "TASK_GOOGLECLOUD_TEST_TOKEN_FAILURE_ATTEMPT";
+        let directory = tempdir().unwrap();
+        let counter = directory.path().join("token-attempt");
+        std::fs::write(&counter, "0").unwrap();
+        let ssh = directory.path().join("ssh");
+        std::fs::write(
+            &ssh,
+            format!(
+                "#!/bin/sh\nset -eu\nattempt=$(cat \"${COUNTER}\")\nattempt=$((attempt + 1))\nprintf '%s' \"$attempt\" > \"${COUNTER}\"\nif [ \"$attempt\" -eq \"${FAILURE}\" ]; then exit 1; fi\nprintf 'token\\n'\n"
+            ),
+        )
+        .unwrap();
+        let mut permissions = std::fs::metadata(&ssh).unwrap().permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&ssh, permissions).unwrap();
+
+        let old_path = env::var_os("PATH");
+        let old_counter = env::var_os(COUNTER);
+        let old_failure = env::var_os(FAILURE);
+        let mut path = OsString::from(directory.path());
+        path.push(":");
+        if let Some(old_path) = &old_path {
+            path.push(old_path);
+        }
+        // The production client invokes SSH through PATH; isolate a deterministic
+        // token failure here without changing the authentication implementation.
+        unsafe {
+            env::set_var("PATH", path);
+            env::set_var(COUNTER, counter);
+            env::set_var(FAILURE, failure_attempt.to_string());
+        }
+
+        Self {
+            _directory: directory,
+            old_path,
+            old_counter,
+            old_failure,
+        }
+    }
+}
+
+#[cfg(unix)]
+impl Drop for TokenEnvironment {
+    fn drop(&mut self) {
+        const COUNTER: &str = "TASK_GOOGLECLOUD_TEST_TOKEN_COUNTER";
+        const FAILURE: &str = "TASK_GOOGLECLOUD_TEST_TOKEN_FAILURE_ATTEMPT";
+
+        unsafe {
+            match self.old_path.take() {
+                Some(value) => env::set_var("PATH", value),
+                None => env::remove_var("PATH"),
+            }
+            match self.old_counter.take() {
+                Some(value) => env::set_var(COUNTER, value),
+                None => env::remove_var(COUNTER),
+            }
+            match self.old_failure.take() {
+                Some(value) => env::set_var(FAILURE, value),
+                None => env::remove_var(FAILURE),
+            }
+        }
+    }
+}
+
+#[cfg(unix)]
+fn move_with_token_failure(
+    failure_attempt: usize,
+    responses: Vec<(u16, String)>,
+) -> (AppError, Vec<String>) {
+    let _environment_lock = TOKEN_ENVIRONMENT_LOCK.lock().unwrap();
+    let _token_environment = TokenEnvironment::new(failure_attempt);
+    let (base, requests, server) = test_server(responses);
+    let storage = StorageApi::with_endpoints(Cloud::new(), base.clone(), base, None);
+    let source = ObjectPath::parse("gs://bucket/source").unwrap();
+    let target = ObjectPath::parse("gs://bucket/target").unwrap();
+
+    let error = storage.move_object(&source, &target, None).unwrap_err();
+    server.join().unwrap();
+
+    (error, requests.lock().unwrap().clone())
+}
+
+#[cfg(unix)]
+fn rollback_with_token_failure(
+    failure_attempt: usize,
+    responses: Vec<(u16, String)>,
+) -> (AppError, Vec<String>) {
+    let _environment_lock = TOKEN_ENVIRONMENT_LOCK.lock().unwrap();
+    let _token_environment = TokenEnvironment::new(failure_attempt);
+    let (base, requests, server) = test_server(responses);
+    let storage = StorageApi::with_endpoints(Cloud::new(), base.clone(), base, None);
+    let source = ObjectPath::parse("gs://bucket/source").unwrap();
+    let target = ObjectPath::parse("gs://bucket/target").unwrap();
+
+    let error = storage.rollback_object(&source, &target, "22").unwrap_err();
+    server.join().unwrap();
+
+    (error, requests.lock().unwrap().clone())
 }
 
 #[test]
@@ -550,6 +669,53 @@ fn moves_objects_using_the_expected_source_generation() {
     );
 }
 
+#[cfg(unix)]
+#[test]
+fn requires_recovery_when_move_confirmation_fails_after_copy() {
+    let (error, requests) = move_with_token_failure(
+        4,
+        vec![
+            bucket_lock_created(),
+            (200, r#"{"generation":"11"}"#.to_string()),
+            (
+                200,
+                r#"{"done":true,"resource":{"generation":"22"}}"#.to_string(),
+            ),
+            bucket_lock_deleted(),
+        ],
+    );
+
+    assert!(matches!(error, AppError::Recovery { .. }), "{error}");
+    assert_eq!(requests.len(), 4);
+    assert!(request_line(&requests[2]).contains("rewriteTo"));
+    assert!(request_line(&requests[3]).contains(".task-googlecloud-lock"));
+}
+
+#[cfg(unix)]
+#[test]
+fn requires_recovery_when_move_confirmation_fails_after_source_deletion() {
+    let (error, requests) = move_with_token_failure(
+        7,
+        vec![
+            bucket_lock_created(),
+            (200, r#"{"generation":"11"}"#.to_string()),
+            (
+                200,
+                r#"{"done":true,"resource":{"generation":"22"}}"#.to_string(),
+            ),
+            (200, r#"{"generation":"22"}"#.to_string()),
+            (200, "{}".to_string()),
+            (404, "{}".to_string()),
+            bucket_lock_deleted(),
+        ],
+    );
+
+    assert!(matches!(error, AppError::Recovery { .. }), "{error}");
+    assert_eq!(requests.len(), 7);
+    assert!(request_line(&requests[4]).contains("DELETE"));
+    assert!(request_line(&requests[6]).contains(".task-googlecloud-lock"));
+}
+
 #[test]
 fn rejects_a_move_when_the_target_generation_changes_after_copy() {
     let (base, requests, server) = test_server_allowing_early_close(vec![
@@ -811,6 +977,55 @@ fn rolls_back_objects_and_confirms_target_deletion() {
         request_line(&requests[8]),
         "DELETE /storage/v1/b/bucket/o/.task-googlecloud-lock?generation=lock HTTP/1.1"
     );
+}
+
+#[cfg(unix)]
+#[test]
+fn requires_recovery_when_rollback_confirmation_fails_after_copy() {
+    let (error, requests) = rollback_with_token_failure(
+        5,
+        vec![
+            bucket_lock_created(),
+            (404, "{}".to_string()),
+            (200, r#"{"generation":"22"}"#.to_string()),
+            (
+                200,
+                r#"{"done":true,"resource":{"generation":"33"}}"#.to_string(),
+            ),
+            bucket_lock_deleted(),
+        ],
+    );
+
+    assert!(matches!(error, AppError::Recovery { .. }), "{error}");
+    assert_eq!(requests.len(), 5);
+    assert!(request_line(&requests[3]).contains("rewriteTo"));
+    assert!(request_line(&requests[4]).contains(".task-googlecloud-lock"));
+}
+
+#[cfg(unix)]
+#[test]
+fn requires_recovery_when_rollback_confirmation_fails_after_target_deletion() {
+    let (error, requests) = rollback_with_token_failure(
+        8,
+        vec![
+            bucket_lock_created(),
+            (404, "{}".to_string()),
+            (200, r#"{"generation":"22"}"#.to_string()),
+            (
+                200,
+                r#"{"done":true,"resource":{"generation":"33"}}"#.to_string(),
+            ),
+            (200, r#"{"generation":"33"}"#.to_string()),
+            (200, "{}".to_string()),
+            (404, "{}".to_string()),
+            bucket_lock_deleted(),
+        ],
+    );
+
+    assert!(matches!(error, AppError::Recovery { .. }), "{error}");
+    assert_eq!(requests.len(), 8);
+    assert!(request_line(&requests[5]).contains("DELETE"));
+    assert!(request_line(&requests[7]).contains(".task-googlecloud-lock"));
 }
 
 #[test]
