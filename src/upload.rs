@@ -330,40 +330,41 @@ fn upload_planned_files_unlocked<S: StorageClient>(
     interrupt: &InterruptFlag,
     uploads: &[PlannedDirectoryUploads],
 ) -> Result<(), AppError> {
-    let mut transaction = RemoteTransaction::new();
-
-    let operation = (|| {
-        // Upload everything to private staging names first. Finalization is
-        // then generation-guarded, so partial runs can be identified and
-        // rolled back without touching another writer's object.
-        for planned in uploads {
-            println!("{}", planned.directory.display());
-            for upload in &planned.uploads {
-                let generation = match upload.source_identity.as_ref() {
-                    Some(identity) => object_move::execute_upload_with_identity(
-                        storage,
-                        interrupt,
-                        &upload.file,
-                        &upload.staging,
-                        Some(identity.clone()),
-                    )?,
-                    None => object_move::execute_upload(
-                        storage,
-                        interrupt,
-                        &upload.file,
-                        &upload.staging,
-                    )?,
-                };
-                transaction.stage(RemoteChange {
-                    source: upload.staging.clone(),
-                    target: upload.target.clone(),
-                    generation,
-                });
-                interrupt.check()?;
+    RemoteTransaction::execute(
+        interrupt,
+        |transaction| {
+            // Upload everything to private staging names first. Finalization is
+            // then generation-guarded, so partial runs can be identified and
+            // rolled back without touching another writer's object.
+            for planned in uploads {
+                println!("{}", planned.directory.display());
+                for upload in &planned.uploads {
+                    let generation = match upload.source_identity.as_ref() {
+                        Some(identity) => object_move::execute_upload_with_identity(
+                            storage,
+                            interrupt,
+                            &upload.file,
+                            &upload.staging,
+                            Some(identity.clone()),
+                        )?,
+                        None => object_move::execute_upload(
+                            storage,
+                            interrupt,
+                            &upload.file,
+                            &upload.staging,
+                        )?,
+                    };
+                    transaction.stage(RemoteChange {
+                        source: upload.staging.clone(),
+                        target: upload.target.clone(),
+                        generation,
+                    });
+                    interrupt.check()?;
+                }
             }
-        }
-
-        transaction.finalize(interrupt, |_, change| {
+            Ok(())
+        },
+        |_, change| {
             let generation = object_move::execute(
                 storage,
                 interrupt,
@@ -376,20 +377,9 @@ fn upload_planned_files_unlocked<S: StorageClient>(
                 target: change.target.clone(),
                 generation,
             })
-        })?;
-        Ok::<(), AppError>(())
-    })();
-
-    match operation {
-        Ok(()) => Ok(()),
-        Err(error) => {
-            interrupt.clear_for_rollback();
-            Err(AppError::rollback(
-                error,
-                rollback_remote(storage, transaction.staged(), transaction.finalized()),
-            ))
-        }
-    }
+        },
+        |staged, finalized| rollback_remote(storage, staged, finalized),
+    )
 }
 
 /// The staging prefix lengthens the object name, so a name that Cloud Storage

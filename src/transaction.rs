@@ -23,6 +23,37 @@ impl RemoteTransaction {
         Self::default()
     }
 
+    /// Runs the shared staging/finalization lifecycle and rolls back every
+    /// recorded change when either phase fails.
+    pub(crate) fn execute<Stage, Finalize, Rollback>(
+        interrupt: &InterruptFlag,
+        stage: Stage,
+        finalize: Finalize,
+        rollback: Rollback,
+    ) -> Result<(), AppError>
+    where
+        Stage: FnOnce(&mut Self) -> Result<(), AppError>,
+        Finalize: FnMut(usize, &RemoteChange) -> Result<RemoteChange, AppError>,
+        Rollback: FnOnce(&[RemoteChange], &[RemoteChange]) -> Vec<AppError>,
+    {
+        let mut transaction = Self::new();
+        let operation = (|| {
+            stage(&mut transaction)?;
+            transaction.finalize(interrupt, finalize)
+        })();
+
+        match operation {
+            Ok(()) => Ok(()),
+            Err(error) => {
+                interrupt.clear_for_rollback();
+                Err(AppError::rollback(
+                    error,
+                    rollback(transaction.staged(), transaction.finalized()),
+                ))
+            }
+        }
+    }
+
     pub(crate) fn stage(&mut self, change: RemoteChange) {
         self.staged.push(change);
     }

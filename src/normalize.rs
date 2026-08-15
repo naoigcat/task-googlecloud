@@ -92,28 +92,29 @@ fn process_moves_unlocked<S: StorageClient>(
     interrupt: &InterruptFlag,
     moves: &[PlannedMove],
 ) -> Result<(), AppError> {
-    let mut transaction = RemoteTransaction::new();
-
-    let operation = (|| {
-        // Separate staging from finalization so no finalization depends on a
-        // source path that an earlier item has already moved.
-        for planned in moves {
-            let generation = object_move::execute(
-                storage,
-                interrupt,
-                &planned.source,
-                &planned.temporary,
-                None,
-            )?;
-            transaction.stage(RemoteChange {
-                source: planned.source.clone(),
-                target: planned.temporary.clone(),
-                generation,
-            });
-            interrupt.check()?;
-        }
-
-        transaction.finalize(interrupt, |index, change| {
+    RemoteTransaction::execute(
+        interrupt,
+        |transaction| {
+            // Separate staging from finalization so no finalization depends on a
+            // source path that an earlier item has already moved.
+            for planned in moves {
+                let generation = object_move::execute(
+                    storage,
+                    interrupt,
+                    &planned.source,
+                    &planned.temporary,
+                    None,
+                )?;
+                transaction.stage(RemoteChange {
+                    source: planned.source.clone(),
+                    target: planned.temporary.clone(),
+                    generation,
+                });
+                interrupt.check()?;
+            }
+            Ok(())
+        },
+        |index, change| {
             let planned = &moves[index];
             let generation = object_move::execute(
                 storage,
@@ -127,20 +128,9 @@ fn process_moves_unlocked<S: StorageClient>(
                 target: planned.target.clone(),
                 generation,
             })
-        })?;
-        Ok::<(), AppError>(())
-    })();
-
-    match operation {
-        Ok(()) => Ok(()),
-        Err(error) => {
-            interrupt.clear_for_rollback();
-            Err(AppError::rollback(
-                error,
-                rollback_moves(storage, transaction.staged(), transaction.finalized()),
-            ))
-        }
-    }
+        },
+        |staged, finalized| rollback_moves(storage, staged, finalized),
+    )
 }
 
 fn temporary_path(source: &ObjectPath) -> Result<ObjectPath, AppError> {

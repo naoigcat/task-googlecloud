@@ -166,3 +166,56 @@ fn collects_rollback_errors_and_continues_in_reverse_order() {
         vec!["finalized rollback failed", "staged rollback failed"]
     );
 }
+
+#[test]
+fn executes_staging_and_rolls_back_when_staging_fails() {
+    let calls = RefCell::new(Vec::new());
+    let error = RemoteTransaction::execute(
+        &interrupt(),
+        |transaction| {
+            transaction.stage(change("first"));
+            transaction.stage(change("second"));
+            Err(AppError::Message("staging failed".to_string()))
+        },
+        |_index, _change| panic!("finalization must not run after staging fails"),
+        |staged, finalized| {
+            calls.borrow_mut().push((staged.len(), finalized.len()));
+            Vec::new()
+        },
+    )
+    .unwrap_err();
+
+    assert_eq!(error.to_string(), "staging failed");
+    assert_eq!(*calls.borrow(), vec![(2, 0)]);
+}
+
+#[test]
+fn executes_rollback_after_a_partial_finalization() {
+    let calls = RefCell::new(Vec::new());
+    let error = RemoteTransaction::execute(
+        &interrupt(),
+        |transaction| {
+            transaction.stage(change("first"));
+            transaction.stage(change("second"));
+            Ok(())
+        },
+        |index, change| {
+            if index == 1 {
+                return Err(AppError::Message("finalization failed".to_string()));
+            }
+            Ok(named_change(
+                &change.source.object,
+                "finalized-target",
+                "finalized",
+            ))
+        },
+        |staged, finalized| {
+            calls.borrow_mut().push((staged.len(), finalized.len()));
+            Vec::new()
+        },
+    )
+    .unwrap_err();
+
+    assert_eq!(error.to_string(), "finalization failed");
+    assert_eq!(*calls.borrow(), vec![(2, 1)]);
+}
