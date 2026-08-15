@@ -270,7 +270,7 @@ impl StorageApi {
     {
         let body = self.send_body(request)?;
         serde_json::from_slice(&body)
-            .map_err(|error| AppError::Message(format!("{description}: {error}")))
+            .map_err(|error| AppError::StorageResponse(format!("{description}: {error}")))
     }
 
     async fn response_body(response: Response) -> Result<Vec<u8>, AppError> {

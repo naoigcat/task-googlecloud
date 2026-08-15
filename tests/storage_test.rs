@@ -753,6 +753,35 @@ fn keeps_one_bucket_lock_for_all_moves_in_a_transaction() {
     );
 }
 
+#[test]
+fn requires_recovery_when_a_move_response_cannot_be_decoded() {
+    let (base, requests, server) = test_server(vec![
+        bucket_lock_created(),
+        (200, r#"{"generation":"11"}"#.to_string()),
+        (200, "not-json".to_string()),
+        (200, r#"{"generation":"11"}"#.to_string()),
+        (404, "{}".to_string()),
+        bucket_lock_deleted(),
+    ]);
+    let storage = storage(&base);
+    let interrupt = InterruptFlag::from_atomic(Arc::new(AtomicBool::new(false)));
+    let source = ObjectPath::parse("gs://bucket/source").unwrap();
+    let target = ObjectPath::parse("gs://bucket/target").unwrap();
+    let temporary = ObjectPath::parse("gs://bucket/temporary").unwrap();
+
+    let error = process_moves(&storage, &interrupt, vec![(source, target, temporary)]).unwrap_err();
+    server.join().unwrap();
+
+    assert!(matches!(error, AppError::Recovery { .. }), "{error}");
+    let requests = requests.lock().unwrap();
+    assert_eq!(requests.len(), 6);
+    assert!(request_line(&requests[2]).contains("rewriteTo"));
+    assert_eq!(
+        request_line(&requests[5]),
+        "DELETE /storage/v1/b/bucket/o/.task-googlecloud-lock?generation=lock HTTP/1.1"
+    );
+}
+
 #[cfg(unix)]
 #[test]
 fn requires_recovery_when_move_confirmation_fails_after_copy() {

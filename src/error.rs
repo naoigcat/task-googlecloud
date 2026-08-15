@@ -21,6 +21,9 @@ pub enum AppError {
     #[error("Cloud Storage API request failed ({status}): {message}")]
     Storage { status: u16, message: String },
 
+    #[error("{0}")]
+    StorageResponse(String),
+
     #[error("Cloud Storage bucket lock conflict: {0}")]
     BucketLockConflict(Box<AppError>),
 
@@ -116,10 +119,12 @@ impl AppError {
     }
 
     pub(crate) fn may_have_sent_storage_request(&self) -> bool {
-        matches!(
-            self,
-            Self::Http(_) | Self::Storage { .. } | Self::Token(_, true)
-        )
+        match self {
+            Self::Http(_) | Self::Storage { .. } | Self::StorageResponse(_) => true,
+            Self::Token(_, true) => true,
+            Self::Rollback { original, .. } => original.may_have_sent_storage_request(),
+            _ => false,
+        }
     }
 
     pub(crate) fn status(&self) -> Option<u16> {

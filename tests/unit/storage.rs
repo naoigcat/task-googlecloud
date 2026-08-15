@@ -256,7 +256,7 @@ fn removes_a_bucket_lock_after_an_unacknowledged_response() {
 
     server.join().unwrap();
 
-    assert!(matches!(error, super::AppError::Message(message) if message.contains("bucket lock")));
+    assert!(error.to_string().contains("bucket lock"), "{error}");
 }
 
 #[test]
