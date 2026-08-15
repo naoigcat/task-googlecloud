@@ -212,6 +212,53 @@ fn renames_a_file_with_captured_identities() {
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 #[test]
+fn refuses_to_rollback_a_replaced_source_file() {
+    let parent = tempdir().unwrap();
+    let root = parent.path().join("uploads");
+    let bucket = root.join("bucket");
+    let source = bucket.join("source.txt");
+    let target = bucket.join("target.txt");
+    fs::create_dir_all(&bucket).unwrap();
+    fs::write(&source, "original").unwrap();
+    let expected_root = directory_identity_from_path(&root).unwrap();
+    let expected_directory = directory_identity_from_path(&bucket).unwrap();
+    let expected_file = file_identity_from_path(&source).unwrap();
+    let entries = vec![Entry {
+        source: source.to_str().unwrap().to_string(),
+        target: target.to_str().unwrap().to_string(),
+    }];
+    let files = HashMap::from([(source.clone(), expected_file)]);
+    let directories = HashMap::from([(bucket.clone(), expected_directory)]);
+    let interrupt = InterruptFlag::from_atomic(Arc::new(AtomicBool::new(false)));
+
+    apply_normalization_with_path_identities(
+        &root,
+        &entries,
+        Some(expected_root.clone()),
+        Some(&files),
+        Some(&directories),
+        &interrupt,
+    )
+    .unwrap();
+    fs::remove_file(&target).unwrap();
+    fs::write(&target, "replacement").unwrap();
+
+    let errors = rollback_normalization_with_path_identities(
+        &root,
+        Some(expected_root),
+        Some(&files),
+        Some(&directories),
+        &[(source.clone(), target.clone())],
+    );
+
+    assert_eq!(errors.len(), 1);
+    assert!(errors[0].to_string().contains("Input file was replaced"));
+    assert!(!source.exists());
+    assert_eq!(fs::read_to_string(target).unwrap(), "replacement");
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
 fn refuses_to_rename_through_a_replaced_bucket() {
     let parent = tempdir().unwrap();
     let root = parent.path().join("uploads");

@@ -16,6 +16,63 @@ struct RenameRecord {
     target: PathBuf,
 }
 
+struct RenameContext<'a> {
+    root: &'a Path,
+    expected_root: Option<DirectoryIdentity>,
+    expected_files: Option<&'a HashMap<PathBuf, FileIdentity>>,
+    expected_directories: Option<&'a HashMap<PathBuf, DirectoryIdentity>>,
+}
+
+impl<'a> RenameContext<'a> {
+    fn new(
+        root: &'a Path,
+        expected_root: Option<DirectoryIdentity>,
+        expected_files: Option<&'a HashMap<PathBuf, FileIdentity>>,
+        expected_directories: Option<&'a HashMap<PathBuf, DirectoryIdentity>>,
+    ) -> Self {
+        Self {
+            root,
+            expected_root,
+            expected_files,
+            expected_directories,
+        }
+    }
+
+    /// Applies the same identity checks to forward and rollback renames so a
+    /// replacement cannot be treated differently in either transaction phase.
+    fn rename(&self, source: &Path, target: &Path) -> Result<(), AppError> {
+        self.rename_with_expected_file(source, target, source)
+    }
+
+    fn rename_with_expected_file(
+        &self,
+        source: &Path,
+        target: &Path,
+        expected_file: &Path,
+    ) -> Result<(), AppError> {
+        match self.expected_root.clone() {
+            Some(expected_root) => rename_without_overwrite_with_identity(
+                self.root,
+                Some(expected_root),
+                self.expected_files
+                    .and_then(|files| files.get(expected_file).cloned()),
+                self.parent_identity(source),
+                self.parent_identity(target),
+                source,
+                target,
+            ),
+            None => rename_without_overwrite(self.root, source, target),
+        }
+    }
+
+    fn parent_identity(&self, path: &Path) -> Option<DirectoryIdentity> {
+        self.expected_directories.and_then(|directories| {
+            path.parent()
+                .and_then(|parent| directories.get(parent).cloned())
+        })
+    }
+}
+
 /// Applies the planned local renames without overwriting a target.
 ///
 /// On failure, already completed renames are rolled back in reverse order.
@@ -44,6 +101,7 @@ pub(crate) fn apply_normalization_with_path_identities(
     expected_directories: Option<&HashMap<PathBuf, DirectoryIdentity>>,
     interrupt: &InterruptFlag,
 ) -> Result<HashMap<PathBuf, PathBuf>, AppError> {
+    let context = RenameContext::new(root, expected_root, expected_files, expected_directories);
     // Preserve the planned identities so rollback can refuse to overwrite a
     // path that another process replaced while this transaction was running.
     let mut renamed = Vec::new();
@@ -54,23 +112,7 @@ pub(crate) fn apply_normalization_with_path_identities(
             if source == target {
                 continue;
             }
-            rename(
-                root,
-                expected_root.clone(),
-                expected_files.and_then(|files| files.get(&source).cloned()),
-                expected_directories.and_then(|directories| {
-                    source
-                        .parent()
-                        .and_then(|parent| directories.get(parent).cloned())
-                }),
-                expected_directories.and_then(|directories| {
-                    target
-                        .parent()
-                        .and_then(|parent| directories.get(parent).cloned())
-                }),
-                &source,
-                &target,
-            )?;
+            context.rename(&source, &target)?;
             renamed.push(RenameRecord { source, target });
             interrupt.check()?;
         }
@@ -78,16 +120,7 @@ pub(crate) fn apply_normalization_with_path_identities(
     })();
 
     if let Err(error) = operation {
-        return Err(AppError::rollback(
-            error,
-            rollback(
-                root,
-                expected_root.clone(),
-                expected_files,
-                expected_directories,
-                &renamed,
-            ),
-        ));
+        return Err(AppError::rollback(error, rollback(&context, &renamed)));
     }
 
     Ok(entries
@@ -116,6 +149,7 @@ pub(crate) fn rollback_normalization_with_path_identities(
     expected_directories: Option<&HashMap<PathBuf, DirectoryIdentity>>,
     entries: &[(PathBuf, PathBuf)],
 ) -> Vec<AppError> {
+    let context = RenameContext::new(root, expected_root, expected_files, expected_directories);
     let records = entries
         .iter()
         .map(|(source, target)| RenameRecord {
@@ -123,22 +157,10 @@ pub(crate) fn rollback_normalization_with_path_identities(
             target: target.clone(),
         })
         .collect::<Vec<_>>();
-    rollback(
-        root,
-        expected_root.clone(),
-        expected_files,
-        expected_directories,
-        &records,
-    )
+    rollback(&context, &records)
 }
 
-fn rollback(
-    root: &Path,
-    expected_root: Option<DirectoryIdentity>,
-    expected_files: Option<&HashMap<PathBuf, FileIdentity>>,
-    expected_directories: Option<&HashMap<PathBuf, DirectoryIdentity>>,
-    entries: &[RenameRecord],
-) -> Vec<AppError> {
+fn rollback(context: &RenameContext<'_>, entries: &[RenameRecord]) -> Vec<AppError> {
     let mut errors = Vec::new();
     // Reverse order restores chained renames without making an earlier source
     // name collide with a later rename that has not been undone yet.
@@ -146,25 +168,9 @@ fn rollback(
         if entry.source == entry.target {
             continue;
         }
-        if let Err(error) = rename(
-            root,
-            expected_root.clone(),
-            expected_files.and_then(|files| files.get(&entry.source).cloned()),
-            expected_directories.and_then(|directories| {
-                entry
-                    .target
-                    .parent()
-                    .and_then(|parent| directories.get(parent).cloned())
-            }),
-            expected_directories.and_then(|directories| {
-                entry
-                    .source
-                    .parent()
-                    .and_then(|parent| directories.get(parent).cloned())
-            }),
-            &entry.target,
-            &entry.source,
-        ) {
+        if let Err(error) =
+            context.rename_with_expected_file(&entry.target, &entry.source, &entry.source)
+        {
             if matches!(&error, AppError::Io(error) if error.kind() == io::ErrorKind::AlreadyExists)
             {
                 errors.push(
@@ -188,29 +194,6 @@ pub fn path_string(path: &Path) -> Result<String, AppError> {
     path.to_str()
         .map(str::to_string)
         .ok_or_else(|| AppError::Message(format!("Path is not valid UTF-8: {path:?}")))
-}
-
-fn rename(
-    root: &Path,
-    expected_root: Option<DirectoryIdentity>,
-    expected_source: Option<FileIdentity>,
-    expected_source_parent: Option<DirectoryIdentity>,
-    expected_target_parent: Option<DirectoryIdentity>,
-    source: &Path,
-    target: &Path,
-) -> Result<(), AppError> {
-    match expected_root {
-        Some(expected_root) => rename_without_overwrite_with_identity(
-            root,
-            Some(expected_root),
-            expected_source,
-            expected_source_parent,
-            expected_target_parent,
-            source,
-            target,
-        ),
-        None => rename_without_overwrite(root, source, target),
-    }
 }
 
 #[cfg(test)]
