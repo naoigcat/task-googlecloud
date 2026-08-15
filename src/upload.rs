@@ -12,7 +12,7 @@ use crate::local;
 use crate::normalization_plan;
 use crate::object_move;
 use crate::storage::{ObjectPath, StorageClient, UPLOAD_ROOT};
-use crate::transaction::{RemoteChange, RemoteTransaction};
+use crate::transaction::{RemoteChange, RemoteTransaction, rollback_changes};
 use crate::upload_source::UploadSourceIdentity;
 
 #[cfg(test)]
@@ -414,31 +414,16 @@ pub fn rollback_remote<S: StorageClient>(
     staged: &[RemoteChange],
     finalized: &[RemoteChange],
 ) -> Vec<AppError> {
-    let mut errors = Vec::new();
-    for change in finalized.iter().rev() {
-        match storage.rollback_object(&change.source, &change.target, &change.generation) {
-            Ok(restored_generation) => {
-                if let Err(error) = storage.cleanup_object(&change.source, &restored_generation) {
-                    errors.push(error);
-                }
-            }
-            Err(error) => errors.push(error),
-        }
-    }
-
-    let finalized_sources = finalized
-        .iter()
-        .map(|change| &change.source)
-        .collect::<Vec<_>>();
-    for change in staged.iter().rev() {
-        if finalized_sources.contains(&&change.source) {
-            continue;
-        }
-        if let Err(error) = storage.cleanup_object(&change.source, &change.generation) {
-            errors.push(error);
-        }
-    }
-    errors
+    rollback_changes(
+        staged,
+        finalized,
+        |change| {
+            let restored_generation =
+                storage.rollback_object(&change.source, &change.target, &change.generation)?;
+            storage.cleanup_object(&change.source, &restored_generation)
+        },
+        |change| storage.cleanup_object(&change.source, &change.generation),
+    )
 }
 
 #[cfg(test)]

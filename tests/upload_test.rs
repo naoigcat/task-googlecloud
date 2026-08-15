@@ -10,7 +10,7 @@ struct FakeStorage {
     uploads: RefCell<Vec<String>>,
     moves: RefCell<Vec<String>>,
     rollbacks: RefCell<Vec<String>>,
-    cleanups: RefCell<Vec<String>>,
+    cleanups: RefCell<Vec<(String, String)>>,
     fail_on_move: Option<usize>,
 }
 
@@ -48,12 +48,10 @@ impl StorageClient for FakeStorage {
         Ok("301".to_string())
     }
 
-    fn cleanup_object(
-        &self,
-        target: &ObjectPath,
-        _target_generation: &str,
-    ) -> Result<(), AppError> {
-        self.cleanups.borrow_mut().push(target.uri());
+    fn cleanup_object(&self, target: &ObjectPath, target_generation: &str) -> Result<(), AppError> {
+        self.cleanups
+            .borrow_mut()
+            .push((target.uri(), target_generation.to_string()));
         Ok(())
     }
 
@@ -142,6 +140,7 @@ fn rolls_back_finalized_and_staged_remote_changes() {
         fail_on_move: None,
     };
     let staging = ObjectPath::parse("gs://bucket/.task-googlecloud-staging/token/file").unwrap();
+    let staging_uri = staging.uri();
     let final_path = ObjectPath::parse("gs://bucket/file").unwrap();
     let staged = vec![RemoteChange {
         source: staging.clone(),
@@ -158,5 +157,8 @@ fn rolls_back_finalized_and_staged_remote_changes() {
 
     assert!(errors.is_empty());
     assert_eq!(storage.rollbacks.borrow().len(), 1);
-    assert_eq!(storage.cleanups.borrow().len(), 1);
+    assert_eq!(
+        *storage.cleanups.borrow(),
+        vec![(staging_uri, "301".to_string())]
+    );
 }

@@ -1,3 +1,5 @@
+use std::collections::HashSet;
+
 use crate::InterruptFlag;
 use crate::error::AppError;
 use crate::storage::{ObjectPath, StorageClient};
@@ -66,28 +68,53 @@ pub(crate) fn rollback_moves<S: StorageClient>(
     staged: &[RemoteChange],
     finalized: &[RemoteChange],
 ) -> Vec<AppError> {
+    rollback_changes(
+        staged,
+        finalized,
+        |change| {
+            storage
+                .rollback_object(&change.source, &change.target, &change.generation)
+                .map(|_| ())
+        },
+        |change| {
+            storage
+                .rollback_object(&change.source, &change.target, &change.generation)
+                .map(|_| ())
+        },
+    )
+}
+
+/// Rolls back finalized changes before still-staged changes while avoiding a
+/// second rollback for a staged source already consumed by finalization.
+pub(crate) fn rollback_changes<Finalized, Staged>(
+    staged: &[RemoteChange],
+    finalized: &[RemoteChange],
+    mut rollback_finalized: Finalized,
+    mut rollback_staged: Staged,
+) -> Vec<AppError>
+where
+    Finalized: FnMut(&RemoteChange) -> Result<(), AppError>,
+    Staged: FnMut(&RemoteChange) -> Result<(), AppError>,
+{
     let mut errors = Vec::new();
+    let finalized_sources = finalized
+        .iter()
+        .map(|change| &change.source)
+        .collect::<HashSet<_>>();
+
     // Undo finalized moves first, then the still-staged moves. Reverse order
     // preserves the same dependency ordering used while applying the plan.
     for change in finalized.iter().rev() {
-        if let Err(error) =
-            storage.rollback_object(&change.source, &change.target, &change.generation)
-        {
+        if let Err(error) = rollback_finalized(change) {
             errors.push(error);
         }
     }
 
-    let finalized_sources = finalized
-        .iter()
-        .map(|change| &change.source)
-        .collect::<Vec<_>>();
     for change in staged.iter().rev() {
-        if finalized_sources.contains(&&change.source) {
+        if finalized_sources.contains(&change.source) {
             continue;
         }
-        if let Err(error) =
-            storage.rollback_object(&change.source, &change.target, &change.generation)
-        {
+        if let Err(error) = rollback_staged(change) {
             errors.push(error);
         }
     }
