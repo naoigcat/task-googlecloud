@@ -7,8 +7,8 @@ use std::sync::{Arc, atomic::AtomicBool};
 use std::thread;
 
 use super::{
-    MAX_OBJECT_NAME_BYTES, PlannedDirectoryUploads, PlannedUpload, is_real_directory,
-    is_regular_file, plan_uploads, staging_path, upload_planned_files,
+    MAX_OBJECT_NAME_BYTES, PlannedDirectoryUploads, PlannedUpload, UploadDiscovery,
+    is_real_directory, is_regular_file, plan_uploads, staging_path, upload_planned_files,
 };
 use crate::InterruptFlag;
 use crate::cloud::Cloud;
@@ -323,8 +323,14 @@ fn plans_uploads_from_discovery_alone() {
     let target = bucket.join("\u{e9}.txt");
     let files_by_directory = BTreeMap::from([(bucket, vec![source.clone()])]);
     let normalized_files = HashMap::from([(source, target)]);
+    let discovery = UploadDiscovery {
+        files_by_directory,
+        root_identity: None,
+        directory_identities: HashMap::new(),
+        file_identities: HashMap::new(),
+    };
 
-    let planned = plan_uploads(&files_by_directory, &normalized_files, STAGING_PREFIX).unwrap();
+    let planned = plan_uploads(&discovery, &normalized_files, STAGING_PREFIX).unwrap();
 
     assert_eq!(planned.len(), 1);
     let uploads = &planned[0].uploads;
@@ -357,8 +363,14 @@ fn rejects_a_plan_before_any_file_is_renamed_or_uploaded() {
     let source = bucket.join(&object_name);
     let files_by_directory = BTreeMap::from([(bucket, vec![source.clone()])]);
     let normalized_files = HashMap::from([(source.clone(), source)]);
+    let discovery = UploadDiscovery {
+        files_by_directory,
+        root_identity: None,
+        directory_identities: HashMap::new(),
+        file_identities: HashMap::new(),
+    };
 
-    let error = plan_uploads(&files_by_directory, &normalized_files, STAGING_PREFIX).unwrap_err();
+    let error = plan_uploads(&discovery, &normalized_files, STAGING_PREFIX).unwrap_err();
 
     assert!(matches!(error, AppError::Message(message) if message.contains("temporary staging")));
 }

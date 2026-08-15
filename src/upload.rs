@@ -27,18 +27,17 @@ pub fn run<S: StorageClient>(
     project: &str,
 ) -> Result<(), AppError> {
     let discovery = discover_uploads(Path::new(UPLOAD_ROOT))?;
-    let files_by_directory = discovery.files_by_directory;
     let expected_root = discovery.root_identity.clone();
-    let directory_identities = discovery.directory_identities;
-    let file_identities = discovery.file_identities;
     storage.set_upload_root_identity(expected_root.clone())?;
-    let buckets = files_by_directory
+    let buckets = discovery
+        .files_by_directory
         .keys()
         .map(|directory| bucket_name(directory))
         .collect::<Result<Vec<_>, _>>()?;
 
     storage.with_bucket_locks(&buckets, || {
-        let files = files_by_directory
+        let files = discovery
+            .files_by_directory
             .values()
             .flatten()
             .cloned()
@@ -54,13 +53,7 @@ pub fn run<S: StorageClient>(
             .iter()
             .map(|entry| (PathBuf::from(&entry.source), PathBuf::from(&entry.target)))
             .collect::<HashMap<_, _>>();
-        let uploads = plan_uploads_with_identities(
-            &files_by_directory,
-            &planned_names,
-            &file_identities,
-            &directory_identities,
-            &staging_prefix(),
-        )?;
+        let uploads = plan_uploads(&discovery, &planned_names, &staging_prefix())?;
 
         cloud.login()?;
         cloud.set_project(project)?;
@@ -69,8 +62,8 @@ pub fn run<S: StorageClient>(
             Path::new(UPLOAD_ROOT),
             &plan,
             expected_root.clone(),
-            Some(&file_identities),
-            Some(&directory_identities),
+            Some(&discovery.file_identities),
+            Some(&discovery.directory_identities),
             interrupt,
         )?;
 
@@ -81,8 +74,8 @@ pub fn run<S: StorageClient>(
                 let errors = local::rollback_normalization_with_path_identities(
                     Path::new(UPLOAD_ROOT),
                     expected_root.clone(),
-                    Some(&file_identities),
-                    Some(&directory_identities),
+                    Some(&discovery.file_identities),
+                    Some(&discovery.directory_identities),
                     &normalized_files
                         .iter()
                         .map(|(source, target)| (source.clone(), target.clone()))
@@ -227,28 +220,12 @@ fn staging_prefix() -> String {
     )
 }
 
-#[cfg(test)]
 fn plan_uploads(
-    files_by_directory: &BTreeMap<PathBuf, Vec<PathBuf>>,
+    discovery: &UploadDiscovery,
     normalized_files: &HashMap<PathBuf, PathBuf>,
     staging_prefix: &str,
 ) -> Result<Vec<PlannedDirectoryUploads>, AppError> {
-    plan_uploads_with_identities(
-        files_by_directory,
-        normalized_files,
-        &HashMap::new(),
-        &HashMap::new(),
-        staging_prefix,
-    )
-}
-
-fn plan_uploads_with_identities(
-    files_by_directory: &BTreeMap<PathBuf, Vec<PathBuf>>,
-    normalized_files: &HashMap<PathBuf, PathBuf>,
-    file_identities: &HashMap<PathBuf, FileIdentity>,
-    directory_identities: &HashMap<PathBuf, DirectoryIdentity>,
-    staging_prefix: &str,
-) -> Result<Vec<PlannedDirectoryUploads>, AppError> {
+    let files_by_directory = &discovery.files_by_directory;
     let mut planned = Vec::new();
     for (directory, files) in files_by_directory {
         let bucket = bucket_name(directory)?;
@@ -265,14 +242,21 @@ fn plan_uploads_with_identities(
                 .ok_or_else(|| {
                     AppError::Message(format!("File is not valid UTF-8: {normalized_file:?}"))
                 })?;
-            let source_identity = if file_identities.is_empty() && directory_identities.is_empty() {
+            let source_identity = if discovery.file_identities.is_empty()
+                && discovery.directory_identities.is_empty()
+            {
                 None
             } else {
                 Some(UploadSourceIdentity {
-                    file: file_identities.get(file).cloned().ok_or_else(|| {
-                        AppError::Message(format!("Missing file identity for {file:?}"))
-                    })?,
-                    directory: directory_identities
+                    file: discovery
+                        .file_identities
+                        .get(file)
+                        .cloned()
+                        .ok_or_else(|| {
+                            AppError::Message(format!("Missing file identity for {file:?}"))
+                        })?,
+                    directory: discovery
+                        .directory_identities
                         .get(directory)
                         .cloned()
                         .ok_or_else(|| {
