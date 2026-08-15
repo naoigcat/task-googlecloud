@@ -37,10 +37,13 @@ pub enum AppError {
         details: String,
     },
 
-    /// Access-token retrieval failed. The boolean records whether an earlier
+    /// Access-token retrieval failed. The field records whether an earlier
     /// request in the same operation may already have reached Cloud Storage.
-    #[error("Cloud Storage token retrieval failed: {0}")]
-    Token(Box<AppError>, bool),
+    #[error("Cloud Storage token retrieval failed: {error}")]
+    Token {
+        error: Box<AppError>,
+        may_have_reached_storage: bool,
+    },
 
     #[error("Manual recovery required for {paths} after {operation}; {details}")]
     Recovery {
@@ -103,7 +106,10 @@ impl AppError {
     pub(crate) fn may_have_reached_storage(&self) -> bool {
         match self {
             Self::UploadSource(_) | Self::Command { .. } | Self::Interrupted => false,
-            Self::Token(_, may_have_reached_storage) => *may_have_reached_storage,
+            Self::Token {
+                may_have_reached_storage,
+                ..
+            } => *may_have_reached_storage,
             _ => true,
         }
     }
@@ -113,7 +119,7 @@ impl AppError {
             Self::Interrupted
             | Self::InterruptedAfterMoveRollback { .. }
             | Self::InterruptedAfterRequest => true,
-            Self::Token(error, _) => error.is_interrupted(),
+            Self::Token { error, .. } => error.is_interrupted(),
             _ => false,
         }
     }
@@ -143,12 +149,18 @@ impl AppError {
     }
 
     pub(crate) fn token(error: Self) -> Self {
-        Self::Token(Box::new(error), false)
+        Self::Token {
+            error: Box::new(error),
+            may_have_reached_storage: false,
+        }
     }
 
     pub(crate) fn mark_storage_reached(self) -> Self {
         match self {
-            Self::Token(error, _) => Self::Token(error, true),
+            Self::Token { error, .. } => Self::Token {
+                error,
+                may_have_reached_storage: true,
+            },
             error => error,
         }
     }
@@ -159,7 +171,10 @@ impl AppError {
             | Self::Storage { .. }
             | Self::StorageResponse(_)
             | Self::InterruptedAfterRequest => true,
-            Self::Token(_, true) => true,
+            Self::Token {
+                may_have_reached_storage: true,
+                ..
+            } => true,
             Self::Rollback { original, .. } => original.may_have_sent_storage_request(),
             _ => false,
         }

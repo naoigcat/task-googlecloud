@@ -530,19 +530,19 @@ fn does_not_confirm_operations_that_never_reached_storage() {
         status: "255".to_string(),
         details: ": ssh: connect to host googlecloud port 22: Connection refused".to_string(),
     };
-    let token_io = AppError::Token(
-        Box::new(AppError::Io(std::io::Error::new(
+    let token_io = AppError::Token {
+        error: Box::new(AppError::Io(std::io::Error::new(
             std::io::ErrorKind::BrokenPipe,
             "token pipe closed",
         ))),
-        false,
-    );
-    let token_utf8 = AppError::Token(
-        Box::new(AppError::Message(
+        may_have_reached_storage: false,
+    };
+    let token_utf8 = AppError::Token {
+        error: Box::new(AppError::Message(
             "Cloud command returned invalid UTF-8".to_string(),
         )),
-        false,
-    );
+        may_have_reached_storage: false,
+    };
 
     storage
         .confirm_write_after_failure(&target, &unreadable_source)
@@ -576,13 +576,13 @@ fn confirms_state_after_token_failure_following_a_remote_request() {
     let storage = storage(&base);
     let source = ObjectPath::parse("gs://bucket/source").unwrap();
     let target = ObjectPath::parse("gs://bucket/target").unwrap();
-    let operation = AppError::Token(
-        Box::new(AppError::Io(std::io::Error::new(
+    let operation = AppError::Token {
+        error: Box::new(AppError::Io(std::io::Error::new(
             std::io::ErrorKind::BrokenPipe,
             "token pipe closed",
         ))),
-        true,
-    );
+        may_have_reached_storage: true,
+    };
 
     let error = storage
         .confirm_move_after_failure(&source, &target, &operation)
