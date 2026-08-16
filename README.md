@@ -28,11 +28,10 @@ mise run upload [project]
 
 ### Authentication lifecycle
 
-Authentication is stored only in the temporary `googlecloud` container. The
-`mise run normalize` and `mise run upload` tasks remove that container when they
-finish, so credentials are not reused by later runs and no logout command is
-provided. A development shell does not tear the container down on its own, so
-run `docker compose down` after using it.
+Authentication is stored in the `googlecloud` container and is reused by later
+normalize or upload retries. Credentials are not mounted from the host, and no
+logout command is provided. Run `docker compose down` when the session should be
+discarded; this also removes the container's credentials.
 
 ## Development
 
@@ -76,12 +75,14 @@ container or host termination, or an interruption during rollback cannot be
 handled. These events can leave temporary Cloud Storage objects or locally
 normalized filenames behind. The workflows also stop for manual recovery when
 a remote failure leaves an object whose ownership cannot be established safely.
-Uploads retry replayable connection or request-send failures up to ten attempts
-with bounded backoff, rebuilding the source stream for each attempt. The media
-upload uses `ifGenerationMatch=0`, so a retry cannot overwrite an existing
-object. Local source-read and response/decode timeout failures are not retried;
-if the result remains ambiguous after the retries, the normal manual-recovery
-confirmation remains in force rather than guessing which object was created.
+Small uploads retry replayable connection or request-send failures up to ten
+attempts with bounded backoff, rebuilding the source stream for each attempt.
+Larger uploads use a resumable Cloud Storage session with bounded chunks; when a
+chunk request fails, the session offset is queried and only the uncommitted
+chunk is retried. Both paths use `ifGenerationMatch=0`, so a retry cannot
+overwrite an existing object. Local source-read failures are not retried, and
+an ambiguous final result still follows the normal manual-recovery confirmation
+instead of guessing which object was created.
 
 Before retrying a stopped run:
 

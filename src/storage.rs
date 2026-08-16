@@ -7,8 +7,9 @@ use std::time::Duration;
 
 use percent_encoding::{AsciiSet, CONTROLS, utf8_percent_encode};
 use reqwest::Body;
-use reqwest::header::{CONTENT_LENGTH, CONTENT_TYPE};
+use reqwest::header::{CONTENT_LENGTH, CONTENT_RANGE, CONTENT_TYPE, LOCATION, RANGE};
 use serde::Deserialize;
+use tokio::io::AsyncReadExt;
 use tokio_util::io::ReaderStream;
 use url::form_urlencoded::Serializer;
 
@@ -18,7 +19,9 @@ use crate::atomic_rename::DirectoryIdentity;
 use crate::cloud::Cloud;
 use crate::error::AppError;
 pub use crate::object_path::ObjectPath;
-use crate::storage_transport::{REQUEST_TIMEOUT, StorageTransport, UPLOAD_TIMEOUT};
+use crate::storage_transport::{
+    REQUEST_TIMEOUT, ResumableResponse, StorageTransport, UPLOAD_TIMEOUT,
+};
 use crate::upload_source::{self, UploadSourceIdentity};
 
 /// Uploads are confined to this directory, so file discovery and the confined
@@ -30,9 +33,10 @@ const UPLOAD_BASE: &str = "https://storage.googleapis.com/upload/storage/v1";
 /// move cannot delete its source while another compliant writer replaces its
 /// destination.
 const BUCKET_LOCK_OBJECT: &str = ".task-googlecloud-lock";
-// The upload is guarded by ifGenerationMatch=0, so a transport failure can be
-// replayed without overwriting a generation that another writer created. Keep
-// the retry budget finite so a persistent outage still reaches recovery handling.
+// Small files retain the simple media request, while larger files use a
+// resumable session so a dropped connection only replays one bounded chunk.
+const RESUMABLE_UPLOAD_THRESHOLD: u64 = 64 * 1024 * 1024;
+const RESUMABLE_CHUNK_SIZE: u64 = 8 * 1024 * 1024;
 const UPLOAD_ATTEMPTS: usize = 10;
 const UPLOAD_RETRY_BASE_DELAY: Duration = Duration::from_millis(250);
 const PATH_SEGMENT: &AsciiSet = &CONTROLS
@@ -735,6 +739,11 @@ impl StorageClient for StorageApi {
     }
 }
 
+enum ResumableProgress {
+    Offset(u64),
+    Complete(String),
+}
+
 impl StorageApi {
     fn upload_file_with_retries(
         &self,
@@ -748,6 +757,15 @@ impl StorageApi {
         // object content between attempts while preserving the same file entry.
         let expected_fingerprint =
             self.capture_upload_fingerprint(source, expected_source.clone())?;
+        if expected_fingerprint.size() >= RESUMABLE_UPLOAD_THRESHOLD {
+            return self.upload_resumable_file(
+                source,
+                target,
+                expected_source,
+                &expected_fingerprint,
+            );
+        }
+
         // Rebuild the whole request, including ReaderStream, so every retry
         // starts from a fresh file descriptor and preserves source validation.
         for attempt in 1..=UPLOAD_ATTEMPTS {
@@ -855,6 +873,396 @@ impl StorageApi {
             Ok(metadata.generation)
         })
     }
+
+    fn upload_resumable_file(
+        &self,
+        source: &Path,
+        target: &ObjectPath,
+        expected_source: Option<UploadSourceIdentity>,
+        expected_fingerprint: &upload_source::FileFingerprint,
+    ) -> Result<String, AppError> {
+        let expected_root = self
+            .upload_root_identity
+            .lock()
+            .map_err(|_| AppError::Message("Upload root identity lock is poisoned".to_string()))?
+            .clone();
+        let mut verification_file = self.open_upload_source_for_verification(
+            source,
+            expected_source.clone(),
+            expected_root.clone(),
+        )?;
+        self.with_object_locks(&[target], || {
+            let generation = self.upload_resumable_locked(
+                source,
+                target,
+                expected_source,
+                expected_root,
+                expected_fingerprint.size(),
+            )?;
+            let actual_fingerprint = upload_source::fingerprint(&mut verification_file)
+                .map_err(|error| AppError::UploadSourceChanged(format!("{source:?}: {error}")))?;
+            if actual_fingerprint != *expected_fingerprint {
+                return Err(AppError::UploadSourceChanged(format!(
+                    "{source:?} no longer matches the validated upload contents"
+                )));
+            }
+            Ok(generation)
+        })
+    }
+
+    fn open_upload_source_for_verification(
+        &self,
+        source: &Path,
+        expected_source: Option<UploadSourceIdentity>,
+        expected_root: Option<DirectoryIdentity>,
+    ) -> Result<std::fs::File, AppError> {
+        let file = upload_source::open(
+            self.upload_root.as_deref(),
+            source,
+            expected_root,
+            expected_source,
+        )?;
+        // Keep a descriptor tied to the validated inode so the final fingerprint
+        // still detects in-place edits even if the pathname is replaced later.
+        file.try_clone().map_err(AppError::UploadSource)
+    }
+
+    fn upload_resumable_locked(
+        &self,
+        source: &Path,
+        target: &ObjectPath,
+        expected_source: Option<UploadSourceIdentity>,
+        expected_root: Option<DirectoryIdentity>,
+        size: u64,
+    ) -> Result<String, AppError> {
+        let mut token = self.transport.token()?;
+        let session = self.start_resumable_session(target, size, &mut token)?;
+        let result = (|| {
+            let mut offset = 0_u64;
+            while offset < size {
+                let chunk_size = (size - offset).min(RESUMABLE_CHUNK_SIZE);
+                match self.upload_resumable_chunk(
+                    source,
+                    expected_source.clone(),
+                    expected_root.clone(),
+                    &session,
+                    offset,
+                    chunk_size,
+                    size,
+                    &mut token,
+                )? {
+                    ResumableProgress::Offset(next_offset)
+                        if next_offset <= offset + chunk_size =>
+                    {
+                        if next_offset == offset {
+                            return Err(AppError::StorageResponse(format!(
+                                "Cloud Storage resumable upload made no progress at {offset}"
+                            )));
+                        }
+                        // A status query is authoritative even when it reveals
+                        // that fewer bytes were committed than the last response reported.
+                        offset = next_offset;
+                    }
+                    ResumableProgress::Offset(next_offset) => {
+                        return Err(AppError::StorageResponse(format!(
+                            "Cloud Storage resumable upload returned invalid offset {next_offset} for {offset}"
+                        )));
+                    }
+                    ResumableProgress::Complete(generation) => return Ok(generation),
+                }
+            }
+
+            match self.query_resumable_progress(&session, size, &mut token)? {
+                ResumableProgress::Complete(generation) => Ok(generation),
+                ResumableProgress::Offset(next_offset) => Err(AppError::StorageResponse(format!(
+                    "Cloud Storage resumable upload stopped at {next_offset} after {size} bytes"
+                ))),
+            }
+        })();
+        match result {
+            Ok(generation) => Ok(generation),
+            Err(error) => match self.cancel_resumable_session(&session, &token) {
+                Ok(()) => Err(error),
+                Err(cancel_error) => Err(AppError::rollback(error, vec![cancel_error])),
+            },
+        }
+    }
+
+    fn cancel_resumable_session(&self, session: &str, token: &str) -> Result<(), AppError> {
+        // An incomplete session is not visible as an object, but cancel it so
+        // a failed run does not leave an untracked server-side upload alive.
+        self.transport.clear_interrupt_for_rollback();
+        let request = self
+            .transport
+            .upload_client()
+            .delete(session)
+            .header(CONTENT_LENGTH, 0_u64)
+            .body(Vec::new());
+        let response = self.transport.send_resumable(request, token)?;
+        if (200..300).contains(&response.status) {
+            return Ok(());
+        }
+        Err(AppError::StorageResponse(format!(
+            "Cloud Storage returned unexpected resumable cancellation status {}",
+            response.status
+        )))
+    }
+
+    fn start_resumable_session(
+        &self,
+        target: &ObjectPath,
+        size: u64,
+        token: &mut String,
+    ) -> Result<String, AppError> {
+        let url = with_query(
+            bucket_objects_url(self.transport.upload_base(), &target.bucket),
+            [
+                ("uploadType", "resumable"),
+                ("name", target.object.as_str()),
+                ("ifGenerationMatch", "0"),
+            ],
+        );
+        let mut last_error = None;
+        for attempt in 1..=UPLOAD_ATTEMPTS {
+            let request = self
+                .transport
+                .upload_client()
+                .post(url.clone())
+                .header(CONTENT_TYPE, "application/octet-stream")
+                .header("x-upload-content-type", "application/octet-stream")
+                .header("x-upload-content-length", size)
+                .header(CONTENT_LENGTH, 0_u64)
+                .body(Vec::new());
+            match self.transport.send_resumable(request, token) {
+                Ok(response) if matches!(response.status, 200 | 201) => {
+                    return response
+                        .headers
+                        .get(LOCATION)
+                        .and_then(|value| value.to_str().ok())
+                        .map(str::to_owned)
+                        .ok_or_else(|| {
+                            AppError::StorageResponse(
+                                "Cloud Storage resumable upload omitted its session URL"
+                                    .to_string(),
+                            )
+                        });
+                }
+                Ok(response) => {
+                    return Err(AppError::StorageResponse(format!(
+                        "Cloud Storage returned unexpected resumable session status {}",
+                        response.status
+                    )));
+                }
+                Err(error) if error.status() == Some(401) && attempt < UPLOAD_ATTEMPTS => {
+                    *token = self.transport.token()?;
+                }
+                Err(error)
+                    if error.is_retryable_resumable_failure() && attempt < UPLOAD_ATTEMPTS =>
+                {
+                    last_error = Some(error);
+                    sleep_upload_retry(attempt);
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        Err(last_error.expect("resumable session retries record their last error"))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn upload_resumable_chunk(
+        &self,
+        source: &Path,
+        expected_source: Option<UploadSourceIdentity>,
+        expected_root: Option<DirectoryIdentity>,
+        session: &str,
+        offset: u64,
+        chunk_size: u64,
+        total_size: u64,
+        token: &mut String,
+    ) -> Result<ResumableProgress, AppError> {
+        let mut last_error = None;
+        for attempt in 1..=UPLOAD_ATTEMPTS {
+            let result = self.send_resumable_chunk(
+                source,
+                expected_source.clone(),
+                expected_root.clone(),
+                session,
+                offset,
+                chunk_size,
+                total_size,
+                token,
+            );
+            match result {
+                Ok(progress @ ResumableProgress::Complete(_)) => return Ok(progress),
+                Ok(progress @ ResumableProgress::Offset(next_offset)) if next_offset != offset => {
+                    return Ok(progress);
+                }
+                Ok(ResumableProgress::Offset(_)) if attempt < UPLOAD_ATTEMPTS => {
+                    sleep_upload_retry(attempt);
+                }
+                Ok(progress) => return Ok(progress),
+                Err(error)
+                    if (error.status() == Some(401) || error.is_retryable_resumable_failure())
+                        && attempt < UPLOAD_ATTEMPTS =>
+                {
+                    if error.status() == Some(401) {
+                        // Refresh before querying so an expired token cannot
+                        // hide the session's authoritative offset.
+                        *token = self.transport.token()?;
+                    }
+                    match self.query_resumable_progress(session, total_size, token) {
+                        Ok(progress @ ResumableProgress::Complete(_)) => return Ok(progress),
+                        Ok(ResumableProgress::Offset(next_offset)) if next_offset != offset => {
+                            return Ok(ResumableProgress::Offset(next_offset));
+                        }
+                        Ok(ResumableProgress::Offset(_)) => {
+                            last_error = Some(error);
+                            sleep_upload_retry(attempt);
+                        }
+                        Err(query_error) if query_error.status() == Some(401) => {
+                            *token = self.transport.token()?;
+                            last_error = Some(error);
+                            sleep_upload_retry(attempt);
+                        }
+                        Err(query_error)
+                            if query_error.is_retryable_resumable_failure()
+                                && attempt < UPLOAD_ATTEMPTS =>
+                        {
+                            last_error = Some(query_error);
+                            sleep_upload_retry(attempt);
+                        }
+                        Err(query_error) => return Err(query_error),
+                    }
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        Err(last_error.expect("resumable chunk retries record their last error"))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn send_resumable_chunk(
+        &self,
+        source: &Path,
+        expected_source: Option<UploadSourceIdentity>,
+        expected_root: Option<DirectoryIdentity>,
+        session: &str,
+        offset: u64,
+        chunk_size: u64,
+        total_size: u64,
+        token: &str,
+    ) -> Result<ResumableProgress, AppError> {
+        let mut file = upload_source::open(
+            self.upload_root.as_deref(),
+            source,
+            expected_root,
+            expected_source,
+        )?;
+        file.seek(SeekFrom::Start(offset))
+            .map_err(AppError::UploadSource)?;
+        let file = tokio::fs::File::from_std(file).take(chunk_size);
+        let end = offset + chunk_size - 1;
+        let request = self
+            .transport
+            .upload_client()
+            .put(session)
+            .header(CONTENT_TYPE, "application/octet-stream")
+            .header(CONTENT_LENGTH, chunk_size)
+            .header(CONTENT_RANGE, format!("bytes {offset}-{end}/{total_size}"))
+            .body(Body::wrap_stream(ReaderStream::new(file)));
+        let response = self.transport.send_resumable(request, token)?;
+        Self::parse_resumable_progress(response, total_size, true)
+    }
+
+    fn query_resumable_progress(
+        &self,
+        session: &str,
+        total_size: u64,
+        token: &mut String,
+    ) -> Result<ResumableProgress, AppError> {
+        let request = self
+            .transport
+            .upload_client()
+            .put(session)
+            .header(CONTENT_LENGTH, 0_u64)
+            .header(CONTENT_RANGE, format!("bytes */{total_size}"))
+            .body(Vec::new());
+        match self.transport.send_resumable(request, token) {
+            Ok(response) => Self::parse_resumable_progress(response, total_size, false),
+            Err(error) if error.status() == Some(401) => {
+                *token = self.transport.token()?;
+                Err(error)
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    fn parse_resumable_progress(
+        response: ResumableResponse,
+        total_size: u64,
+        require_range: bool,
+    ) -> Result<ResumableProgress, AppError> {
+        match response.status {
+            200 | 201 => {
+                let metadata: MetadataResponse =
+                    serde_json::from_slice(&response.body).map_err(|error| {
+                        AppError::StorageResponse(format!(
+                            "Invalid Cloud Storage resumable upload response: {error}"
+                        ))
+                    })?;
+                Ok(ResumableProgress::Complete(metadata.generation))
+            }
+            308 => {
+                let offset = match response.headers.get(RANGE) {
+                    Some(value) => parse_resumable_range(value.to_str().map_err(|error| {
+                        AppError::StorageResponse(format!(
+                            "Invalid Cloud Storage resumable range: {error}"
+                        ))
+                    })?)?,
+                    None if require_range => {
+                        return Err(AppError::StorageResponse(
+                            "Cloud Storage resumable chunk response omitted its range".to_string(),
+                        ));
+                    }
+                    None => 0,
+                };
+                if offset > total_size {
+                    return Err(AppError::StorageResponse(format!(
+                        "Cloud Storage resumable upload returned offset {offset} beyond {total_size}"
+                    )));
+                }
+                Ok(ResumableProgress::Offset(offset))
+            }
+            status => Err(AppError::StorageResponse(format!(
+                "Cloud Storage returned unexpected resumable upload status {status}"
+            ))),
+        }
+    }
+}
+
+fn parse_resumable_range(range: &str) -> Result<u64, AppError> {
+    let (start, end) = range
+        .strip_prefix("bytes=")
+        .and_then(|range| range.split_once('-'))
+        .ok_or_else(|| {
+            AppError::StorageResponse(format!("Invalid Cloud Storage resumable range: {range}"))
+        })?;
+    if start != "0" {
+        return Err(AppError::StorageResponse(format!(
+            "Invalid Cloud Storage resumable range: {range}"
+        )));
+    }
+    end.parse::<u64>()
+        .ok()
+        .and_then(|end| end.checked_add(1))
+        .ok_or_else(|| {
+            AppError::StorageResponse(format!("Invalid Cloud Storage resumable range: {range}"))
+        })
+}
+
+fn sleep_upload_retry(attempt: usize) {
+    let backoff = attempt.saturating_sub(1).min(3) as u32;
+    thread::sleep(UPLOAD_RETRY_BASE_DELAY.saturating_mul(1_u32 << backoff));
 }
 
 impl StorageApi {

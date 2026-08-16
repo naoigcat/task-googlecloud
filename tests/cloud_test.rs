@@ -1,17 +1,18 @@
 use task_googlecloud::{Cloud, shell_quote};
 
 #[test]
-fn documents_ephemeral_cloud_authentication_without_a_logout_command() {
+fn documents_reusable_cloud_authentication_without_a_logout_command() {
     let mise_config = std::fs::read_to_string(".mise.toml").unwrap();
     let compose = std::fs::read_to_string("compose.yaml").unwrap();
     let readme = std::fs::read_to_string("README.md").unwrap();
     let source = std::fs::read_to_string("src/cloud.rs").unwrap();
 
     assert!(!mise_config.contains("[tasks.logout]"));
-    assert!(mise_config.contains("docker compose down"));
+    assert!(!mise_config.contains("trap 'docker compose down' EXIT"));
     assert!(!compose.contains("/home/cloud/.config/gcloud"));
     assert!(!source.contains("gcloud auth revoke"));
-    assert!(readme.contains("temporary `googlecloud` container"));
+    assert!(readme.contains("reused by later"));
+    assert!(readme.contains("docker compose down"));
     assert!(!readme.contains("mise run logout"));
 }
 

@@ -9,7 +9,6 @@ set -eu
 if [ -f /.dockerenv ]; then
     task-googlecloud normalize "${usage_project?}" "${usage_bucket?}"
 else
-    trap 'docker compose down' EXIT
     docker compose build app
     docker compose run --rm app task-googlecloud normalize "${usage_project?}" "${usage_bucket?}"
 fi
@@ -25,7 +24,6 @@ set -eu
 if [ -f /.dockerenv ]; then
     task-googlecloud upload "${usage_project?}"
 else
-    trap 'docker compose down' EXIT
     docker compose build app
     docker compose run --rm app task-googlecloud upload "${usage_project?}"
 fi

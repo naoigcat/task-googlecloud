@@ -6,7 +6,8 @@ use std::sync::{
 };
 use std::time::Duration;
 
-use reqwest::{Client, RequestBuilder, Response};
+use reqwest::header::HeaderMap;
+use reqwest::{Client, RequestBuilder, Response, StatusCode};
 use serde::Deserialize;
 use serde::de::DeserializeOwned;
 
@@ -17,6 +18,13 @@ use crate::error::AppError;
 pub(crate) const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 pub(crate) const UPLOAD_TIMEOUT: Duration = Duration::from_secs(60 * 60);
 const INTERRUPT_POLL_INTERVAL: Duration = Duration::from_millis(25);
+
+/// The response metadata needed to advance a Cloud Storage resumable session.
+pub(crate) struct ResumableResponse {
+    pub(crate) status: u16,
+    pub(crate) headers: HeaderMap,
+    pub(crate) body: Vec<u8>,
+}
 
 /// Owns the HTTP runtime and authentication boundary so storage operations can
 /// focus on Cloud Storage state transitions.
@@ -84,6 +92,30 @@ impl StorageTransport {
 
     pub(crate) fn send_body(&self, request: RequestBuilder) -> Result<Vec<u8>, AppError> {
         let token = self.token()?;
+        self.send_request(request, token, false)
+            .map(|response| response.body)
+    }
+
+    /// Sends one request for a resumable upload while accepting Cloud Storage's
+    /// 308 response, which reports the committed byte range instead of a body.
+    pub(crate) fn send_resumable(
+        &self,
+        request: RequestBuilder,
+        token: &str,
+    ) -> Result<ResumableResponse, AppError> {
+        self.send_request(request, token.to_string(), true)
+    }
+
+    pub(crate) fn token(&self) -> Result<String, AppError> {
+        self.token_inner()
+    }
+
+    fn send_request(
+        &self,
+        request: RequestBuilder,
+        token: String,
+        allow_resume_status: bool,
+    ) -> Result<ResumableResponse, AppError> {
         if self
             .interrupt
             .as_ref()
@@ -116,7 +148,7 @@ impl StorageTransport {
                         }
                         request_started_for_request.store(true, Ordering::Relaxed);
                         let response = request.bearer_auth(token).send().await?;
-                        Self::response_body(response).await
+                        Self::response_data(response, allow_resume_status).await
                     } => response,
                     _ = wait_for_interrupt(interrupt) => {
                         if request_started_for_select.load(Ordering::Relaxed) {
@@ -196,17 +228,26 @@ impl StorageTransport {
             .expect("the static HTTP client configuration is valid")
     }
 
-    fn token(&self) -> Result<String, AppError> {
+    fn token_inner(&self) -> Result<String, AppError> {
         self.token_override
             .clone()
             .map_or_else(|| self.cloud.access_token().map_err(AppError::token), Ok)
     }
 
-    async fn response_body(response: Response) -> Result<Vec<u8>, AppError> {
+    async fn response_data(
+        response: Response,
+        allow_resume_status: bool,
+    ) -> Result<ResumableResponse, AppError> {
         let status = response.status();
+        let headers = response.headers().clone();
         let body = response.bytes().await?.to_vec();
-        if status.is_success() {
-            return Ok(body);
+        if status.is_success() || (allow_resume_status && status == StatusCode::PERMANENT_REDIRECT)
+        {
+            return Ok(ResumableResponse {
+                status: status.as_u16(),
+                headers,
+                body,
+            });
         }
 
         Err(AppError::Storage {

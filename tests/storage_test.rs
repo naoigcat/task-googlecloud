@@ -151,6 +151,32 @@ fn read_request(stream: &mut TcpStream) -> String {
     String::from_utf8(request).unwrap()
 }
 
+fn read_request_headers_and_body_size(stream: &mut TcpStream) -> (String, usize) {
+    let mut request = Vec::new();
+    let mut buffer = [0_u8; 1];
+    while !request.ends_with(b"\r\n\r\n") {
+        stream.read_exact(&mut buffer).unwrap();
+        request.push(buffer[0]);
+    }
+    let content_length = String::from_utf8_lossy(&request)
+        .lines()
+        .find_map(|line| {
+            let (name, value) = line.split_once(':')?;
+            name.eq_ignore_ascii_case("content-length")
+                .then(|| value.trim().parse::<usize>().unwrap())
+        })
+        .unwrap_or(0);
+    let mut remaining = content_length;
+    let mut body = [0_u8; 64 * 1024];
+    while remaining > 0 {
+        let read_length = remaining.min(body.len());
+        let read = stream.read(&mut body[..read_length]).unwrap();
+        assert!(read > 0, "request body ended before Content-Length");
+        remaining -= read;
+    }
+    (String::from_utf8(request).unwrap(), content_length)
+}
+
 fn request_line(request: &str) -> &str {
     request.split_once("\r\n").map_or(request, |(line, _)| line)
 }
@@ -616,6 +642,102 @@ fn retries_streaming_upload_after_request_send_failures() {
     assert!(requests[1].ends_with("\r\n\r\ncontents"));
     assert!(request_line(&requests[4]).contains("uploadType=media"));
     assert!(requests[4].ends_with("\r\n\r\ncontents"));
+}
+
+#[test]
+fn resumes_a_large_upload_after_a_connection_loss() {
+    const CHUNK_SIZE: usize = 8 * 1024 * 1024;
+    const TOTAL_SIZE: usize = 64 * 1024 * 1024 + 1;
+    const LARGE_UPLOAD_SERVER_TIMEOUT: Duration = Duration::from_secs(30);
+    let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let address = listener.local_addr().unwrap();
+    let server = thread::spawn(move || {
+        let mut lock = accept_connection(&listener, LARGE_UPLOAD_SERVER_TIMEOUT).unwrap();
+        let (request, body_size) = read_request_headers_and_body_size(&mut lock);
+        assert!(request_line(&request).contains("uploadType=media"));
+        assert!(body_size > 0);
+        let lock_body = r#"{"generation":"lock"}"#;
+        let lock_response = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{lock_body}",
+            lock_body.len()
+        );
+        lock.write_all(lock_response.as_bytes()).unwrap();
+
+        let mut session = accept_connection(&listener, LARGE_UPLOAD_SERVER_TIMEOUT).unwrap();
+        let (request, body_size) = read_request_headers_and_body_size(&mut session);
+        assert!(request_line(&request).contains("uploadType=resumable"));
+        assert_eq!(body_size, 0);
+        let session_response = format!(
+            "HTTP/1.1 200 OK\r\nLocation: http://{address}/upload-session\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+        );
+        session.write_all(session_response.as_bytes()).unwrap();
+
+        let mut failed_chunk = accept_connection(&listener, LARGE_UPLOAD_SERVER_TIMEOUT).unwrap();
+        let (request, body_size) = read_request_headers_and_body_size(&mut failed_chunk);
+        assert_eq!(request_line(&request), "PUT /upload-session HTTP/1.1");
+        assert_eq!(body_size, CHUNK_SIZE);
+        drop(failed_chunk);
+
+        let mut query = accept_connection(&listener, LARGE_UPLOAD_SERVER_TIMEOUT).unwrap();
+        let (request, body_size) = read_request_headers_and_body_size(&mut query);
+        assert_eq!(request_line(&request), "PUT /upload-session HTTP/1.1");
+        assert_eq!(body_size, 0);
+        assert!(
+            request
+                .to_ascii_lowercase()
+                .contains(&format!("content-range: bytes */{TOTAL_SIZE}"))
+        );
+        let query_response = format!(
+            "HTTP/1.1 308 Resume Incomplete\r\nRange: bytes=0-{}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+            CHUNK_SIZE - 1
+        );
+        query.write_all(query_response.as_bytes()).unwrap();
+
+        let mut offset = CHUNK_SIZE;
+        while offset < TOTAL_SIZE {
+            let chunk_size = (TOTAL_SIZE - offset).min(CHUNK_SIZE);
+            let mut chunk = accept_connection(&listener, LARGE_UPLOAD_SERVER_TIMEOUT).unwrap();
+            let (request, body_size) = read_request_headers_and_body_size(&mut chunk);
+            assert_eq!(request_line(&request), "PUT /upload-session HTTP/1.1");
+            assert_eq!(body_size, chunk_size);
+            let end = offset + chunk_size - 1;
+            assert!(
+                request
+                    .to_ascii_lowercase()
+                    .contains(&format!("content-range: bytes {offset}-{end}/{TOTAL_SIZE}"))
+            );
+            if end + 1 == TOTAL_SIZE {
+                let body = r#"{"generation":"789"}"#;
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                chunk.write_all(response.as_bytes()).unwrap();
+            } else {
+                let response = format!(
+                    "HTTP/1.1 308 Resume Incomplete\r\nRange: bytes=0-{end}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                );
+                chunk.write_all(response.as_bytes()).unwrap();
+            }
+            offset = end + 1;
+        }
+
+        let mut release = accept_connection(&listener, LARGE_UPLOAD_SERVER_TIMEOUT).unwrap();
+        let _ = read_request_headers_and_body_size(&mut release);
+        release
+            .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}")
+            .unwrap();
+    });
+    let base = format!("http://{address}/storage/v1");
+    let source = NamedTempFile::new().unwrap();
+    std::fs::write(source.path(), vec![b'x'; TOTAL_SIZE]).unwrap();
+    let target = ObjectPath::parse("gs://bucket/large.bin").unwrap();
+
+    let generation = storage(&base).upload_file(source.path(), &target).unwrap();
+    server.join().unwrap();
+
+    assert_eq!(generation, "789");
 }
 
 #[test]

@@ -18,9 +18,10 @@ that are easy to lose when changing the implementation.
     toolchain and audit/lint tool installation so source edits do not invalidate the
     expensive preparation layer. Update `tests/ci_configuration_test.rs` when this
     build contract changes.
--   The `googlecloud` service owns authentication and is intentionally ephemeral. Do
-    not add persistent credential mounts or a logout flow without updating the
-    authentication lifecycle in `README.md` and its regression tests.
+-   The `googlecloud` service owns authentication. Keep credentials inside that
+    Compose container so a failed upload can be retried without another login;
+    do not mount host credentials or add a logout flow. `docker compose down`
+    remains the explicit boundary that discards the container and its session.
 -   The application talks to the Cloud Storage JSON API directly. Use the dedicated
     Cloud SDK container only for authentication and access-token retrieval, through
     its host-verified SSH channel.
@@ -48,13 +49,13 @@ that are easy to lose when changing the implementation.
     after a request may have started is not proof that the remote state is unchanged:
     confirm ownership and generations before retrying or rolling back. If ownership
     cannot be established, preserve the recovery state and require manual recovery.
--   Upload retries are limited to the no-replace media upload path. Retry only
-    connection-establishment or non-timeout request-send failures
-    (`reqwest::Error::is_connect()` or `is_request()`), never local body-read or
-    response/decode timeout failures; rebuild the streamed request for each attempt
-    and keep the attempt budget and backoff finite. A `412` or an ambiguous final
-    result is not an upload success: preserve generation confirmation and manual
-    recovery unless ownership and contents are independently established.
+-   Uploads use the no-replace media path only for small files. Larger files use
+    a Google Cloud Storage resumable session with bounded chunks; after a
+    connection, timeout, or transient HTTP failure, query the session's committed
+    range and continue from that offset rather than replaying the whole file.
+    Keep session/chunk retry budgets and backoff finite, never retry local body
+    reads, and treat a `412` or an ambiguous final result as recovery state rather
+    than success unless ownership and contents are independently established.
 -   Upload planning must remain tied to discovery. The one-level `uploads/<bucket>/`
     layout, hidden-file exclusion, symlinked-root/entry exclusion or rejection,
     root/directory/file identity checks, and content fingerprint check protect against
