@@ -2,6 +2,88 @@
 
 This guide defines commenting and documentation practices for human contributors and AI coding agents.
 
+## Project-specific guidance
+
+This repository contains a Rust CLI that normalizes Google Cloud Storage object
+names and uploads files from `uploads/`. The rules below capture constraints
+that are easy to lose when changing the implementation.
+
+### Execution and toolchain
+
+-   Use the tasks in `.mise.toml` as the canonical development and workflow entry points.
+    On the host, they build and run the `app` service; inside the application container,
+    they run the tool directly. Keep this boundary so development does not require
+    nested Docker.
+-   The `app` image uses an inline Dockerfile. Keep the source copy after the pinned
+    toolchain and audit/lint tool installation so source edits do not invalidate the
+    expensive preparation layer. Update `tests/ci_configuration_test.rs` when this
+    build contract changes.
+-   The `googlecloud` service owns authentication and is intentionally ephemeral. Do
+    not add persistent credential mounts or a logout flow without updating the
+    authentication lifecycle in `README.md` and its regression tests.
+-   The application talks to the Cloud Storage JSON API directly. Use the dedicated
+    Cloud SDK container only for authentication and access-token retrieval, through
+    its host-verified SSH channel.
+-   The short `googlecloud` healthcheck interval is intentional: the default Docker
+    healthcheck delay made `app` startup unnecessarily slow. Preserve the startup
+    parameters and the configuration regression test when changing Compose healthchecks.
+
+### Workflow invariants
+
+-   Both `normalize` and `upload` must configure the requested project before
+    interactive authentication, and authenticate before acquiring any Cloud Storage
+    bucket lock. Acquiring a lock itself needs a token, and the login message must
+    identify the requested project.
+-   Treat each workflow as a transaction. Complete validation and name planning before
+    the first mutation; stage remote changes under run-specific temporary names; record
+    the generation of every owned object; finalize only with generation preconditions;
+    and roll back in the reverse dependency order. A change to these phases requires
+    success, partial-failure, and interruption coverage.
+-   Hold each bucket lock across the complete remote snapshot or transaction, including
+    finalization and rollback. Acquire multiple buckets in a stable order, reuse locks
+    for nested calls, and never treat `.task-googlecloud-lock` as user data. All writers
+    touching a bucket must honor this protocol.
+-   Cloud Storage copy, rewrite, delete, and cleanup operations must be
+    generation-guarded. A timeout, interruption, malformed response, or other failure
+    after a request may have started is not proof that the remote state is unchanged:
+    confirm ownership and generations before retrying or rolling back. If ownership
+    cannot be established, preserve the recovery state and require manual recovery.
+-   Upload planning must remain tied to discovery. The one-level `uploads/<bucket>/`
+    layout, hidden-file exclusion, symlinked-root/entry exclusion or rejection,
+    root/directory/file identity checks, and content fingerprint check protect against
+    path replacement and in-place source changes during a stream. Do not replace these
+    checks with an unchecked pathname read.
+-   Local normalization is NFC-based and must reject collisions before changing local
+    or remote state. Renames are atomic and no-replace; retain the identity checks and
+    the Linux/macOS Unicode-alias handling, including when the application runs in a
+    Linux container over a macOS filesystem.
+-   Keep Cloud Storage object names parsed and encoded through `ObjectPath` and the
+    centralized validation helpers. Do not interpolate raw object names into API URLs,
+    bypass the 1024-byte limit, or reuse another run's temporary or staging object
+    without confirming its generation and contents.
+-   Local source errors that occur before an HTTP request can be handled as local
+    failures. Once a request may have started, classify the error as remote-state
+    uncertainty and preserve the confirmation and recovery path; do not simplify this
+    distinction for convenience.
+
+### Tests and documentation
+
+-   Keep tests under `tests/`; source modules include those files only as a layout
+    convention. Storage transition tests should use a finite-timeout local HTTP server,
+    assert the complete request line and request count, and cover success, partial
+    responses, HTTP failures, interrupted requests, and rollback ownership.
+-   For changes to filesystem safety, cover both normal operation and replacement races
+    or symlink/dangling-entry cases on the supported Linux/macOS paths. For transaction
+    changes, assert rollback order and generation propagation rather than only checking
+    that an error was returned.
+-   Run the relevant `mise` checks, including `fmt-check`, `clippy`, `audit`, `deny`,
+    `test`, `markdownlint`, and `shellcheck`. Keep CI workflow configuration and its
+    tests in sync when adding or moving a check.
+-   Update `README.md` whenever a change affects command usage, credential lifetime,
+    user-visible progress, temporary object names, or the manual recovery procedure.
+    Keep recovery instructions conservative: never recommend deleting or restoring a
+    remote object until the run's ownership and generation have been verified.
+
 ## Core principle
 
 Code should make the mechanics understandable. Comments should preserve the context
