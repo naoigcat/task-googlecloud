@@ -55,6 +55,23 @@ fn app_source_is_copied_after_tool_preparation() {
 }
 
 #[test]
+fn googlecloud_healthcheck_uses_startup_parameters() {
+    let root = env!("CARGO_MANIFEST_DIR");
+    let compose = fs::read_to_string(format!("{root}/compose.yaml"))
+        .expect("Compose configuration should exist");
+    let healthcheck = compose
+        .split_once("  googlecloud:\n")
+        .and_then(|(_, services)| services.split_once("    healthcheck:\n"))
+        .and_then(|(_, healthcheck)| healthcheck.split_once("\nvolumes:\n"))
+        .map(|(healthcheck, _)| healthcheck)
+        .expect("googlecloud healthcheck should end before the next top-level section");
+
+    assert!(healthcheck.contains("interval: 1s"));
+    assert!(healthcheck.contains("timeout: 5s"));
+    assert!(healthcheck.contains("retries: 5"));
+}
+
+#[test]
 fn actionlint_image_is_pinned_by_digest() {
     let root = env!("CARGO_MANIFEST_DIR");
     let workflow = fs::read_to_string(format!("{root}/.github/workflows/actionlint.yml"))

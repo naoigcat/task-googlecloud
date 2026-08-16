@@ -128,6 +128,10 @@ services:
       - googlecloud-ssh:/run/googlecloud-ssh
     healthcheck:
       test: ["CMD-SHELL", "sshd -T | grep -q '^permitrootlogin no$' && sshd -T | grep -q '^passwordauthentication no$' && nc -z 127.0.0.1 22 && test -s /run/googlecloud-ssh/client_key && test -s /run/googlecloud-ssh/known_hosts"]
+      # Docker's 30-second healthcheck default delays app startup even when SSH is already ready.
+      interval: 1s
+      timeout: 5s
+      retries: 5
 
 volumes:
   googlecloud-ssh:
