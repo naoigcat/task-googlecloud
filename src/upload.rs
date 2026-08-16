@@ -35,32 +35,31 @@ pub fn run<S: StorageClient>(
         .map(|directory| bucket_name(directory))
         .collect::<Result<Vec<_>, _>>()?;
 
+    let files = discovery
+        .files_by_directory
+        .values()
+        .flatten()
+        .cloned()
+        .collect::<Vec<_>>();
+    let names = files
+        .iter()
+        .map(|file| local::path_string(file))
+        .collect::<Result<Vec<_>, _>>()?;
+    let plan = normalization_plan::build(&names)?;
+    // Derive every object name while the run is still a no-op, so a name Cloud
+    // Storage cannot accept stops it before any file is renamed or uploaded.
+    let planned_names = plan
+        .iter()
+        .map(|entry| (PathBuf::from(&entry.source), PathBuf::from(&entry.target)))
+        .collect::<HashMap<_, _>>();
+    let uploads = plan_uploads(&discovery, &planned_names, &staging_prefix())?;
+
+    // Validate local inputs before login, but authenticate before acquiring locks
+    // because creating a bucket lock already requires an access token.
+    cloud.login()?;
+    cloud.set_project(project)?;
+
     storage.with_bucket_locks(&buckets, || {
-        let files = discovery
-            .files_by_directory
-            .values()
-            .flatten()
-            .cloned()
-            .collect::<Vec<_>>();
-        let names = files
-            .iter()
-            .map(|file| local::path_string(file))
-            .collect::<Result<Vec<_>, _>>()?;
-        let plan = normalization_plan::build(&names)?;
-        // Derive every object name while the run is still a no-op, so a name Cloud
-        // Storage cannot accept stops it before any file is renamed or uploaded.
-        let planned_names = plan
-            .iter()
-            .map(|entry| (PathBuf::from(&entry.source), PathBuf::from(&entry.target)))
-            .collect::<HashMap<_, _>>();
-        let uploads = plan_uploads(&discovery, &planned_names, &staging_prefix())?;
-
-        // Keep explicit interactive login after local planning and validation.
-        // Bucket-lock setup may already obtain a token, but invalid input never
-        // needs to start the interactive login flow.
-        cloud.login()?;
-        cloud.set_project(project)?;
-
         // Rename before uploading so the local source, normalized object name,
         // and captured identity stay aligned; failures restore this phase below.
         let normalized_files = local::apply_normalization_with_path_identities(
