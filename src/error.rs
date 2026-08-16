@@ -105,11 +105,15 @@ impl AppError {
     }
 
     /// Whether the failure may have left Cloud Storage changed. Upload-source
-    /// failures, pre-request interruptions, and token failures before any
-    /// request cannot have; token failures after an earlier request are marked
-    /// as possibly reached.
+    /// failures, connection-establishment failures, pre-request interruptions,
+    /// and token failures before any request cannot have; token failures after
+    /// an earlier request are marked as possibly reached.
     pub(crate) fn may_have_reached_storage(&self) -> bool {
         match self {
+            // DNS, TCP, and TLS setup failures happen before Cloud Storage can
+            // process the request, so state confirmation would only create a
+            // false manual-recovery failure when the network is unavailable.
+            Self::Http(error) if error.is_connect() => false,
             Self::UploadSource(_) | Self::Command { .. } | Self::Interrupted => false,
             Self::Token {
                 may_have_reached_storage,
@@ -172,8 +176,8 @@ impl AppError {
 
     pub(crate) fn may_have_sent_storage_request(&self) -> bool {
         match self {
-            Self::Http(_)
-            | Self::Storage { .. }
+            Self::Http(error) => !error.is_connect(),
+            Self::Storage { .. }
             | Self::StorageResponse(_)
             | Self::UploadSourceChanged(_)
             | Self::InterruptedAfterRequest => true,

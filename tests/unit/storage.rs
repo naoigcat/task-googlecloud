@@ -408,6 +408,37 @@ fn distinguishes_interrupts_before_and_after_a_storage_request() {
 }
 
 #[test]
+fn treats_connection_failures_as_unreached_storage() {
+    let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+    let address = listener.local_addr().unwrap();
+    drop(listener);
+    let endpoint = format!("http://{address}/storage/v1");
+    let storage = super::StorageApi::with_endpoint_options(
+        super::Cloud::new(),
+        endpoint.clone(),
+        endpoint.clone(),
+        Some("token".to_string()),
+        Duration::from_millis(100),
+    );
+    let operation = storage
+        .transport
+        .send_body(storage.transport.client().get(endpoint))
+        .unwrap_err();
+
+    assert!(matches!(
+        &operation,
+        super::AppError::Http(error) if error.is_connect()
+    ));
+    assert!(!operation.may_have_reached_storage());
+    assert!(!operation.may_have_sent_storage_request());
+
+    let target = super::ObjectPath::parse("gs://bucket/target").unwrap();
+    storage
+        .confirm_write_after_failure(&target, &operation)
+        .unwrap();
+}
+
+#[test]
 fn rolls_back_a_move_interrupted_before_each_post_copy_request() {
     for after_request in 2..=5 {
         let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
