@@ -7,7 +7,10 @@ use std::sync::{Arc, atomic::AtomicBool};
 #[cfg(unix)]
 use std::sync::{Mutex, MutexGuard};
 
-use super::{MAX_OBJECT_NAME_BYTES, process_moves, run, temporary_path, temporary_suffix};
+use super::{
+    MAX_OBJECT_NAME_BYTES, PlannedMove, process_moves, progress_messages, run, temporary_path,
+    temporary_suffix,
+};
 use crate::cloud::Cloud;
 use crate::error::AppError;
 use crate::normalization_plan::normalized;
@@ -210,6 +213,39 @@ fn accepts_object_names_at_the_temporary_staging_limit() {
     let temporary = temporary_path(&source).unwrap();
 
     assert_eq!(temporary.object.len(), MAX_OBJECT_NAME_BYTES);
+}
+
+#[test]
+fn reports_when_all_listed_objects_are_already_normalized() {
+    let files = vec!["gs://bucket/file.txt".to_string()];
+
+    assert_eq!(
+        progress_messages("bucket", &files, &[]),
+        vec![
+            "Found 1 object in gs://bucket.".to_string(),
+            "No objects require normalization.".to_string(),
+        ]
+    );
+}
+
+#[test]
+fn reports_each_object_that_requires_normalization() {
+    let source = ObjectPath::parse("gs://bucket/e\u{301}.txt").unwrap();
+    let target = ObjectPath::parse("gs://bucket/é.txt").unwrap();
+    let temporary = ObjectPath::parse("gs://bucket/temporary").unwrap();
+    let moves = vec![PlannedMove {
+        source,
+        target,
+        temporary,
+    }];
+
+    assert_eq!(
+        progress_messages("bucket", &["gs://bucket/e\u{301}.txt".to_string()], &moves),
+        vec![
+            "Found 1 object in gs://bucket.".to_string(),
+            "Normalizing gs://bucket/e\u{301}.txt -> gs://bucket/é.txt".to_string(),
+        ]
+    );
 }
 
 #[test]

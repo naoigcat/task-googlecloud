@@ -27,12 +27,16 @@ pub fn run<S: StorageClient>(
 ) -> Result<(), AppError> {
     cloud.login()?;
     cloud.set_project(project)?;
+    println!("Using Google Cloud project [{project}].");
     storage.with_bucket_locks(&[bucket], || {
         // Hold the lock while listing and applying the plan so the snapshot
         // cannot be invalidated by another compliant writer.
         let files = storage.list_objects(bucket)?;
         let plan = normalization_plan::build(&files)?;
         let moves = plan_moves(plan)?;
+        for message in progress_messages(bucket, &files, &moves) {
+            println!("{message}");
+        }
         process_moves_unlocked(storage, interrupt, &moves)
     })
 }
@@ -54,6 +58,30 @@ fn plan_moves(plan: Vec<normalization_plan::Entry>) -> Result<Vec<PlannedMove>, 
             })
         })
         .collect()
+}
+
+fn progress_messages(bucket: &str, files: &[String], moves: &[PlannedMove]) -> Vec<String> {
+    let object_label = if files.len() == 1 {
+        "object"
+    } else {
+        "objects"
+    };
+    let mut messages = vec![format!(
+        "Found {} {object_label} in gs://{bucket}.",
+        files.len()
+    )];
+    if moves.is_empty() {
+        messages.push("No objects require normalization.".to_string());
+    } else {
+        messages.extend(moves.iter().map(|planned| {
+            format!(
+                "Normalizing {} -> {}",
+                planned.source.uri(),
+                planned.target.uri()
+            )
+        }));
+    }
+    messages
 }
 
 /// Processes remote moves in a staging phase followed by a finalization
