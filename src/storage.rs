@@ -22,7 +22,7 @@ pub use crate::object_path::ObjectPath;
 use crate::storage_transport::{
     REQUEST_TIMEOUT, ResumableResponse, StorageTransport, UPLOAD_TIMEOUT,
 };
-use crate::upload_source::{self, UploadSourceIdentity};
+use crate::upload_source::{self, UploadSourceIdentity, UploadSourceValidation};
 
 /// Uploads are confined to this directory, so file discovery and the confined
 /// open must agree on where it is.
@@ -755,26 +755,16 @@ impl StorageApi {
         // Anchor every retry to the bytes discovered before the first request;
         // otherwise a local edit during a network outage could change the
         // object content between attempts while preserving the same file entry.
-        let expected_fingerprint =
-            self.capture_upload_fingerprint(source, expected_source.clone())?;
+        let validation = self.upload_source_validation(expected_source)?;
+        let expected_fingerprint = self.capture_upload_fingerprint(source, &validation)?;
         if expected_fingerprint.size() >= RESUMABLE_UPLOAD_THRESHOLD {
-            return self.upload_resumable_file(
-                source,
-                target,
-                expected_source,
-                &expected_fingerprint,
-            );
+            return self.upload_resumable_file(source, target, &validation, &expected_fingerprint);
         }
 
         // Rebuild the whole request, including ReaderStream, so every retry
         // starts from a fresh file descriptor and preserves source validation.
         for attempt in 1..=UPLOAD_ATTEMPTS {
-            match self.upload_file_checked(
-                source,
-                target,
-                expected_source.clone(),
-                &expected_fingerprint,
-            ) {
+            match self.upload_file_checked(source, target, &validation, &expected_fingerprint) {
                 Ok(generation) => return Ok(generation),
                 Err(error) if error.is_retryable_upload_failure() && attempt < UPLOAD_ATTEMPTS => {
                     let backoff = attempt.saturating_sub(1).min(3) as u32;
@@ -787,22 +777,32 @@ impl StorageApi {
         unreachable!("the upload attempt loop always returns")
     }
 
-    fn capture_upload_fingerprint(
+    fn upload_source_validation(
         &self,
-        source: &Path,
         expected_source: Option<UploadSourceIdentity>,
-    ) -> Result<upload_source::FileFingerprint, AppError> {
+    ) -> Result<UploadSourceValidation, AppError> {
         let expected_root = self
             .upload_root_identity
             .lock()
             .map_err(|_| AppError::Message("Upload root identity lock is poisoned".to_string()))?
             .clone();
-        let mut file = upload_source::open(
-            self.upload_root.as_deref(),
-            source,
-            expected_root,
-            expected_source,
-        )?;
+        Ok(UploadSourceValidation::new(expected_root, expected_source))
+    }
+
+    fn open_upload_source(
+        &self,
+        source: &Path,
+        validation: &UploadSourceValidation,
+    ) -> Result<std::fs::File, AppError> {
+        validation.open(self.upload_root.as_deref(), source)
+    }
+
+    fn capture_upload_fingerprint(
+        &self,
+        source: &Path,
+        validation: &UploadSourceValidation,
+    ) -> Result<upload_source::FileFingerprint, AppError> {
+        let mut file = self.open_upload_source(source, validation)?;
         upload_source::fingerprint(&mut file).map_err(AppError::UploadSource)
     }
 
@@ -810,21 +810,11 @@ impl StorageApi {
         &self,
         source: &Path,
         target: &ObjectPath,
-        expected_source: Option<UploadSourceIdentity>,
+        validation: &UploadSourceValidation,
         expected_fingerprint: &upload_source::FileFingerprint,
     ) -> Result<String, AppError> {
         Self::reject_bucket_lock_object(target)?;
-        let expected_root = self
-            .upload_root_identity
-            .lock()
-            .map_err(|_| AppError::Message("Upload root identity lock is poisoned".to_string()))?
-            .clone();
-        let mut file = upload_source::open(
-            self.upload_root.as_deref(),
-            source,
-            expected_root,
-            expected_source,
-        )?;
+        let mut file = self.open_upload_source(source, validation)?;
         // Keep verification on a clone of the validated descriptor so a path
         // replacement cannot make the comparison refer to a different inode.
         let mut verification_file = file.try_clone().map_err(AppError::UploadSource)?;
@@ -878,25 +868,18 @@ impl StorageApi {
         &self,
         source: &Path,
         target: &ObjectPath,
-        expected_source: Option<UploadSourceIdentity>,
+        validation: &UploadSourceValidation,
         expected_fingerprint: &upload_source::FileFingerprint,
     ) -> Result<String, AppError> {
-        let expected_root = self
-            .upload_root_identity
-            .lock()
-            .map_err(|_| AppError::Message("Upload root identity lock is poisoned".to_string()))?
-            .clone();
-        let mut verification_file = self.open_upload_source_for_verification(
-            source,
-            expected_source.clone(),
-            expected_root.clone(),
-        )?;
+        let mut verification_file = self
+            .open_upload_source(source, validation)?
+            .try_clone()
+            .map_err(AppError::UploadSource)?;
         self.with_object_locks(&[target], || {
             let generation = self.upload_resumable_locked(
                 source,
                 target,
-                expected_source,
-                expected_root,
+                validation,
                 expected_fingerprint.size(),
             )?;
             let actual_fingerprint = upload_source::fingerprint(&mut verification_file)
@@ -910,29 +893,11 @@ impl StorageApi {
         })
     }
 
-    fn open_upload_source_for_verification(
-        &self,
-        source: &Path,
-        expected_source: Option<UploadSourceIdentity>,
-        expected_root: Option<DirectoryIdentity>,
-    ) -> Result<std::fs::File, AppError> {
-        let file = upload_source::open(
-            self.upload_root.as_deref(),
-            source,
-            expected_root,
-            expected_source,
-        )?;
-        // Keep a descriptor tied to the validated inode so the final fingerprint
-        // still detects in-place edits even if the pathname is replaced later.
-        file.try_clone().map_err(AppError::UploadSource)
-    }
-
     fn upload_resumable_locked(
         &self,
         source: &Path,
         target: &ObjectPath,
-        expected_source: Option<UploadSourceIdentity>,
-        expected_root: Option<DirectoryIdentity>,
+        validation: &UploadSourceValidation,
         size: u64,
     ) -> Result<String, AppError> {
         let mut token = self.transport.token()?;
@@ -942,14 +907,7 @@ impl StorageApi {
             while offset < size {
                 let chunk_size = (size - offset).min(RESUMABLE_CHUNK_SIZE);
                 match self.upload_resumable_chunk(
-                    source,
-                    expected_source.clone(),
-                    expected_root.clone(),
-                    &session,
-                    offset,
-                    chunk_size,
-                    size,
-                    &mut token,
+                    source, validation, &session, offset, chunk_size, size, &mut token,
                 )? {
                     ResumableProgress::Offset(next_offset)
                         if next_offset <= offset + chunk_size =>
@@ -1072,8 +1030,7 @@ impl StorageApi {
     fn upload_resumable_chunk(
         &self,
         source: &Path,
-        expected_source: Option<UploadSourceIdentity>,
-        expected_root: Option<DirectoryIdentity>,
+        validation: &UploadSourceValidation,
         session: &str,
         offset: u64,
         chunk_size: u64,
@@ -1083,14 +1040,7 @@ impl StorageApi {
         let mut last_error = None;
         for attempt in 1..=UPLOAD_ATTEMPTS {
             let result = self.send_resumable_chunk(
-                source,
-                expected_source.clone(),
-                expected_root.clone(),
-                session,
-                offset,
-                chunk_size,
-                total_size,
-                token,
+                source, validation, session, offset, chunk_size, total_size, token,
             );
             match result {
                 Ok(progress @ ResumableProgress::Complete(_)) => return Ok(progress),
@@ -1144,20 +1094,14 @@ impl StorageApi {
     fn send_resumable_chunk(
         &self,
         source: &Path,
-        expected_source: Option<UploadSourceIdentity>,
-        expected_root: Option<DirectoryIdentity>,
+        validation: &UploadSourceValidation,
         session: &str,
         offset: u64,
         chunk_size: u64,
         total_size: u64,
         token: &str,
     ) -> Result<ResumableProgress, AppError> {
-        let mut file = upload_source::open(
-            self.upload_root.as_deref(),
-            source,
-            expected_root,
-            expected_source,
-        )?;
+        let mut file = self.open_upload_source(source, validation)?;
         file.seek(SeekFrom::Start(offset))
             .map_err(AppError::UploadSource)?;
         let file = tokio::fs::File::from_std(file).take(chunk_size);

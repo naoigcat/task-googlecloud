@@ -29,6 +29,26 @@ pub struct UploadSourceIdentity {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+/// Keeps one upload's filesystem identities consistent across retries and chunks.
+pub(crate) struct UploadSourceValidation {
+    root: Option<DirectoryIdentity>,
+    source: Option<UploadSourceIdentity>,
+}
+
+impl UploadSourceValidation {
+    pub(crate) fn new(
+        root: Option<DirectoryIdentity>,
+        source: Option<UploadSourceIdentity>,
+    ) -> Self {
+        Self { root, source }
+    }
+
+    pub(crate) fn open(&self, upload_root: Option<&Path>, source: &Path) -> Result<File, AppError> {
+        open(upload_root, source, self.root.clone(), self.source.clone())
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 /// Size and content identity captured at one point in an upload.
 pub(crate) struct FileFingerprint {
     size: u64,
