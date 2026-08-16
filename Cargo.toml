@@ -7,6 +7,7 @@ license = "MIT"
 
 [dependencies]
 clap = { version = "4.5.45", features = ["derive"] }
+indicatif = "0.18.6"
 libc = "0.2.175"
 percent-encoding = "2.3.1"
 reqwest = { version = "0.12.23", default-features = false, features = ["rustls-tls", "stream"] }

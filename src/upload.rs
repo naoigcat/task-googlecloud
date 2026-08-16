@@ -2,6 +2,8 @@ use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::path::{Path, PathBuf};
 
+use indicatif::{ProgressBar, ProgressDrawTarget, ProgressStyle};
+
 use crate::InterruptFlag;
 use crate::atomic_rename::{
     DirectoryIdentity, FileIdentity, directory_identity_from_path, file_identity_from_path,
@@ -319,6 +321,7 @@ fn upload_planned_files_unlocked<S: StorageClient>(
     interrupt: &InterruptFlag,
     uploads: &[PlannedDirectoryUploads],
 ) -> Result<(), AppError> {
+    let progress = upload_progress(uploads);
     RemoteTransaction::execute(
         interrupt,
         |transaction| {
@@ -326,8 +329,15 @@ fn upload_planned_files_unlocked<S: StorageClient>(
             // then generation-guarded, so partial runs can be identified and
             // rolled back without touching another writer's object.
             for planned in uploads {
-                println!("{}", planned.directory.display());
+                if let Some(progress) = &progress {
+                    progress.println(planned.directory.display().to_string());
+                } else {
+                    println!("{}", planned.directory.display());
+                }
                 for upload in &planned.uploads {
+                    if let Some(progress) = &progress {
+                        progress.set_message(format!("Uploading {}", upload.file.display()));
+                    }
                     let generation = match upload.source_identity.as_ref() {
                         Some(identity) => object_move::execute_upload_with_identity(
                             storage,
@@ -348,6 +358,9 @@ fn upload_planned_files_unlocked<S: StorageClient>(
                         target: upload.target.clone(),
                         generation,
                     });
+                    if let Some(progress) = &progress {
+                        progress.inc(1);
+                    }
                     interrupt.check()?;
                 }
             }
@@ -371,6 +384,37 @@ fn upload_planned_files_unlocked<S: StorageClient>(
         },
         |staged, finalized| rollback_remote(storage, staged, finalized),
     )
+    .inspect(|_| {
+        if let Some(progress) = &progress {
+            progress.finish_with_message("Upload complete");
+        }
+    })
+    .inspect_err(|_| {
+        if let Some(progress) = &progress {
+            progress.abandon();
+        }
+    })
+}
+
+fn upload_progress(uploads: &[PlannedDirectoryUploads]) -> Option<ProgressBar> {
+    let total_files = uploads
+        .iter()
+        .map(|planned| planned.uploads.len())
+        .sum::<usize>();
+    if total_files == 0 {
+        return None;
+    }
+
+    // Keep upload status with the command's normal output instead of indicatif's
+    // default stderr target, so it remains visible in mise task output.
+    let progress =
+        ProgressBar::with_draw_target(Some(total_files as u64), ProgressDrawTarget::stdout());
+    progress.set_style(
+        ProgressStyle::with_template("{bar:40.cyan/blue} {pos}/{len} {wide_msg}")
+            .expect("upload progress template is valid")
+            .progress_chars("=>-"),
+    );
+    Some(progress)
 }
 
 /// The staging prefix lengthens the object name, so a name that Cloud Storage
