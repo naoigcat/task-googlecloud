@@ -1,5 +1,5 @@
 use std::collections::{HashMap, HashSet};
-use std::io::{Seek, SeekFrom};
+use std::io::{self, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::thread::{self, ThreadId};
@@ -803,7 +803,23 @@ impl StorageApi {
         validation: &UploadSourceValidation,
     ) -> Result<upload_source::FileFingerprint, AppError> {
         let mut file = self.open_upload_source(source, validation)?;
-        upload_source::fingerprint(&mut file).map_err(AppError::UploadSource)
+        upload_source::FileFingerprint::capture(&mut file).map_err(AppError::UploadSource)
+    }
+
+    fn verify_upload_fingerprint(
+        source: &Path,
+        file: &mut std::fs::File,
+        expected: &upload_source::FileFingerprint,
+        read_error: impl FnOnce(io::Error) -> AppError,
+    ) -> Result<(), AppError> {
+        // Preserve local-read errors before sending and remote-state
+        // uncertainty after sending through the caller-selected mapping.
+        if expected.matches_file(file).map_err(read_error)? {
+            return Ok(());
+        }
+        Err(AppError::UploadSourceChanged(format!(
+            "{source:?} no longer matches the validated upload contents"
+        )))
     }
 
     fn upload_file_checked(
@@ -820,13 +836,12 @@ impl StorageApi {
         let mut verification_file = file.try_clone().map_err(AppError::UploadSource)?;
         // Recheck every freshly opened descriptor before sending so a path
         // replacement between attempts cannot silently change the upload.
-        let actual_fingerprint =
-            upload_source::fingerprint(&mut verification_file).map_err(AppError::UploadSource)?;
-        if actual_fingerprint != *expected_fingerprint {
-            return Err(AppError::UploadSourceChanged(format!(
-                "{source:?} no longer matches the validated upload contents"
-            )));
-        }
+        Self::verify_upload_fingerprint(
+            source,
+            &mut verification_file,
+            expected_fingerprint,
+            AppError::UploadSource,
+        )?;
         file.seek(SeekFrom::Start(0))
             .map_err(AppError::UploadSource)?;
         let size = expected_fingerprint.size();
@@ -853,13 +868,12 @@ impl StorageApi {
             let metadata: MetadataResponse = self
                 .transport
                 .send_json(request, "Invalid Cloud Storage upload response")?;
-            let actual_fingerprint = upload_source::fingerprint(&mut verification_file)
-                .map_err(|error| AppError::UploadSourceChanged(format!("{source:?}: {error}")))?;
-            if actual_fingerprint != *expected_fingerprint {
-                return Err(AppError::UploadSourceChanged(format!(
-                    "{source:?} no longer matches the validated upload contents"
-                )));
-            }
+            Self::verify_upload_fingerprint(
+                source,
+                &mut verification_file,
+                expected_fingerprint,
+                |error| AppError::UploadSourceChanged(format!("{source:?}: {error}")),
+            )?;
             Ok(metadata.generation)
         })
     }
@@ -882,13 +896,12 @@ impl StorageApi {
                 validation,
                 expected_fingerprint.size(),
             )?;
-            let actual_fingerprint = upload_source::fingerprint(&mut verification_file)
-                .map_err(|error| AppError::UploadSourceChanged(format!("{source:?}: {error}")))?;
-            if actual_fingerprint != *expected_fingerprint {
-                return Err(AppError::UploadSourceChanged(format!(
-                    "{source:?} no longer matches the validated upload contents"
-                )));
-            }
+            Self::verify_upload_fingerprint(
+                source,
+                &mut verification_file,
+                expected_fingerprint,
+                |error| AppError::UploadSourceChanged(format!("{source:?}: {error}")),
+            )?;
             Ok(generation)
         })
     }
