@@ -36,6 +36,25 @@ fn shellcheck_covers_the_cloud_entrypoint_in_ci() {
 }
 
 #[test]
+fn app_source_is_copied_after_tool_preparation() {
+    let root = env!("CARGO_MANIFEST_DIR");
+    let compose = fs::read_to_string(format!("{root}/compose.yaml"))
+        .expect("Compose configuration should exist");
+    let tool_preparation = compose
+        .find("cargo install cargo-deny --version 0.20.2 --locked")
+        .expect("App tool preparation should install cargo-deny");
+    let source_copy = compose
+        .find("COPY src ./src")
+        .expect("App Dockerfile should copy the source directory");
+    let application_build = compose
+        .find("RUN cargo build --release --locked")
+        .expect("App Dockerfile should build the release binary");
+
+    assert!(tool_preparation < source_copy);
+    assert!(source_copy < application_build);
+}
+
+#[test]
 fn actionlint_image_is_pinned_by_digest() {
     let root = env!("CARGO_MANIFEST_DIR");
     let workflow = fs::read_to_string(format!("{root}/.github/workflows/actionlint.yml"))

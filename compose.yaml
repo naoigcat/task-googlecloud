@@ -12,7 +12,6 @@ services:
         WORKDIR /app
 
         COPY Cargo.toml Cargo.lock ./
-        COPY src ./src
 
         RUN apt-get update && apt-get install -y --no-install-recommends \
                 ca-certificates \
@@ -26,13 +25,17 @@ services:
             && \
             cargo install cargo-deny --version 0.20.2 --locked \
             && \
-            cargo build --release --locked \
-            && \
-            install -m 755 target/release/task-googlecloud /usr/local/bin/task-googlecloud \
-            && \
             apt-get clean \
             && \
             rm -rf /var/lib/apt/lists/*
+
+        # Keep source changes out of the tool preparation layer so Docker can reuse
+        # the pinned toolchain and audit/lint installations across application builds.
+        COPY src ./src
+
+        RUN cargo build --release --locked \
+            && \
+            install -m 755 target/release/task-googlecloud /usr/local/bin/task-googlecloud
 
         COPY --from=markdownlint /usr/local/bin/node /usr/local/bin/node
         COPY --from=markdownlint /usr/local/lib/node_modules /usr/local/lib/node_modules
