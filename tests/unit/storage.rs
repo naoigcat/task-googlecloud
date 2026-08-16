@@ -190,6 +190,55 @@ fn uploads_files_with_a_longer_timeout_than_api_requests() {
 }
 
 #[test]
+fn rejects_uploads_when_the_source_changes_while_streaming() {
+    let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+    let base = format!("http://{}/storage/v1", listener.local_addr().unwrap());
+    let (headers_sender, headers_receiver) = mpsc::channel();
+    let (changed_sender, changed_receiver) = mpsc::channel();
+    let server = thread::spawn(move || {
+        let (mut lock_stream, _) = listener.accept().unwrap();
+        read_headers(&mut lock_stream);
+        write_json(&mut lock_stream, r#"{"generation":"lock"}"#);
+
+        let (mut upload_stream, _) = listener.accept().unwrap();
+        read_headers(&mut upload_stream);
+        headers_sender.send(()).unwrap();
+        changed_receiver.recv().unwrap();
+        let mut body = [0_u8; 5];
+        upload_stream.read_exact(&mut body).unwrap();
+        write_json(&mut upload_stream, r#"{"generation":"456"}"#);
+
+        let (mut release_stream, _) = listener.accept().unwrap();
+        read_headers(&mut release_stream);
+        write_json(&mut release_stream, "{}");
+    });
+    let source = NamedTempFile::new().unwrap();
+    std::fs::write(source.path(), b"old!!").unwrap();
+    let target = ObjectPath::parse("gs://bucket/target").unwrap();
+    let storage =
+        StorageApi::with_endpoints(Cloud::new(), base.clone(), base, Some("token".to_string()));
+    let source_path = source.path().to_path_buf();
+    let upload = thread::spawn(move || storage.upload_file(&source_path, &target));
+
+    headers_receiver
+        .recv_timeout(Duration::from_secs(1))
+        .unwrap();
+    std::fs::write(source.path(), b"new!!").unwrap();
+    changed_sender.send(()).unwrap();
+
+    let error = upload
+        .join()
+        .unwrap()
+        .expect_err("source changes must abort the upload");
+    server.join().unwrap();
+
+    assert!(
+        matches!(error, super::AppError::UploadSourceChanged(_)),
+        "{error}"
+    );
+}
+
+#[test]
 fn times_out_uploads_that_stop_responding() {
     let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
     let base = format!("http://{}/storage/v1", listener.local_addr().unwrap());

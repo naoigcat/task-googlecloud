@@ -1,4 +1,5 @@
 use std::collections::{HashMap, HashSet};
+use std::io::{Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::thread::{self, ThreadId};
@@ -742,15 +743,22 @@ impl StorageApi {
             .lock()
             .map_err(|_| AppError::Message("Upload root identity lock is poisoned".to_string()))?
             .clone();
-        let file = upload_source::open(
+        let mut file = upload_source::open(
             self.upload_root.as_deref(),
             source,
             expected_root,
             expected_source,
         )?;
-        // Validate the local source before acquiring a remote lock or sending a
-        // request, so path replacement remains a local UploadSource failure.
-        let size = file.metadata().map_err(AppError::UploadSource)?.len();
+        // Keep verification on a clone of the validated descriptor so a path
+        // replacement cannot make the comparison refer to a different inode.
+        let mut verification_file = file.try_clone().map_err(AppError::UploadSource)?;
+        // Record the bytes before acquiring a remote lock or sending a request
+        // so a same-file write is detected even when its size is unchanged.
+        let expected_fingerprint =
+            upload_source::fingerprint(&mut verification_file).map_err(AppError::UploadSource)?;
+        file.seek(SeekFrom::Start(0))
+            .map_err(AppError::UploadSource)?;
+        let size = expected_fingerprint.size();
         self.with_object_locks(&[target], || {
             let url = with_query(
                 bucket_objects_url(self.transport.upload_base(), &target.bucket),
@@ -774,6 +782,13 @@ impl StorageApi {
             let metadata: MetadataResponse = self
                 .transport
                 .send_json(request, "Invalid Cloud Storage upload response")?;
+            let actual_fingerprint = upload_source::fingerprint(&mut verification_file)
+                .map_err(|error| AppError::UploadSourceChanged(format!("{source:?}: {error}")))?;
+            if actual_fingerprint != expected_fingerprint {
+                return Err(AppError::UploadSourceChanged(format!(
+                    "{source:?} no longer matches the validated upload contents"
+                )));
+            }
             Ok(metadata.generation)
         })
     }

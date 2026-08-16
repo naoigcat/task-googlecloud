@@ -2,6 +2,7 @@
 use std::ffi::CString;
 use std::fs;
 use std::fs::File;
+use std::io::{self, Read, Seek, SeekFrom};
 #[cfg(unix)]
 use std::os::unix::ffi::OsStrExt;
 #[cfg(unix)]
@@ -11,6 +12,8 @@ use std::os::unix::io::{AsRawFd, FromRawFd, RawFd};
 #[cfg(unix)]
 use std::path::Component;
 use std::path::Path;
+
+use sha2::{Digest, Sha256};
 
 use crate::atomic_rename::{
     DirectoryIdentity, FileIdentity, directory_identity, directory_identity_from_path,
@@ -23,6 +26,40 @@ use crate::error::AppError;
 pub struct UploadSourceIdentity {
     pub(crate) file: FileIdentity,
     pub(crate) directory: DirectoryIdentity,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+/// Size and content identity captured at one point in an upload.
+pub(crate) struct FileFingerprint {
+    size: u64,
+    digest: [u8; 32],
+}
+
+impl FileFingerprint {
+    pub(crate) fn size(&self) -> u64 {
+        self.size
+    }
+}
+
+/// Reads the current file contents from the beginning so a later read can
+/// prove that the bytes streamed to Cloud Storage were not changed in place.
+pub(crate) fn fingerprint(file: &mut File) -> io::Result<FileFingerprint> {
+    file.seek(SeekFrom::Start(0))?;
+    let mut digest = Sha256::new();
+    let mut size = 0_u64;
+    let mut buffer = [0_u8; 64 * 1024];
+    loop {
+        let read = file.read(&mut buffer)?;
+        if read == 0 {
+            break;
+        }
+        digest.update(&buffer[..read]);
+        size += read as u64;
+    }
+    Ok(FileFingerprint {
+        size,
+        digest: digest.finalize().into(),
+    })
 }
 
 #[cfg(unix)]

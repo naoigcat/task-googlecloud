@@ -17,6 +17,11 @@ pub enum AppError {
     #[error("Cannot read the upload source: {0}")]
     UploadSource(io::Error),
 
+    /// Raised after streaming when the source no longer matches the bytes
+    /// validated before the request, so callers must confirm remote state.
+    #[error("Upload source changed during upload: {0}")]
+    UploadSourceChanged(String),
+
     #[error("HTTP request failed: {0}")]
     Http(#[from] reqwest::Error),
 
@@ -170,6 +175,7 @@ impl AppError {
             Self::Http(_)
             | Self::Storage { .. }
             | Self::StorageResponse(_)
+            | Self::UploadSourceChanged(_)
             | Self::InterruptedAfterRequest => true,
             Self::Token {
                 may_have_reached_storage: true,
