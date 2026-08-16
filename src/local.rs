@@ -50,29 +50,30 @@ impl<'a> RenameContext<'a> {
         expected_file: &Path,
         renamed: &mut bool,
     ) -> Result<(), AppError> {
-        match self.expected_root.clone() {
-            Some(expected_root) => rename_without_overwrite_with_identity(
-                self.root,
+        let identity = self.rename_identity(source, target, expected_file);
+        rename_without_overwrite_with_identity(self.root, identity, source, target, renamed)
+    }
+
+    fn rename_identity(
+        &self,
+        source: &Path,
+        target: &Path,
+        expected_file: &Path,
+    ) -> RenameIdentity {
+        // A captured root is the switch that enables all path identity checks;
+        // without it, preserve the public no-identity-check behavior.
+        self.expected_root
+            .clone()
+            .map_or_else(RenameIdentity::without_identity_checks, |root| {
                 RenameIdentity {
-                    root: Some(expected_root),
+                    root: Some(root),
                     file: self
                         .expected_files
                         .and_then(|files| files.get(expected_file).cloned()),
                     source_parent: self.parent_identity(source),
                     target_parent: self.parent_identity(target),
-                },
-                source,
-                target,
-                renamed,
-            ),
-            None => rename_without_overwrite_with_identity(
-                self.root,
-                RenameIdentity::without_identity_checks(),
-                source,
-                target,
-                renamed,
-            ),
-        }
+                }
+            })
     }
 
     fn parent_identity(&self, path: &Path) -> Option<DirectoryIdentity> {
