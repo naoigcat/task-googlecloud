@@ -47,6 +47,28 @@ fn does_not_overwrite_a_target_that_appears_after_planning() {
     assert_eq!(fs::read_to_string(target).unwrap(), "competitor");
 }
 
+#[cfg(target_os = "linux")]
+#[test]
+fn does_not_treat_a_hard_link_as_a_unicode_alias() {
+    let directory = tempdir().unwrap();
+    let source = directory.path().join("cafe\u{301}.txt");
+    let target = directory.path().join("caf\u{e9}.txt");
+    fs::write(&source, "original").unwrap();
+    fs::hard_link(&source, &target).unwrap();
+
+    let entries = vec![Entry {
+        source: source.to_str().unwrap().to_string(),
+        target: target.to_str().unwrap().to_string(),
+    }];
+    let error = apply_normalization(directory.path(), &entries, &no_interrupt()).unwrap_err();
+
+    assert!(
+        error.to_string().contains("File exists") || error.to_string().contains("already exists")
+    );
+    assert_eq!(fs::read_to_string(source).unwrap(), "original");
+    assert_eq!(fs::read_to_string(target).unwrap(), "original");
+}
+
 #[cfg(unix)]
 #[test]
 fn refuses_to_rename_through_a_replaced_root() {
@@ -119,14 +141,18 @@ fn refuses_to_rollback_through_a_replaced_bucket() {
     assert!(!outside.path().join("source.txt").exists());
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 #[test]
 fn rollback_ignores_nfc_and_nfd_aliases() {
-    let directory = tempdir().unwrap();
+    // Use the project mount so Docker Desktop exposes the host filesystem's
+    // normalization behavior; a native Linux filesystem may keep both names.
+    let directory = tempfile::tempdir_in(".").unwrap();
     let source = directory.path().join("cafe\u{301}.txt");
     let target = directory.path().join("caf\u{e9}.txt");
     fs::write(&source, "content").unwrap();
-    assert!(target.exists());
+    if !target.exists() {
+        return;
+    }
     let entries = vec![Entry {
         source: source.to_str().unwrap().to_string(),
         target: target.to_str().unwrap().to_string(),

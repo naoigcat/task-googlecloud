@@ -6,8 +6,8 @@ use crate::error::AppError;
 #[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
 use std::cell::Cell;
 #[cfg(any(target_os = "linux", target_os = "macos"))]
-use std::ffi::{CString, OsStr};
-#[cfg(target_os = "macos")]
+use std::ffi::{CStr, CString, OsStr};
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 use std::mem::MaybeUninit;
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 use std::os::unix::ffi::OsStrExt;
@@ -19,6 +19,8 @@ use std::os::unix::fs::OpenOptionsExt;
 use std::os::unix::io::{AsRawFd, FromRawFd};
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 use std::sync::Arc;
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+use unicode_normalization::UnicodeNormalization;
 
 #[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
 thread_local! {
@@ -222,7 +224,10 @@ pub(crate) fn rename_without_overwrite_with_identity(
             )));
         }
 
-        #[cfg(target_os = "macos")]
+        // Shared filesystems can apply macOS Unicode normalization while the
+        // application itself runs in a Linux container, making both spellings
+        // resolve to the same entry before the exclusive rename is attempted.
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
         if same_path_entry(&source_parent, source_name, &target_parent, target_name_os)? {
             return Ok(());
         }
@@ -397,24 +402,41 @@ fn rename_noreplace(
     }
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn same_path_entry(
     source_directory: &File,
     source_name: &OsStr,
     target_directory: &File,
     target_name: &OsStr,
 ) -> Result<bool, AppError> {
+    let Some(source_name_text) = source_name.to_str() else {
+        return Ok(false);
+    };
+    let Some(target_name_text) = target_name.to_str() else {
+        return Ok(false);
+    };
+    let normalized_target = target_name_text.nfc().collect::<String>();
+    // Keep the no-replace guarantee for distinct hard links; only a single
+    // directory entry with the normalized spelling may be a filesystem alias.
+    if !source_name_text.nfc().eq(normalized_target.chars())
+        || !directory_identity(source_directory)?.eq(&directory_identity(target_directory)?)
+    {
+        return Ok(false);
+    }
+
     let source_metadata = entry_metadata(source_directory, source_name)?;
     let target_metadata = entry_metadata(target_directory, target_name)?;
     Ok(match (source_metadata, target_metadata) {
         (Some(source), Some(target)) => {
-            source.st_dev == target.st_dev && source.st_ino == target.st_ino
+            source.st_dev == target.st_dev
+                && source.st_ino == target.st_ino
+                && equivalent_name_count(target_directory, &normalized_target)? == 1
         }
         _ => false,
     })
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn entry_metadata(directory: &File, name: &OsStr) -> Result<Option<libc::stat>, AppError> {
     let name = c_string(name)?;
     let mut metadata = MaybeUninit::<libc::stat>::uninit();
@@ -434,6 +456,64 @@ fn entry_metadata(directory: &File, name: &OsStr) -> Result<Option<libc::stat>, 
         return Ok(None);
     }
     Err(error.into())
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn equivalent_name_count(directory: &File, normalized_name: &str) -> Result<usize, AppError> {
+    let duplicated_fd = unsafe { libc::dup(directory.as_raw_fd()) };
+    if duplicated_fd < 0 {
+        return Err(io::Error::last_os_error().into());
+    }
+
+    let stream = unsafe { libc::fdopendir(duplicated_fd) };
+    if stream.is_null() {
+        let error = io::Error::last_os_error();
+        unsafe {
+            libc::close(duplicated_fd);
+        }
+        return Err(error.into());
+    }
+
+    clear_errno();
+    let mut count = 0;
+    let result = loop {
+        let entry = unsafe { libc::readdir(stream) };
+        if entry.is_null() {
+            let error = io::Error::last_os_error();
+            if error.raw_os_error().unwrap_or_default() != 0 {
+                break Err(error.into());
+            }
+            break Ok(count);
+        }
+
+        let entry_name = unsafe { CStr::from_ptr((*entry).d_name.as_ptr()) };
+        let Ok(entry_name) = std::str::from_utf8(entry_name.to_bytes()) else {
+            continue;
+        };
+        if entry_name.nfc().eq(normalized_name.chars()) {
+            count += 1;
+        }
+    };
+
+    let close_status = unsafe { libc::closedir(stream) };
+    if close_status != 0 && result.is_ok() {
+        return Err(io::Error::last_os_error().into());
+    }
+    result
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn clear_errno() {
+    unsafe {
+        #[cfg(target_os = "linux")]
+        {
+            *libc::__errno_location() = 0;
+        }
+        #[cfg(target_os = "macos")]
+        {
+            *libc::__error() = 0;
+        }
+    }
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
