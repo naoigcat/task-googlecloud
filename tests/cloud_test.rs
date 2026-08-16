@@ -33,3 +33,23 @@ fn ssh_options_require_key_authentication_and_host_verification() {
     assert!(args.contains(&"cloud@googlecloud".to_string()));
     assert!(!args.contains(&"root@googlecloud".to_string()));
 }
+
+#[test]
+fn configures_the_requested_project_before_authentication() {
+    for (workflow, source) in [
+        ("normalize", include_str!("../src/normalize.rs")),
+        ("upload", include_str!("../src/upload.rs")),
+    ] {
+        let project_position = source
+            .find("cloud.set_project(project)?")
+            .unwrap_or_else(|| panic!("{workflow} must set the requested project"));
+        let login_position = source
+            .find("cloud.login()?")
+            .unwrap_or_else(|| panic!("{workflow} must authenticate"));
+
+        assert!(
+            project_position < login_position,
+            "{workflow} must configure the project before authentication"
+        );
+    }
+}

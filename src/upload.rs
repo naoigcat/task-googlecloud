@@ -54,10 +54,11 @@ pub fn run<S: StorageClient>(
         .collect::<HashMap<_, _>>();
     let uploads = plan_uploads(&discovery, &planned_names, &staging_prefix())?;
 
-    // Validate local inputs before login, but authenticate before acquiring locks
-    // because creating a bucket lock already requires an access token.
-    cloud.login()?;
+    // Validate local inputs before authentication, but authenticate before
+    // acquiring locks because creating a bucket lock already requires an access token.
+    // Set the project first so an interactive login reports the requested project.
     cloud.set_project(project)?;
+    cloud.login()?;
 
     storage.with_bucket_locks(&buckets, || {
         // Rename before uploading so the local source, normalized object name,

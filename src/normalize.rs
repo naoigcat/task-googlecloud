@@ -25,8 +25,10 @@ pub fn run<S: StorageClient>(
     project: &str,
     bucket: &str,
 ) -> Result<(), AppError> {
-    cloud.login()?;
+    // Set the project first so an interactive login reports the project this
+    // workflow was asked to use instead of an unset default.
     cloud.set_project(project)?;
+    cloud.login()?;
     println!("Using Google Cloud project [{project}].");
     storage.with_bucket_locks(&[bucket], || {
         // Hold the lock while listing and applying the plan so the snapshot
