@@ -530,6 +530,157 @@ fn retries_streaming_upload_after_connection_failures() {
     assert!(requests[1].ends_with("\r\n\r\ncontents"));
 }
 
+#[test]
+fn retries_streaming_upload_after_request_send_failures() {
+    let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let address = listener.local_addr().unwrap();
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    let recorded_requests = Arc::clone(&requests);
+    let server = thread::spawn(move || {
+        let mut stream = accept_connection(&listener, SERVER_TIMEOUT).unwrap();
+        recorded_requests
+            .lock()
+            .unwrap()
+            .push(read_request(&mut stream));
+        let body = r#"{"generation":"lock"}"#;
+        let response = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        );
+        stream.write_all(response.as_bytes()).unwrap();
+
+        // Closing after the complete request body models a connection loss
+        // after the server may already have accepted the upload.
+        let mut failed_upload = accept_connection(&listener, SERVER_TIMEOUT).unwrap();
+        recorded_requests
+            .lock()
+            .unwrap()
+            .push(read_request(&mut failed_upload));
+        drop(failed_upload);
+
+        let mut release_after_failure = accept_connection(&listener, SERVER_TIMEOUT).unwrap();
+        recorded_requests
+            .lock()
+            .unwrap()
+            .push(read_request(&mut release_after_failure));
+        release_after_failure
+            .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}")
+            .unwrap();
+
+        let mut retry_lock = accept_connection(&listener, SERVER_TIMEOUT).unwrap();
+        recorded_requests
+            .lock()
+            .unwrap()
+            .push(read_request(&mut retry_lock));
+        let body = r#"{"generation":"lock-2"}"#;
+        let response = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        );
+        retry_lock.write_all(response.as_bytes()).unwrap();
+
+        let mut retry = accept_connection(&listener, SERVER_TIMEOUT).unwrap();
+        recorded_requests
+            .lock()
+            .unwrap()
+            .push(read_request(&mut retry));
+        let body = r#"{"generation":"789"}"#;
+        let response = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        );
+        retry.write_all(response.as_bytes()).unwrap();
+
+        let mut release = accept_connection(&listener, SERVER_TIMEOUT).unwrap();
+        recorded_requests
+            .lock()
+            .unwrap()
+            .push(read_request(&mut release));
+        release
+            .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}")
+            .unwrap();
+    });
+    let base = format!("http://{address}/storage/v1");
+    let source = NamedTempFile::new().unwrap();
+    std::fs::write(source.path(), b"contents").unwrap();
+    let target = ObjectPath::parse("gs://bucket/target.txt").unwrap();
+
+    let generation = storage(&base).upload_file(source.path(), &target).unwrap();
+    server.join().unwrap();
+
+    assert_eq!(generation, "789");
+    let requests = requests.lock().unwrap();
+    assert_eq!(requests.len(), 6);
+    assert!(request_line(&requests[1]).contains("uploadType=media"));
+    assert!(requests[1].ends_with("\r\n\r\ncontents"));
+    assert!(request_line(&requests[4]).contains("uploadType=media"));
+    assert!(requests[4].ends_with("\r\n\r\ncontents"));
+}
+
+#[test]
+fn does_not_retry_with_changed_source_contents() {
+    let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let address = listener.local_addr().unwrap();
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    let recorded_requests = Arc::clone(&requests);
+    let (upload_received_sender, upload_received_receiver) = std::sync::mpsc::channel();
+    let (close_sender, close_receiver) = std::sync::mpsc::channel();
+    let server = thread::spawn(move || {
+        let mut lock = accept_connection(&listener, SERVER_TIMEOUT).unwrap();
+        recorded_requests
+            .lock()
+            .unwrap()
+            .push(read_request(&mut lock));
+        let body = r#"{"generation":"lock"}"#;
+        let response = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        );
+        lock.write_all(response.as_bytes()).unwrap();
+
+        let mut failed_upload = accept_connection(&listener, SERVER_TIMEOUT).unwrap();
+        recorded_requests
+            .lock()
+            .unwrap()
+            .push(read_request(&mut failed_upload));
+        upload_received_sender.send(()).unwrap();
+        close_receiver.recv().unwrap();
+        drop(failed_upload);
+
+        let mut release = accept_connection(&listener, SERVER_TIMEOUT).unwrap();
+        recorded_requests
+            .lock()
+            .unwrap()
+            .push(read_request(&mut release));
+        release
+            .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}")
+            .unwrap();
+    });
+    let base = format!("http://{address}/storage/v1");
+    let source = NamedTempFile::new().unwrap();
+    std::fs::write(source.path(), b"contents").unwrap();
+    let source_path = source.path().to_path_buf();
+    let target = ObjectPath::parse("gs://bucket/target.txt").unwrap();
+    let storage = storage(&base);
+    let upload = thread::spawn(move || storage.upload_file(&source_path, &target));
+
+    upload_received_receiver
+        .recv_timeout(SERVER_TIMEOUT)
+        .unwrap();
+    std::fs::write(source.path(), b"changed").unwrap();
+    close_sender.send(()).unwrap();
+    let error = upload.join().unwrap().unwrap_err();
+    server.join().unwrap();
+
+    assert!(matches!(error, AppError::UploadSourceChanged(_)), "{error}");
+    let requests = requests.lock().unwrap();
+    assert_eq!(requests.len(), 3);
+    assert!(request_line(&requests[1]).contains("uploadType=media"));
+    assert!(request_line(&requests[2]).contains(".task-googlecloud-lock"));
+}
+
 #[cfg(unix)]
 #[test]
 fn refuses_symlinked_upload_sources() {

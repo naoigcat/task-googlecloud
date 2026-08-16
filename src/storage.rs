@@ -30,10 +30,11 @@ const UPLOAD_BASE: &str = "https://storage.googleapis.com/upload/storage/v1";
 /// move cannot delete its source while another compliant writer replaces its
 /// destination.
 const BUCKET_LOCK_OBJECT: &str = ".task-googlecloud-lock";
-// A connection failure proves no upload request left the process, so rebuilding
-// the operation is safe while still allowing genuinely unavailable networks to fail.
-const CONNECTION_ATTEMPTS: usize = 3;
-const CONNECTION_RETRY_DELAY: Duration = Duration::from_millis(250);
+// The upload is guarded by ifGenerationMatch=0, so a transport failure can be
+// replayed without overwriting a generation that another writer created. Keep
+// the retry budget finite so a persistent outage still reaches recovery handling.
+const UPLOAD_ATTEMPTS: usize = 10;
+const UPLOAD_RETRY_BASE_DELAY: Duration = Duration::from_millis(250);
 const PATH_SEGMENT: &AsciiSet = &CONTROLS
     .add(b' ')
     .add(b'"')
@@ -741,19 +742,50 @@ impl StorageApi {
         target: &ObjectPath,
         expected_source: Option<UploadSourceIdentity>,
     ) -> Result<String, AppError> {
+        Self::reject_bucket_lock_object(target)?;
+        // Anchor every retry to the bytes discovered before the first request;
+        // otherwise a local edit during a network outage could change the
+        // object content between attempts while preserving the same file entry.
+        let expected_fingerprint =
+            self.capture_upload_fingerprint(source, expected_source.clone())?;
         // Rebuild the whole request, including ReaderStream, so every retry
         // starts from a fresh file descriptor and preserves source validation.
-        for attempt in 1..=CONNECTION_ATTEMPTS {
-            match self.upload_file_checked(source, target, expected_source.clone()) {
+        for attempt in 1..=UPLOAD_ATTEMPTS {
+            match self.upload_file_checked(
+                source,
+                target,
+                expected_source.clone(),
+                &expected_fingerprint,
+            ) {
                 Ok(generation) => return Ok(generation),
-                Err(error) if error.is_connection_failure() && attempt < CONNECTION_ATTEMPTS => {
-                    thread::sleep(CONNECTION_RETRY_DELAY);
+                Err(error) if error.is_retryable_upload_failure() && attempt < UPLOAD_ATTEMPTS => {
+                    let backoff = attempt.saturating_sub(1).min(3) as u32;
+                    thread::sleep(UPLOAD_RETRY_BASE_DELAY.saturating_mul(1_u32 << backoff));
                 }
                 Err(error) => return Err(error),
             }
         }
 
-        unreachable!("the connection attempt loop always returns")
+        unreachable!("the upload attempt loop always returns")
+    }
+
+    fn capture_upload_fingerprint(
+        &self,
+        source: &Path,
+        expected_source: Option<UploadSourceIdentity>,
+    ) -> Result<upload_source::FileFingerprint, AppError> {
+        let expected_root = self
+            .upload_root_identity
+            .lock()
+            .map_err(|_| AppError::Message("Upload root identity lock is poisoned".to_string()))?
+            .clone();
+        let mut file = upload_source::open(
+            self.upload_root.as_deref(),
+            source,
+            expected_root,
+            expected_source,
+        )?;
+        upload_source::fingerprint(&mut file).map_err(AppError::UploadSource)
     }
 
     fn upload_file_checked(
@@ -761,6 +793,7 @@ impl StorageApi {
         source: &Path,
         target: &ObjectPath,
         expected_source: Option<UploadSourceIdentity>,
+        expected_fingerprint: &upload_source::FileFingerprint,
     ) -> Result<String, AppError> {
         Self::reject_bucket_lock_object(target)?;
         let expected_root = self
@@ -777,10 +810,15 @@ impl StorageApi {
         // Keep verification on a clone of the validated descriptor so a path
         // replacement cannot make the comparison refer to a different inode.
         let mut verification_file = file.try_clone().map_err(AppError::UploadSource)?;
-        // Record the bytes before acquiring a remote lock or sending a request
-        // so a same-file write is detected even when its size is unchanged.
-        let expected_fingerprint =
+        // Recheck every freshly opened descriptor before sending so a path
+        // replacement between attempts cannot silently change the upload.
+        let actual_fingerprint =
             upload_source::fingerprint(&mut verification_file).map_err(AppError::UploadSource)?;
+        if actual_fingerprint != *expected_fingerprint {
+            return Err(AppError::UploadSourceChanged(format!(
+                "{source:?} no longer matches the validated upload contents"
+            )));
+        }
         file.seek(SeekFrom::Start(0))
             .map_err(AppError::UploadSource)?;
         let size = expected_fingerprint.size();
@@ -809,7 +847,7 @@ impl StorageApi {
                 .send_json(request, "Invalid Cloud Storage upload response")?;
             let actual_fingerprint = upload_source::fingerprint(&mut verification_file)
                 .map_err(|error| AppError::UploadSourceChanged(format!("{source:?}: {error}")))?;
-            if actual_fingerprint != expected_fingerprint {
+            if actual_fingerprint != *expected_fingerprint {
                 return Err(AppError::UploadSourceChanged(format!(
                     "{source:?} no longer matches the validated upload contents"
                 )));

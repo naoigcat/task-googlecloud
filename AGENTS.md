@@ -48,9 +48,13 @@ that are easy to lose when changing the implementation.
     after a request may have started is not proof that the remote state is unchanged:
     confirm ownership and generations before retrying or rolling back. If ownership
     cannot be established, preserve the recovery state and require manual recovery.
--   Retry only bounded connection-establishment failures identified by
-    `reqwest::Error::is_connect()`. Rebuild streamed upload requests for each attempt;
-    do not blindly retry failures after request transmission may have started.
+-   Upload retries are limited to the no-replace media upload path. Retry only
+    connection-establishment or non-timeout request-send failures
+    (`reqwest::Error::is_connect()` or `is_request()`), never local body-read or
+    response/decode timeout failures; rebuild the streamed request for each attempt
+    and keep the attempt budget and backoff finite. A `412` or an ambiguous final
+    result is not an upload success: preserve generation confirmation and manual
+    recovery unless ownership and contents are independently established.
 -   Upload planning must remain tied to discovery. The one-level `uploads/<bucket>/`
     layout, hidden-file exclusion, symlinked-root/entry exclusion or rejection,
     root/directory/file identity checks, and content fingerprint check protect against

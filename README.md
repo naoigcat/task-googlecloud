@@ -76,9 +76,12 @@ container or host termination, or an interruption during rollback cannot be
 handled. These events can leave temporary Cloud Storage objects or locally
 normalized filenames behind. The workflows also stop for manual recovery when
 a remote failure leaves an object whose ownership cannot be established safely.
-Uploads retry connection-establishment failures up to three times, rebuilding
-the source stream for each attempt. A failure after request transmission may
-still require manual recovery because the remote state is uncertain.
+Uploads retry replayable connection or request-send failures up to ten attempts
+with bounded backoff, rebuilding the source stream for each attempt. The media
+upload uses `ifGenerationMatch=0`, so a retry cannot overwrite an existing
+object. Local source-read and response/decode timeout failures are not retried;
+if the result remains ambiguous after the retries, the normal manual-recovery
+confirmation remains in force rather than guessing which object was created.
 
 Before retrying a stopped run:
 

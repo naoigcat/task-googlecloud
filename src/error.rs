@@ -174,8 +174,19 @@ impl AppError {
         }
     }
 
-    pub(crate) fn is_connection_failure(&self) -> bool {
-        matches!(self, Self::Http(error) if error.is_connect())
+    /// Whether a streamed upload can be replayed after this transport error.
+    ///
+    /// Request failures can happen after Cloud Storage received some or all of
+    /// the bytes. Uploads use `ifGenerationMatch=0`, so replaying them cannot
+    /// overwrite an existing generation; body errors stay excluded because
+    /// they can originate from reading the local source file. Non-connection
+    /// timeouts remain confirmation failures because the request may already
+    /// have completed and no retryable send error was reported. Wrapped rollback
+    /// errors are also excluded because lock cleanup may have left remote state
+    /// uncertain.
+    pub(crate) fn is_retryable_upload_failure(&self) -> bool {
+        matches!(self, Self::Http(error) if !error.is_body()
+            && (error.is_connect() || (error.is_request() && !error.is_timeout())))
     }
 
     pub(crate) fn may_have_sent_storage_request(&self) -> bool {
