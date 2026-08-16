@@ -29,7 +29,6 @@ pub fn run<S: StorageClient>(
     // workflow was asked to use instead of an unset default.
     cloud.set_project(project)?;
     cloud.login()?;
-    println!("Using Google Cloud project [{project}].");
     storage.with_bucket_locks(&[bucket], || {
         // Hold the lock while listing and applying the plan so the snapshot
         // cannot be invalidated by another compliant writer.

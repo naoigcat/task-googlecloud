@@ -59,8 +59,6 @@ pub fn run<S: StorageClient>(
     // Set the project first so an interactive login reports the requested project.
     cloud.set_project(project)?;
     cloud.login()?;
-    println!("Using Google Cloud project [{project}].");
-
     storage.with_bucket_locks(&buckets, || {
         // Rename before uploading so the local source, normalized object name,
         // and captured identity stay aligned; failures restore this phase below.

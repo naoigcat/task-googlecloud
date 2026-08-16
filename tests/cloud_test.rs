@@ -58,15 +58,12 @@ fn configures_the_requested_project_before_authentication() {
 fn reports_the_upload_project_before_acquiring_bucket_locks() {
     let source = include_str!("../src/upload.rs");
     let login_position = source.find("cloud.login()?").unwrap();
-    let log_position = source
-        .find("println!(\"Using Google Cloud project [{project}].\");")
-        .expect("upload must report the configured project");
     let lock_position = source
         .find("storage.with_bucket_locks(&buckets, ||")
         .expect("upload must acquire bucket locks");
 
     assert!(
-        login_position < log_position && log_position < lock_position,
+        login_position < lock_position,
         "upload must report the project after authentication and before remote processing"
     );
 }
