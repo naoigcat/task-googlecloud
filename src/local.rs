@@ -4,8 +4,7 @@ use std::path::{Path, PathBuf};
 
 use crate::InterruptFlag;
 use crate::atomic_rename::{
-    DirectoryIdentity, FileIdentity, rename_without_overwrite,
-    rename_without_overwrite_with_identity,
+    DirectoryIdentity, FileIdentity, RenameIdentity, rename_without_overwrite_with_identity,
 };
 use crate::error::AppError;
 use crate::normalization_plan::Entry;
@@ -40,8 +39,8 @@ impl<'a> RenameContext<'a> {
 
     /// Applies the same identity checks to forward and rollback renames so a
     /// replacement cannot be treated differently in either transaction phase.
-    fn rename(&self, source: &Path, target: &Path) -> Result<(), AppError> {
-        self.rename_with_expected_file(source, target, source)
+    fn rename(&self, source: &Path, target: &Path, renamed: &mut bool) -> Result<(), AppError> {
+        self.rename_with_expected_file(source, target, source, renamed)
     }
 
     fn rename_with_expected_file(
@@ -49,19 +48,30 @@ impl<'a> RenameContext<'a> {
         source: &Path,
         target: &Path,
         expected_file: &Path,
+        renamed: &mut bool,
     ) -> Result<(), AppError> {
         match self.expected_root.clone() {
             Some(expected_root) => rename_without_overwrite_with_identity(
                 self.root,
-                Some(expected_root),
-                self.expected_files
-                    .and_then(|files| files.get(expected_file).cloned()),
-                self.parent_identity(source),
-                self.parent_identity(target),
+                RenameIdentity {
+                    root: Some(expected_root),
+                    file: self
+                        .expected_files
+                        .and_then(|files| files.get(expected_file).cloned()),
+                    source_parent: self.parent_identity(source),
+                    target_parent: self.parent_identity(target),
+                },
                 source,
                 target,
+                renamed,
             ),
-            None => rename_without_overwrite(self.root, source, target),
+            None => rename_without_overwrite_with_identity(
+                self.root,
+                RenameIdentity::without_identity_checks(),
+                source,
+                target,
+                renamed,
+            ),
         }
     }
 
@@ -112,8 +122,15 @@ pub(crate) fn apply_normalization_with_path_identities(
             if source == target {
                 continue;
             }
-            context.rename(&source, &target)?;
-            renamed.push(RenameRecord { source, target });
+            let mut rename_completed = false;
+            let result = context.rename(&source, &target, &mut rename_completed);
+            if rename_completed {
+                renamed.push(RenameRecord {
+                    source: source.clone(),
+                    target: target.clone(),
+                });
+            }
+            result?;
             interrupt.check()?;
         }
         Ok::<(), AppError>(())
@@ -168,9 +185,13 @@ fn rollback(context: &RenameContext<'_>, entries: &[RenameRecord]) -> Vec<AppErr
         if entry.source == entry.target {
             continue;
         }
-        if let Err(error) =
-            context.rename_with_expected_file(&entry.target, &entry.source, &entry.source)
-        {
+        let mut rename_completed = false;
+        if let Err(error) = context.rename_with_expected_file(
+            &entry.target,
+            &entry.source,
+            &entry.source,
+            &mut rename_completed,
+        ) {
             if matches!(&error, AppError::Io(error) if error.kind() == io::ErrorKind::AlreadyExists)
             {
                 errors.push(

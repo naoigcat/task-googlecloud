@@ -21,7 +21,8 @@ use tempfile::tempdir;
 
 use super::*;
 use crate::atomic_rename::{
-    directory_identity_from_path, file_identity_from_path, identity_descriptor_is_unlinked,
+    directory_identity_from_path, fail_next_target_identity_check, file_identity_from_path,
+    identity_descriptor_is_unlinked,
 };
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
@@ -208,6 +209,43 @@ fn renames_a_file_with_captured_identities() {
 
     assert_eq!(fs::read_to_string(&target).unwrap(), "original");
     assert!(!source.exists());
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn rolls_back_a_rename_when_target_identity_verification_fails() {
+    let parent = tempdir().unwrap();
+    let root = parent.path().join("uploads");
+    let bucket = root.join("bucket");
+    let source = bucket.join("source.txt");
+    let target = bucket.join("target.txt");
+    fs::create_dir_all(&bucket).unwrap();
+    fs::write(&source, "original").unwrap();
+    let expected_root = directory_identity_from_path(&root).unwrap();
+    let expected_directory = directory_identity_from_path(&bucket).unwrap();
+    let expected_file = file_identity_from_path(&source).unwrap();
+    let entries = vec![Entry {
+        source: source.to_str().unwrap().to_string(),
+        target: target.to_str().unwrap().to_string(),
+    }];
+    let files = HashMap::from([(source.clone(), expected_file)]);
+    let directories = HashMap::from([(bucket.clone(), expected_directory)]);
+    let interrupt = InterruptFlag::from_atomic(Arc::new(AtomicBool::new(false)));
+
+    fail_next_target_identity_check();
+    let error = apply_normalization_with_path_identities(
+        &root,
+        &entries,
+        Some(expected_root),
+        Some(&files),
+        Some(&directories),
+        &interrupt,
+    )
+    .unwrap_err();
+
+    assert!(error.to_string().contains("manual recovery is required"));
+    assert_eq!(fs::read_to_string(&source).unwrap(), "original");
+    assert!(!target.exists());
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]

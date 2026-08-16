@@ -3,6 +3,8 @@ use std::{fs::File, io};
 
 use crate::error::AppError;
 
+#[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
+use std::cell::Cell;
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 use std::ffi::{CString, OsStr};
 #[cfg(target_os = "macos")]
@@ -17,6 +19,11 @@ use std::os::unix::fs::OpenOptionsExt;
 use std::os::unix::io::{AsRawFd, FromRawFd};
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 use std::sync::Arc;
+
+#[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
+thread_local! {
+    static FAIL_NEXT_TARGET_IDENTITY_CHECK: Cell<bool> = const { Cell::new(false) };
+}
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 #[derive(Clone, Debug)]
@@ -67,6 +74,24 @@ pub struct DirectoryIdentity;
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct FileIdentity;
+
+pub(crate) struct RenameIdentity {
+    pub(crate) root: Option<DirectoryIdentity>,
+    pub(crate) file: Option<FileIdentity>,
+    pub(crate) source_parent: Option<DirectoryIdentity>,
+    pub(crate) target_parent: Option<DirectoryIdentity>,
+}
+
+impl RenameIdentity {
+    pub(crate) fn without_identity_checks() -> Self {
+        Self {
+            root: None,
+            file: None,
+            source_parent: None,
+            target_parent: None,
+        }
+    }
+}
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 pub(crate) fn directory_identity_from_path(
@@ -129,6 +154,11 @@ pub(crate) fn file_identity(file: &File) -> io::Result<FileIdentity> {
 }
 
 #[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
+pub(crate) fn fail_next_target_identity_check() {
+    FAIL_NEXT_TARGET_IDENTITY_CHECK.with(|fail| fail.set(true));
+}
+
+#[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
 pub(crate) fn identity_descriptor_is_unlinked(identity: &FileIdentity) -> io::Result<bool> {
     Ok(identity._descriptor.metadata()?.nlink() == 0)
 }
@@ -143,22 +173,12 @@ pub(crate) fn directory_identity(_file: &File) -> io::Result<DirectoryIdentity> 
     Ok(DirectoryIdentity)
 }
 
-/// Atomically renames a path without replacing an existing target.
-///
-/// Linux and macOS provide the required no-replace primitive; other platforms
-/// return [`AppError::UnsupportedPlatform`].
-pub fn rename_without_overwrite(root: &Path, source: &Path, target: &Path) -> Result<(), AppError> {
-    rename_without_overwrite_with_identity(root, None, None, None, None, source, target)
-}
-
 pub(crate) fn rename_without_overwrite_with_identity(
     root: &Path,
-    expected_root: Option<DirectoryIdentity>,
-    expected_source: Option<FileIdentity>,
-    expected_source_parent: Option<DirectoryIdentity>,
-    expected_target_parent: Option<DirectoryIdentity>,
+    identity: RenameIdentity,
     source: &Path,
     target: &Path,
+    renamed: &mut bool,
 ) -> Result<(), AppError> {
     if source == target {
         return Ok(());
@@ -171,7 +191,7 @@ pub(crate) fn rename_without_overwrite_with_identity(
         // Resolve both parents from an open root descriptor so a concurrent
         // replacement of the root or an intermediate directory is detected.
         let root_directory = open_directory(root)?;
-        if let Some(expected_root) = expected_root.as_ref()
+        if let Some(expected_root) = identity.root.as_ref()
             && !directory_identity(&root_directory)?.eq(expected_root)
         {
             return Err(AppError::Message(format!(
@@ -180,21 +200,21 @@ pub(crate) fn rename_without_overwrite_with_identity(
         }
         let (source_parent, source_name) = relative_parent(&root_directory, root, source)?;
         let (target_parent, target_name_os) = relative_parent(&root_directory, root, target)?;
-        if let Some(expected_source_parent) = expected_source_parent.as_ref()
+        if let Some(expected_source_parent) = identity.source_parent.as_ref()
             && !directory_identity(&source_parent)?.eq(expected_source_parent)
         {
             return Err(AppError::Message(format!(
                 "Input source directory was replaced before renaming: {source:?}"
             )));
         }
-        if let Some(expected_target_parent) = expected_target_parent.as_ref()
+        if let Some(expected_target_parent) = identity.target_parent.as_ref()
             && !directory_identity(&target_parent)?.eq(expected_target_parent)
         {
             return Err(AppError::Message(format!(
                 "Input target directory was replaced before renaming: {target:?}"
             )));
         }
-        if let Some(expected_source) = expected_source.as_ref()
+        if let Some(expected_source) = identity.file.as_ref()
             && !file_identity_at(&source_parent, source_name)?.eq(expected_source)
         {
             return Err(AppError::Message(format!(
@@ -210,15 +230,19 @@ pub(crate) fn rename_without_overwrite_with_identity(
         let source_name = c_string(source_name)?;
         let target_name = c_string(target_name_os)?;
         rename_noreplace(&source_parent, &source_name, &target_parent, &target_name)?;
-        if let Some(expected_source) = expected_source.as_ref() {
-            let actual = file_identity_at(&target_parent, target_name_os).map_err(|error| {
-                AppError::rollback(
-                    AppError::Message(format!(
-                        "Input file was replaced during renaming: {source:?}"
-                    )),
-                    vec![error],
-                )
-            })?;
+        // Record the atomic move before checking the destination so callers can
+        // restore it if post-rename identity verification cannot complete.
+        *renamed = true;
+        if let Some(expected_source) = identity.file.as_ref() {
+            let actual = file_identity_after_rename(&target_parent, target_name_os).map_err(
+                |error| AppError::Recovery {
+                    paths: format!("{:?} and {:?}", source, target),
+                    operation: "verify normalized upload source".to_string(),
+                    details: format!(
+                        "Could not verify the renamed file at {target:?}: {error}; manual recovery is required"
+                    ),
+                },
+            )?;
             if !actual.eq(expected_source) {
                 return Err(AppError::Recovery {
                     paths: format!("{:?} and {:?}", source, target),
@@ -234,19 +258,22 @@ pub(crate) fn rename_without_overwrite_with_identity(
 
     #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     {
-        let _ = (
-            root,
-            expected_root,
-            expected_source,
-            expected_source_parent,
-            expected_target_parent,
-            source,
-            target,
-        );
+        let _ = (root, identity, source, target);
         Err(AppError::UnsupportedPlatform(
             std::env::consts::OS.to_string(),
         ))
     }
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn file_identity_after_rename(directory: &File, name: &OsStr) -> Result<FileIdentity, AppError> {
+    #[cfg(test)]
+    if FAIL_NEXT_TARGET_IDENTITY_CHECK.with(|fail| fail.replace(false)) {
+        // A deterministic test hook covers the narrow race without relying on
+        // another thread winning a scheduler-dependent delete/replace race.
+        return Err(io::Error::other("injected target identity verification failure").into());
+    }
+    file_identity_at(directory, name)
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
