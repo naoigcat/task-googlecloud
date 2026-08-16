@@ -662,6 +662,11 @@ fn moves_objects_and_confirms_source_deletion() {
         request_line(&requests[2]),
         "POST /storage/v1/b/bucket/o/source/rewriteTo/b/bucket/o/target?sourceGeneration=11&ifSourceGenerationMatch=11&ifGenerationMatch=0 HTTP/1.1"
     );
+    assert!(
+        requests[2]
+            .to_ascii_lowercase()
+            .contains("content-length: 0")
+    );
     assert_eq!(
         request_line(&requests[3]),
         "GET /storage/v1/b/bucket/o/target HTTP/1.1"

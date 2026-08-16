@@ -506,7 +506,12 @@ impl StorageApi {
             let rewrite: RewriteResponse = self
                 .transport
                 .send_json(
-                    self.transport.client().post(url),
+                    self.transport
+                        .client()
+                        .post(url)
+                        // Cloud Storage requires Content-Length on every POST,
+                        // including bodyless rewrite requests.
+                        .header(CONTENT_LENGTH, 0),
                     "Invalid Cloud Storage rewrite response",
                 )
                 .map_err(|error| {
@@ -759,6 +764,8 @@ impl StorageApi {
                 .transport
                 .upload_client()
                 .post(url)
+                // ReaderStream has no exact size hint, so preserve the file
+                // metadata length explicitly while streaming it from disk.
                 .header(CONTENT_TYPE, "application/octet-stream")
                 .header(CONTENT_LENGTH, size)
                 .body(Body::wrap_stream(ReaderStream::new(
