@@ -19,6 +19,8 @@ enum Command {
 fn main() {
     let cli = Cli::parse();
     let result = (|| -> Result<(), AppError> {
+        // Share one signal flag with both external boundaries so an interrupt
+        // is observed consistently and rollback can clear it at one boundary.
         let interrupt = InterruptFlag::install()?;
         let cloud = Cloud::with_interrupt(interrupt.clone());
         let storage = StorageApi::new(cloud.clone());

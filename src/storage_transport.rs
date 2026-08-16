@@ -127,6 +127,8 @@ impl StorageTransport {
                     },
                 }
             });
+        // The signal can arrive just after the request future completes; retain
+        // post-request classification so callers choose recovery instead of retrying blindly.
         let result = if self
             .interrupt
             .as_ref()

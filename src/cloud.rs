@@ -96,6 +96,8 @@ impl Cloud {
     }
 
     fn run_script(&self, script: &str, arguments: &[String]) -> Result<String, AppError> {
+        // Keep the script on stdin and pass values as positional parameters so
+        // project names remain data rather than becoming shell source.
         let remote_command = if arguments.is_empty() {
             "sh -s --".to_string()
         } else {
@@ -208,6 +210,8 @@ fn wait_for_child_with_input(
     let pipes = ChildPipes::new(&mut child, input);
     let started = Instant::now();
 
+    // Polling keeps signal and timeout checks responsive while the pipe threads
+    // continue draining output; waiting directly on the child would delay both.
     loop {
         if let Some(status) = child.try_wait()? {
             return pipes.finish(status);

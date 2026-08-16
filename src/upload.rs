@@ -55,9 +55,14 @@ pub fn run<S: StorageClient>(
             .collect::<HashMap<_, _>>();
         let uploads = plan_uploads(&discovery, &planned_names, &staging_prefix())?;
 
+        // Keep explicit interactive login after local planning and validation.
+        // Bucket-lock setup may already obtain a token, but invalid input never
+        // needs to start the interactive login flow.
         cloud.login()?;
         cloud.set_project(project)?;
 
+        // Rename before uploading so the local source, normalized object name,
+        // and captured identity stay aligned; failures restore this phase below.
         let normalized_files = local::apply_normalization_with_path_identities(
             Path::new(UPLOAD_ROOT),
             &plan,
@@ -159,6 +164,9 @@ fn discover_uploads(root: &Path) -> Result<UploadDiscovery, AppError> {
     let root_identity = directory_identity_from_path(root).map_err(AppError::from)?;
     let mut directory_identities = HashMap::new();
     let mut file_identities = HashMap::new();
+    // The input contract is intentionally one directory deep: each real child
+    // directory maps to a bucket, while nested trees and symlinked entries are
+    // excluded so discovery cannot silently broaden the upload scope.
     // Discovery records identities as well as paths because a later open by
     // pathname must not silently accept a replacement file or directory.
     for directory in fs::read_dir(root)? {
@@ -347,6 +355,8 @@ fn upload_planned_files_unlocked<S: StorageClient>(
             Ok(())
         },
         |_, change| {
+            // Publishing is generation-guarded separately from upload, so a
+            // retry cannot finalize a newer object under the same staging name.
             let generation = object_move::execute(
                 storage,
                 interrupt,

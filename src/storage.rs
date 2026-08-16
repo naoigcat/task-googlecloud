@@ -322,6 +322,9 @@ impl StorageApi {
         bucket_names.sort_unstable();
         bucket_names.dedup();
 
+        // Workflows hold a bucket lock around a group of operations, while the
+        // individual operations call this helper again. Reuse locks already
+        // held by this thread instead of creating a conflicting marker object.
         let owner = thread::current().id();
         let held_buckets = self
             .active_bucket_locks
@@ -468,6 +471,9 @@ impl StorageApi {
         source_generation: Option<&str>,
         destination_generation: Option<&str>,
     ) -> Result<String, AppError> {
+        // Rewrite accepts both source and destination preconditions: the source
+        // generation protects the input, while a supplied destination condition
+        // verifies the target generation before the rewrite proceeds.
         let mut query = Serializer::new(String::new());
         if let Some(generation) = source_generation {
             query.append_pair("sourceGeneration", generation);
@@ -737,6 +743,8 @@ impl StorageApi {
             expected_root,
             expected_source,
         )?;
+        // Validate the local source before acquiring a remote lock or sending a
+        // request, so path replacement remains a local UploadSource failure.
         let size = file.metadata().map_err(AppError::UploadSource)?.len();
         self.with_object_locks(&[target], || {
             let url = with_query(

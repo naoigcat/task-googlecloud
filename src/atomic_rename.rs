@@ -164,6 +164,8 @@ pub(crate) fn rename_without_overwrite_with_identity(
         return Ok(());
     }
 
+    // Identity checks protect the captured filesystem context; the platform
+    // primitive below only makes the final rename itself atomic and exclusive.
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     {
         // Resolve both parents from an open root descriptor so a concurrent

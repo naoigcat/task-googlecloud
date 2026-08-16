@@ -82,6 +82,8 @@ impl RemoteTransaction {
                 Ok(finalized) => finalized,
                 Err(error) => {
                     if let Some(restored_generation) = error.restored_move_generation() {
+                        // An interrupted move may have restored the source under
+                        // a new generation; rollback must use that owned version.
                         self.staged[index].generation = restored_generation.to_string();
                     }
                     return Err(error);
