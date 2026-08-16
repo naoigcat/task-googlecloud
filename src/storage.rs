@@ -30,6 +30,10 @@ const UPLOAD_BASE: &str = "https://storage.googleapis.com/upload/storage/v1";
 /// move cannot delete its source while another compliant writer replaces its
 /// destination.
 const BUCKET_LOCK_OBJECT: &str = ".task-googlecloud-lock";
+// A connection failure proves no upload request left the process, so rebuilding
+// the operation is safe while still allowing genuinely unavailable networks to fail.
+const CONNECTION_ATTEMPTS: usize = 3;
+const CONNECTION_RETRY_DELAY: Duration = Duration::from_millis(250);
 const PATH_SEGMENT: &AsciiSet = &CONTROLS
     .add(b' ')
     .add(b'"')
@@ -634,7 +638,7 @@ impl StorageClient for StorageApi {
     }
 
     fn upload_file(&self, source: &Path, target: &ObjectPath) -> Result<String, AppError> {
-        self.upload_file_checked(source, target, None)
+        self.upload_file_with_retries(source, target, None)
     }
 
     fn upload_file_with_identity(
@@ -643,7 +647,7 @@ impl StorageClient for StorageApi {
         target: &ObjectPath,
         identity: Option<UploadSourceIdentity>,
     ) -> Result<String, AppError> {
-        self.upload_file_checked(source, target, identity)
+        self.upload_file_with_retries(source, target, identity)
     }
 
     fn move_object(
@@ -731,6 +735,27 @@ impl StorageClient for StorageApi {
 }
 
 impl StorageApi {
+    fn upload_file_with_retries(
+        &self,
+        source: &Path,
+        target: &ObjectPath,
+        expected_source: Option<UploadSourceIdentity>,
+    ) -> Result<String, AppError> {
+        // Rebuild the whole request, including ReaderStream, so every retry
+        // starts from a fresh file descriptor and preserves source validation.
+        for attempt in 1..=CONNECTION_ATTEMPTS {
+            match self.upload_file_checked(source, target, expected_source.clone()) {
+                Ok(generation) => return Ok(generation),
+                Err(error) if error.is_connection_failure() && attempt < CONNECTION_ATTEMPTS => {
+                    thread::sleep(CONNECTION_RETRY_DELAY);
+                }
+                Err(error) => return Err(error),
+            }
+        }
+
+        unreachable!("the connection attempt loop always returns")
+    }
+
     fn upload_file_checked(
         &self,
         source: &Path,

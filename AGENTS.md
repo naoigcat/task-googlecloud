@@ -48,6 +48,9 @@ that are easy to lose when changing the implementation.
     after a request may have started is not proof that the remote state is unchanged:
     confirm ownership and generations before retrying or rolling back. If ownership
     cannot be established, preserve the recovery state and require manual recovery.
+-   Retry only bounded connection-establishment failures identified by
+    `reqwest::Error::is_connect()`. Rebuild streamed upload requests for each attempt;
+    do not blindly retry failures after request transmission may have started.
 -   Upload planning must remain tied to discovery. The one-level `uploads/<bucket>/`
     layout, hidden-file exclusion, symlinked-root/entry exclusion or rejection,
     root/directory/file identity checks, and content fingerprint check protect against

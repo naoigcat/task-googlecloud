@@ -174,6 +174,10 @@ impl AppError {
         }
     }
 
+    pub(crate) fn is_connection_failure(&self) -> bool {
+        matches!(self, Self::Http(error) if error.is_connect())
+    }
+
     pub(crate) fn may_have_sent_storage_request(&self) -> bool {
         match self {
             Self::Http(error) => !error.is_connect(),

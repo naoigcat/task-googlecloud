@@ -488,6 +488,48 @@ fn uploads_files_and_preserves_generation_preconditions() {
     assert!(request.ends_with("\r\n\r\ncontents"));
 }
 
+#[test]
+fn retries_streaming_upload_after_connection_failures() {
+    let reservation = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+    let address = reservation.local_addr().unwrap();
+    drop(reservation);
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    let recorded_requests = Arc::clone(&requests);
+    let server = thread::spawn(move || {
+        // The first two attempts find the port closed; the third attempt can
+        // connect after the upload operation has rebuilt its file stream.
+        thread::sleep(Duration::from_millis(400));
+        let listener = TcpListener::bind(address).unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let responses = [r#"{"generation":"lock"}"#, r#"{"generation":"789"}"#, "{}"];
+        for body in responses {
+            let mut stream = accept_connection(&listener, SERVER_TIMEOUT).unwrap();
+            recorded_requests
+                .lock()
+                .unwrap()
+                .push(read_request(&mut stream));
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            stream.write_all(response.as_bytes()).unwrap();
+        }
+    });
+    let base = format!("http://{address}/storage/v1");
+    let source = NamedTempFile::new().unwrap();
+    std::fs::write(source.path(), b"contents").unwrap();
+    let target = ObjectPath::parse("gs://bucket/target.txt").unwrap();
+
+    let generation = storage(&base).upload_file(source.path(), &target).unwrap();
+    server.join().unwrap();
+
+    assert_eq!(generation, "789");
+    let requests = requests.lock().unwrap();
+    assert_eq!(requests.len(), 3);
+    assert!(request_line(&requests[1]).contains("uploadType=media"));
+    assert!(requests[1].ends_with("\r\n\r\ncontents"));
+}
+
 #[cfg(unix)]
 #[test]
 fn refuses_symlinked_upload_sources() {
