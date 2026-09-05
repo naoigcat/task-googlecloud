@@ -1,6 +1,6 @@
 use crate::InterruptFlag;
 use crate::error::AppError;
-use crate::storage::{ObjectPath, StorageClient};
+use crate::storage::{ObjectPath, StorageClient, UploadProgressCallback};
 use crate::upload_source::UploadSourceIdentity;
 
 /// Executes one remote move and confirms object state when the request fails.
@@ -28,26 +28,17 @@ pub fn execute<S: StorageClient>(
     }
 }
 
-/// Uploads one local file and applies the same post-failure confirmation rules
-/// as a remote move.
-pub fn execute_upload<S: StorageClient>(
-    storage: &S,
-    interrupt: &InterruptFlag,
-    source: &std::path::Path,
-    target: &ObjectPath,
-) -> Result<String, AppError> {
-    execute_upload_with_identity(storage, interrupt, source, target, None)
-}
-
 pub(crate) fn execute_upload_with_identity<S: StorageClient>(
     storage: &S,
     interrupt: &InterruptFlag,
     source: &std::path::Path,
     target: &ObjectPath,
     expected_source: Option<UploadSourceIdentity>,
+    progress: Option<UploadProgressCallback>,
 ) -> Result<String, AppError> {
     interrupt.check()?;
-    match storage.upload_file_with_identity(source, target, expected_source) {
+    match storage.upload_file_with_identity_and_progress(source, target, expected_source, progress)
+    {
         Ok(generation) => Ok(generation),
         Err(error) => Err(confirmed_failure(interrupt, error, |operation| {
             storage.confirm_write_after_failure(target, operation)

@@ -7,9 +7,9 @@ use std::sync::{Arc, atomic::AtomicBool};
 use std::thread;
 
 use super::{
-    MAX_OBJECT_NAME_BYTES, PlannedDirectoryUploads, PlannedUpload, UploadDiscovery,
-    discover_uploads, is_real_directory, is_regular_file, plan_uploads, staging_path,
-    upload_planned_files,
+    FileUploadProgress, MAX_OBJECT_NAME_BYTES, PlannedDirectoryUploads, PlannedUpload,
+    UploadDiscovery, discover_uploads, is_real_directory, is_regular_file, plan_uploads,
+    staging_path, upload_planned_files,
 };
 use crate::InterruptFlag;
 use crate::cloud::Cloud;
@@ -242,6 +242,19 @@ fn finalizes_uploaded_objects_using_their_uploaded_generation() {
     );
     assert_eq!(storage.lock_calls.get(), 1);
     assert_eq!(storage.calls_outside_lock.get(), 0);
+}
+
+#[test]
+fn follows_storage_confirmed_file_progress() {
+    let progress_display =
+        indicatif::MultiProgress::with_draw_target(indicatif::ProgressDrawTarget::hidden());
+    let progress = FileUploadProgress::new(&progress_display, Path::new("uploads/bucket/file"));
+    let callback = progress.callback();
+
+    callback(75, 100);
+    callback(8, 100);
+
+    assert_eq!(progress.bar.position(), 8);
 }
 
 #[test]

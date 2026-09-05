@@ -7,7 +7,8 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 use task_googlecloud::{
-    AppError, Cloud, InterruptFlag, ObjectPath, StorageApi, StorageClient, process_moves,
+    AppError, Cloud, InterruptFlag, ObjectPath, StorageApi, StorageClient, UploadProgressCallback,
+    process_moves,
 };
 use tempfile::{NamedTempFile, TempDir, tempdir};
 
@@ -515,6 +516,36 @@ fn uploads_files_and_preserves_generation_preconditions() {
 }
 
 #[test]
+fn reports_upload_progress_for_a_file() {
+    let (base, _requests, server) = test_server(vec![
+        bucket_lock_created(),
+        (200, r#"{"generation":"789"}"#.to_string()),
+        bucket_lock_deleted(),
+    ]);
+    let source = NamedTempFile::new().unwrap();
+    std::fs::write(source.path(), b"contents").unwrap();
+    let target = ObjectPath::parse("gs://bucket/target.txt").unwrap();
+    let progress_values = Arc::new(Mutex::new(Vec::new()));
+    let progress_values_for_callback = Arc::clone(&progress_values);
+    let callback: UploadProgressCallback = Arc::new(move |bytes, total| {
+        progress_values_for_callback
+            .lock()
+            .unwrap()
+            .push((bytes, total));
+    });
+
+    storage(&base)
+        .upload_file_with_identity_and_progress(source.path(), &target, None, Some(callback))
+        .unwrap();
+    server.join().unwrap();
+
+    let progress_values = progress_values.lock().unwrap();
+    assert_eq!(progress_values.first(), Some(&(0, 8)));
+    assert_eq!(progress_values.last(), Some(&(8, 8)));
+    assert!(progress_values.windows(2).all(|values| values[0].1 == 8));
+}
+
+#[test]
 fn retries_streaming_upload_after_connection_failures() {
     let reservation = TcpListener::bind(("127.0.0.1", 0)).unwrap();
     let address = reservation.local_addr().unwrap();
@@ -733,11 +764,25 @@ fn resumes_a_large_upload_after_a_connection_loss() {
     let source = NamedTempFile::new().unwrap();
     std::fs::write(source.path(), vec![b'x'; TOTAL_SIZE]).unwrap();
     let target = ObjectPath::parse("gs://bucket/large.bin").unwrap();
+    let progress_values = Arc::new(Mutex::new(Vec::new()));
+    let progress_values_for_callback = Arc::clone(&progress_values);
+    let callback: UploadProgressCallback = Arc::new(move |bytes, total| {
+        progress_values_for_callback
+            .lock()
+            .unwrap()
+            .push((bytes, total));
+    });
 
-    let generation = storage(&base).upload_file(source.path(), &target).unwrap();
+    let generation = storage(&base)
+        .upload_file_with_identity_and_progress(source.path(), &target, None, Some(callback))
+        .unwrap();
     server.join().unwrap();
 
     assert_eq!(generation, "789");
+    assert_eq!(
+        progress_values.lock().unwrap().last(),
+        Some(&(TOTAL_SIZE as u64, TOTAL_SIZE as u64))
+    );
 }
 
 #[test]

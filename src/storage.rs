@@ -1,7 +1,7 @@
 use std::collections::{HashMap, HashSet};
 use std::io::{self, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::thread::{self, ThreadId};
 use std::time::Duration;
 
@@ -129,6 +129,20 @@ pub trait StorageClient {
     ) -> Result<String, AppError> {
         self.upload_file(source, target)
     }
+
+    /// Uploads a file while reporting storage-confirmed progress to the caller.
+    ///
+    /// The default keeps custom storage implementations compatible; the HTTP
+    /// implementation invokes the callback with `(confirmed_bytes, total_bytes)`.
+    fn upload_file_with_identity_and_progress(
+        &self,
+        source: &Path,
+        target: &ObjectPath,
+        identity: Option<UploadSourceIdentity>,
+        _progress: Option<UploadProgressCallback>,
+    ) -> Result<String, AppError> {
+        self.upload_file_with_identity(source, target, identity)
+    }
     fn upload_file(&self, source: &Path, target: &ObjectPath) -> Result<String, AppError>;
     fn move_object(
         &self,
@@ -155,6 +169,9 @@ pub trait StorageClient {
         operation: &AppError,
     ) -> Result<(), AppError>;
 }
+
+/// Receives the number of bytes confirmed by Cloud Storage for the current upload.
+pub type UploadProgressCallback = Arc<dyn Fn(u64, u64) + Send + Sync>;
 
 /// Cloud Storage JSON API client with bucket locking and generation checks.
 pub struct StorageApi {
@@ -643,7 +660,7 @@ impl StorageClient for StorageApi {
     }
 
     fn upload_file(&self, source: &Path, target: &ObjectPath) -> Result<String, AppError> {
-        self.upload_file_with_retries(source, target, None)
+        self.upload_file_with_retries(source, target, None, None)
     }
 
     fn upload_file_with_identity(
@@ -652,7 +669,17 @@ impl StorageClient for StorageApi {
         target: &ObjectPath,
         identity: Option<UploadSourceIdentity>,
     ) -> Result<String, AppError> {
-        self.upload_file_with_retries(source, target, identity)
+        self.upload_file_with_retries(source, target, identity, None)
+    }
+
+    fn upload_file_with_identity_and_progress(
+        &self,
+        source: &Path,
+        target: &ObjectPath,
+        identity: Option<UploadSourceIdentity>,
+        progress: Option<UploadProgressCallback>,
+    ) -> Result<String, AppError> {
+        self.upload_file_with_retries(source, target, identity, progress)
     }
 
     fn move_object(
@@ -750,6 +777,7 @@ impl StorageApi {
         source: &Path,
         target: &ObjectPath,
         expected_source: Option<UploadSourceIdentity>,
+        progress: Option<UploadProgressCallback>,
     ) -> Result<String, AppError> {
         Self::reject_bucket_lock_object(target)?;
         // Anchor every retry to the bytes discovered before the first request;
@@ -757,14 +785,27 @@ impl StorageApi {
         // object content between attempts while preserving the same file entry.
         let validation = self.upload_source_validation(expected_source)?;
         let expected_fingerprint = self.capture_upload_fingerprint(source, &validation)?;
+        report_upload_progress(progress.as_ref(), 0, expected_fingerprint.size());
         if expected_fingerprint.size() >= RESUMABLE_UPLOAD_THRESHOLD {
-            return self.upload_resumable_file(source, target, &validation, &expected_fingerprint);
+            return self.upload_resumable_file(
+                source,
+                target,
+                &validation,
+                &expected_fingerprint,
+                progress,
+            );
         }
 
         // Rebuild the whole request, including ReaderStream, so every retry
         // starts from a fresh file descriptor and preserves source validation.
         for attempt in 1..=UPLOAD_ATTEMPTS {
-            match self.upload_file_checked(source, target, &validation, &expected_fingerprint) {
+            match self.upload_file_checked(
+                source,
+                target,
+                &validation,
+                &expected_fingerprint,
+                progress.as_ref(),
+            ) {
                 Ok(generation) => return Ok(generation),
                 Err(error) if error.is_retryable_upload_failure() && attempt < UPLOAD_ATTEMPTS => {
                     let backoff = attempt.saturating_sub(1).min(3) as u32;
@@ -828,6 +869,7 @@ impl StorageApi {
         target: &ObjectPath,
         validation: &UploadSourceValidation,
         expected_fingerprint: &upload_source::FileFingerprint,
+        progress: Option<&UploadProgressCallback>,
     ) -> Result<String, AppError> {
         Self::reject_bucket_lock_object(target)?;
         let mut file = self.open_upload_source(source, validation)?;
@@ -874,6 +916,7 @@ impl StorageApi {
                 expected_fingerprint,
                 |error| AppError::UploadSourceChanged(format!("{source:?}: {error}")),
             )?;
+            report_upload_progress(progress, size, size);
             Ok(metadata.generation)
         })
     }
@@ -884,6 +927,7 @@ impl StorageApi {
         target: &ObjectPath,
         validation: &UploadSourceValidation,
         expected_fingerprint: &upload_source::FileFingerprint,
+        progress: Option<UploadProgressCallback>,
     ) -> Result<String, AppError> {
         let mut verification_file = self
             .open_upload_source(source, validation)?
@@ -895,6 +939,7 @@ impl StorageApi {
                 target,
                 validation,
                 expected_fingerprint.size(),
+                progress.as_ref(),
             )?;
             Self::verify_upload_fingerprint(
                 source,
@@ -902,6 +947,11 @@ impl StorageApi {
                 expected_fingerprint,
                 |error| AppError::UploadSourceChanged(format!("{source:?}: {error}")),
             )?;
+            report_upload_progress(
+                progress.as_ref(),
+                expected_fingerprint.size(),
+                expected_fingerprint.size(),
+            );
             Ok(generation)
         })
     }
@@ -912,6 +962,7 @@ impl StorageApi {
         target: &ObjectPath,
         validation: &UploadSourceValidation,
         size: u64,
+        progress: Option<&UploadProgressCallback>,
     ) -> Result<String, AppError> {
         let mut token = self.transport.token()?;
         let session = self.start_resumable_session(target, size, &mut token)?;
@@ -932,6 +983,7 @@ impl StorageApi {
                         }
                         // A status query is authoritative even when it reveals
                         // that fewer bytes were committed than the last response reported.
+                        report_upload_progress(progress, next_offset, size);
                         offset = next_offset;
                     }
                     ResumableProgress::Offset(next_offset) => {
@@ -939,15 +991,24 @@ impl StorageApi {
                             "Cloud Storage resumable upload returned invalid offset {next_offset} for {offset}"
                         )));
                     }
-                    ResumableProgress::Complete(generation) => return Ok(generation),
+                    ResumableProgress::Complete(generation) => {
+                        report_upload_progress(progress, size, size);
+                        return Ok(generation);
+                    }
                 }
             }
 
             match self.query_resumable_progress(&session, size, &mut token)? {
-                ResumableProgress::Complete(generation) => Ok(generation),
-                ResumableProgress::Offset(next_offset) => Err(AppError::StorageResponse(format!(
-                    "Cloud Storage resumable upload stopped at {next_offset} after {size} bytes"
-                ))),
+                ResumableProgress::Complete(generation) => {
+                    report_upload_progress(progress, size, size);
+                    Ok(generation)
+                }
+                ResumableProgress::Offset(next_offset) => {
+                    report_upload_progress(progress, next_offset, size);
+                    Err(AppError::StorageResponse(format!(
+                        "Cloud Storage resumable upload stopped at {next_offset} after {size} bytes"
+                    )))
+                }
             }
         })();
         match result {
@@ -1194,6 +1255,12 @@ impl StorageApi {
                 "Cloud Storage returned unexpected resumable upload status {status}"
             ))),
         }
+    }
+}
+
+fn report_upload_progress(progress: Option<&UploadProgressCallback>, bytes: u64, total: u64) {
+    if let Some(progress) = progress {
+        progress(bytes, total);
     }
 }
 

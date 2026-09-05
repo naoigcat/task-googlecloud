@@ -26,6 +26,9 @@ Move files to `uploads/[bucket]` and run:
 mise run upload [project]
 ```
 
+Upload progress is shown as a percentage for each file.
+Resumable uploads advance as Cloud Storage confirms each chunk.
+
 ### Authentication lifecycle
 
 Authentication is stored in the `googlecloud` container and is reused by later

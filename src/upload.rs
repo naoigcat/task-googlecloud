@@ -1,8 +1,10 @@
+use std::cell::RefCell;
 use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
-use indicatif::{ProgressBar, ProgressDrawTarget, ProgressStyle};
+use indicatif::{MultiProgress, ProgressBar, ProgressDrawTarget, ProgressStyle};
 
 use crate::InterruptFlag;
 use crate::atomic_rename::{
@@ -13,7 +15,7 @@ use crate::error::AppError;
 use crate::local;
 use crate::normalization_plan;
 use crate::object_move;
-use crate::storage::{ObjectPath, StorageClient, UPLOAD_ROOT};
+use crate::storage::{ObjectPath, StorageClient, UPLOAD_ROOT, UploadProgressCallback};
 use crate::transaction::{RemoteChange, RemoteTransaction, rollback_changes};
 use crate::upload_source::UploadSourceIdentity;
 
@@ -321,46 +323,49 @@ fn upload_planned_files_unlocked<S: StorageClient>(
     interrupt: &InterruptFlag,
     uploads: &[PlannedDirectoryUploads],
 ) -> Result<(), AppError> {
-    let progress = upload_progress(uploads);
-    RemoteTransaction::execute(
+    let has_uploads = uploads.iter().any(|planned| !planned.uploads.is_empty());
+    let progress_display = MultiProgress::with_draw_target(ProgressDrawTarget::stdout());
+    let progress_bars = RefCell::new(Vec::new());
+    let result = RemoteTransaction::execute(
         interrupt,
         |transaction| {
             // Upload everything to private staging names first. Finalization is
             // then generation-guarded, so partial runs can be identified and
             // rolled back without touching another writer's object.
             for planned in uploads {
-                if let Some(progress) = &progress {
-                    progress.println(planned.directory.display().to_string());
+                let directory = planned.directory.display().to_string();
+                if progress_display.is_hidden() {
+                    // Keep directory headings in non-terminal logs where
+                    // progress rendering is hidden.
+                    println!("{directory}");
                 } else {
-                    println!("{}", planned.directory.display());
+                    progress_display.println(directory).map_err(|error| {
+                        AppError::Message(format!("Failed to display upload progress: {error}"))
+                    })?;
                 }
                 for upload in &planned.uploads {
-                    if let Some(progress) = &progress {
-                        progress.set_message(format!("Uploading {}", upload.file.display()));
-                    }
-                    let generation = match upload.source_identity.as_ref() {
-                        Some(identity) => object_move::execute_upload_with_identity(
-                            storage,
-                            interrupt,
-                            &upload.file,
-                            &upload.staging,
-                            Some(identity.clone()),
-                        )?,
-                        None => object_move::execute_upload(
-                            storage,
-                            interrupt,
-                            &upload.file,
-                            &upload.staging,
-                        )?,
+                    let progress = FileUploadProgress::new(&progress_display, &upload.file);
+                    let generation = match object_move::execute_upload_with_identity(
+                        storage,
+                        interrupt,
+                        &upload.file,
+                        &upload.staging,
+                        upload.source_identity.clone(),
+                        Some(progress.callback()),
+                    ) {
+                        Ok(generation) => generation,
+                        Err(error) => {
+                            progress.abandon();
+                            return Err(error);
+                        }
                     };
+                    progress.complete();
                     transaction.stage(RemoteChange {
                         source: upload.staging.clone(),
                         target: upload.target.clone(),
                         generation,
                     });
-                    if let Some(progress) = &progress {
-                        progress.inc(1);
-                    }
+                    progress_bars.borrow_mut().push(progress);
                     interrupt.check()?;
                 }
             }
@@ -383,38 +388,81 @@ fn upload_planned_files_unlocked<S: StorageClient>(
             })
         },
         |staged, finalized| rollback_remote(storage, staged, finalized),
-    )
-    .inspect(|_| {
-        if let Some(progress) = &progress {
-            progress.finish_with_message("Upload complete");
+    );
+    let progress_bars = progress_bars.into_inner();
+    match result {
+        Ok(()) => {
+            for progress in progress_bars {
+                progress.finish();
+            }
+            if has_uploads {
+                println!("Upload complete");
+            }
+            Ok(())
         }
-    })
-    .inspect_err(|_| {
-        if let Some(progress) = &progress {
-            progress.abandon();
+        Err(error) => {
+            for progress in progress_bars {
+                progress.rollback();
+            }
+            Err(error)
         }
-    })
+    }
 }
 
-fn upload_progress(uploads: &[PlannedDirectoryUploads]) -> Option<ProgressBar> {
-    let total_files = uploads
-        .iter()
-        .map(|planned| planned.uploads.len())
-        .sum::<usize>();
-    if total_files == 0 {
-        return None;
+struct FileUploadProgress {
+    bar: ProgressBar,
+    file: PathBuf,
+}
+
+impl FileUploadProgress {
+    fn new(progress_display: &MultiProgress, file: &Path) -> Self {
+        // Start with a one-byte placeholder so empty files can still render a
+        // completed 100% state before the storage layer reports their size.
+        let bar = progress_display.add(ProgressBar::new(1));
+        bar.set_style(
+            ProgressStyle::with_template("{bar:40.cyan/blue} {percent}% {wide_msg}")
+                .expect("upload progress template is valid")
+                .progress_chars("=>-"),
+        );
+        bar.set_message(format!("Uploading {}", file.display()));
+        Self {
+            bar,
+            file: file.to_path_buf(),
+        }
     }
 
-    // Keep upload status with the command's normal output instead of indicatif's
-    // default stderr target, so it remains visible in mise task output.
-    let progress =
-        ProgressBar::with_draw_target(Some(total_files as u64), ProgressDrawTarget::stdout());
-    progress.set_style(
-        ProgressStyle::with_template("{bar:40.cyan/blue} {pos}/{len} {wide_msg}")
-            .expect("upload progress template is valid")
-            .progress_chars("=>-"),
-    );
-    Some(progress)
+    fn callback(&self) -> UploadProgressCallback {
+        let bar = self.bar.clone();
+        Arc::new(move |bytes, total| {
+            let length = total.max(1);
+            let position = if total == 0 { 1 } else { bytes.min(total) };
+            bar.set_length(length);
+            bar.set_position(position);
+        })
+    }
+
+    fn complete(&self) {
+        let length = self.bar.length().unwrap_or(1).max(1);
+        self.bar.set_position(length);
+    }
+
+    fn finish(&self) {
+        self.complete();
+        self.bar
+            .finish_with_message(format!("Uploaded {}", self.file.display()));
+    }
+
+    fn abandon(&self) {
+        self.bar
+            .abandon_with_message(format!("Upload failed: {}", self.file.display()));
+    }
+
+    fn rollback(&self) {
+        self.bar.abandon_with_message(format!(
+            "Upload failed; rollback attempted: {}",
+            self.file.display()
+        ));
+    }
 }
 
 /// The staging prefix lengthens the object name, so a name that Cloud Storage
